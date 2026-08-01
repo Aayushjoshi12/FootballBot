@@ -201,10 +201,9 @@ def injuries_embed(team_name: str, injuries: list) -> discord.Embed:
     embed = discord.Embed(title=f"🏥 {team_name} — Injuries", color=0xE53935)
     lines = []
     for item in injuries[:15]:
-        p    = item.get("player", {})
-        fix  = item.get("fixture", {})
-        reason = item.get("player", {}).get("reason", "Injury")
-        lines.append(f"• **{p.get('name','')}** — {reason}")
+        p      = item.get("player", {})
+        reason = p.get("reason", "Injury")  # was fetched twice before; single fetch now
+        lines.append(f"• **{p.get('name', '')}** — {reason}")
     embed.description = "\n".join(lines) or "No injury data."
     return embed
 
@@ -249,7 +248,6 @@ def prediction_embed(match: dict, pred: dict) -> discord.Embed:
     embed  = discord.Embed(title=f"🔮 Prediction — {match['home']} vs {match['away']}", color=_color(lid))
     p      = pred.get("predictions", {})
     winner = pred.get("winner", {})
-    comp   = pred.get("comparison", {})
     embed.add_field(name="Winner", value=winner.get("name", "?"), inline=True)
     embed.add_field(name="Win%",   value=p.get("percent", {}).get("home", "?"), inline=True)
     embed.add_field(name="Advice", value=p.get("advice", "N/A"), inline=False)
@@ -261,7 +259,7 @@ def prediction_embed(match: dict, pred: dict) -> discord.Embed:
 # ══════════════════════════════════════════════════════════════════════════
 
 class MatchView(discord.ui.View):
-    """Buttons: Stats · Events · Lineups · Refresh attached to a live match embed."""
+    """Buttons: Stats · Events · Refresh attached to a live match embed."""
 
     def __init__(self, match: dict):
         super().__init__(timeout=300)

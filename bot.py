@@ -13,7 +13,7 @@ from discord import app_commands
 import db
 import http_client as hc
 import notifier
-from config import DISCORD_BOT_TOKEN, TRACKED_LEAGUES, LEAGUE_MAP, ESPN_LEAGUE_MAP
+from config import DISCORD_BOT_TOKEN, TRACKED_LEAGUES, ESPN_LEAGUE_MAP
 from embeds import (
     match_embed, fixtures_embed, standings_embed, team_embed,
     injuries_embed, h2h_embed, lineups_embed, topscorers_embed,
@@ -67,14 +67,12 @@ bot = FootballBot()
 # ══════════════════════════════════════════════════════════════════════════
 
 async def _send_paginated(interaction: discord.Interaction, embeds: list[discord.Embed]):
+    """Send multiple embeds via followup — safe in DMs and guild channels."""
     if not embeds:
         await interaction.followup.send("No data found.")
         return
-    for i, emb in enumerate(embeds):
-        if i == 0:
-            await interaction.followup.send(embed=emb)
-        else:
-            await interaction.channel.send(embed=emb)
+    for emb in embeds:
+        await interaction.followup.send(embed=emb)
 
 
 async def _find_team(name: str) -> tuple[dict | None, list]:
@@ -93,7 +91,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Dual provider: **SofaScore 🟡** (faster) + **API-Football 🔵** (backup)\n"
+            "Tri-provider: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢**\n"
             "Live alerts sent to subscribed channels automatically.\n​"
         ),
         color=0x00C851,
@@ -164,7 +162,8 @@ async def cmd_live(interaction: discord.Interaction):
     for m in combined[:5]:
         await interaction.followup.send(embed=match_embed(m), view=MatchView(m))
     if len(combined) > 5:
-        await interaction.channel.send(f"…and {len(combined)-5} more live matches.")
+        # Use followup instead of channel.send — channel can be None in DMs
+        await interaction.followup.send(f"…and {len(combined)-5} more live matches.")
 
 
 # ── /today ─────────────────────────────────────────────────────────────────
@@ -343,15 +342,15 @@ async def cmd_player(interaction: discord.Interaction, player_id: int):
     stat = (data.get("statistics") or [{}])[0]
     embed = discord.Embed(title=f"👤 {p.get('name','?')}", color=0x2196F3)
     embed.set_thumbnail(url=p.get("photo", ""))
-    embed.add_field(name="Age",         value=p.get("age", "?"),                                   inline=True)
-    embed.add_field(name="Nationality", value=p.get("nationality", "?"),                            inline=True)
-    embed.add_field(name="Team",        value=stat.get("team", {}).get("name", "?"),               inline=True)
-    embed.add_field(name="Goals",       value=stat.get("goals", {}).get("total", 0),              inline=True)
-    embed.add_field(name="Assists",     value=stat.get("goals", {}).get("assists", 0),            inline=True)
-    embed.add_field(name="Apps",        value=stat.get("games", {}).get("appearences", 0),        inline=True)
-    embed.add_field(name="Rating",      value=stat.get("games", {}).get("rating") or "N/A",       inline=True)
-    embed.add_field(name="Yellow",      value=stat.get("cards", {}).get("yellow", 0),             inline=True)
-    embed.add_field(name="Red",         value=stat.get("cards", {}).get("red", 0),                inline=True)
+    embed.add_field(name="Age",         value=p.get("age", "?"),                             inline=True)
+    embed.add_field(name="Nationality", value=p.get("nationality", "?"),                      inline=True)
+    embed.add_field(name="Team",        value=stat.get("team", {}).get("name", "?"),         inline=True)
+    embed.add_field(name="Goals",       value=stat.get("goals", {}).get("total", 0),         inline=True)
+    embed.add_field(name="Assists",     value=stat.get("goals", {}).get("assists", 0),       inline=True)
+    embed.add_field(name="Apps",        value=stat.get("games", {}).get("appearences", 0),   inline=True)
+    embed.add_field(name="Rating",      value=stat.get("games", {}).get("rating") or "N/A",  inline=True)
+    embed.add_field(name="Yellow",      value=stat.get("cards", {}).get("yellow", 0),        inline=True)
+    embed.add_field(name="Red",         value=stat.get("cards", {}).get("red", 0),           inline=True)
     await interaction.followup.send(embed=embed)
 
 
@@ -464,7 +463,7 @@ async def cmd_stats(interaction: discord.Interaction):
     from http_client import stats_summary
     embed = discord.Embed(title="📈 Bot Performance Stats", color=0x9C27B0)
     embed.description = f"```\n{stats_summary()}\n```"
-    embed.add_field(name="Live fixtures tracked", value=len(notifier._state), inline=True)
+    embed.add_field(name="Live fixtures tracked", value=len(notifier._state),        inline=True)
     embed.add_field(name="Subscribed channels",   value=len(notifier.subscriptions), inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 

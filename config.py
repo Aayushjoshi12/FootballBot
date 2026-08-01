@@ -22,8 +22,8 @@ POLL_INTERVAL   = 12    # seconds
 CURRENT_SEASON  = _current_season()
 MAX_CONCURRENCY = 10    # max simultaneous HTTP requests
 
-CONNECT_TIMEOUT = 5.0   # seconds
-READ_TIMEOUT    = 10.0  # seconds
+CONNECT_TIMEOUT = 10.0  # seconds (was 5.0 — increased for slow-to-connect hosts)
+READ_TIMEOUT    = 25.0  # seconds (was 10.0 — ESPN and APF can be slow under load)
 
 # Cache TTLs (seconds)
 TTL_LIVE       = 0      # never cache live data

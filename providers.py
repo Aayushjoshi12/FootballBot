@@ -1,9 +1,8 @@
 """
 Three free data providers, polled concurrently:
-  - SofaScore    (unofficial, no key — session cookies via cloudscraper)
+  - SofaScore    (unofficial — mobile app User-Agent bypasses Cloudflare)
   - API-Football (official, needs APIFOOTBALL_API_KEY)
-  - ESPN         (unofficial, no key, bundles events with the scoreboard —
-                  usually the fastest since it needs only one HTTP call)
+  - ESPN         (unofficial, no key, bundles events with the scoreboard)
 All public functions return normalized dicts with consistent field names.
 Event fingerprinting uses a cross-provider semantic key (team + minute +
 category) so the same real event from multiple providers collapses to one
@@ -21,36 +20,27 @@ from normalizer import normalize
 
 log = logging.getLogger("providers")
 
-# ══════════════════════════════════════════════════════════════════════════
-# SHARED TYPES
-# ══════════════════════════════════════════════════════════════════════════
-
 Match = dict[str, Any]
 Event = dict[str, Any]
 
 # ══════════════════════════════════════════════════════════════════════════
 # SOFASCORE
+#
+# api.sofascore.com is the same backend used by the SofaScore Android/iOS
+# app. When the request carries the app’s User-Agent Cloudflare passes it
+# through without a JS challenge or cookie check. No cf_clearance needed.
 # ══════════════════════════════════════════════════════════════════════════
 
 _SOFA = "https://api.sofascore.com/api/v1"
 
-# Full Chrome 126 headers — incomplete UA or missing Sec-Fetch-* triggers 403.
-# The Cookie key is populated at runtime by _ensure_sofa_session().
+# Headers extracted from the SofaScore Android app (okhttp/4.x)
 _SOFA_HDR: dict[str, str] = {
-    "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Accept":             "application/json, text/plain, */*",
-    "Accept-Language":    "en-US,en;q=0.9",
-    "Accept-Encoding":    "gzip, deflate, br",
-    "Referer":            "https://www.sofascore.com/",
-    "Origin":             "https://www.sofascore.com",
-    "Sec-Ch-Ua":          '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
-    "Sec-Ch-Ua-Mobile":   "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest":     "empty",
-    "Sec-Fetch-Mode":     "cors",
-    "Sec-Fetch-Site":     "same-site",
-    "Cache-Control":      "no-cache",
-    "Pragma":             "no-cache",
+    "User-Agent":      "SofaScore/6.17.3 (Linux; Android 14; Pixel 8 Build/UP1A.231105.003) okhttp/4.12.0",
+    "Accept":          "application/json",
+    "Accept-Encoding": "gzip",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control":   "no-cache",
+    "Pragma":          "no-cache",
 }
 
 _SOFA_STATUS: dict[int, str] = {
@@ -76,28 +66,14 @@ _SOFA_GOAL_ICONS = {"ownGoal": ("⚽🙈", "Own Goal"), "penalty": ("⚽🎯", "
 
 
 async def _ensure_sofa_session() -> None:
-    """Prime the SofaScore session on first use and inject cookies into _SOFA_HDR."""
-    if sofa_session.needs_refresh():
-        await sofa_session.refresh()
-    cookie = sofa_session.cookie_header()
-    if cookie:
-        _SOFA_HDR["Cookie"] = cookie
+    pass  # no-op: mobile UA bypasses Cloudflare without cookies
 
 
 async def _sofa_refresh() -> bool:
-    """
-    Passed as refresh_fn to hc.get for all SofaScore requests.
-    Forces a new cloudscraper session and updates the shared header dict
-    so the next retry attempt picks up fresh Cloudflare cookies.
-    """
-    ok = await sofa_session.refresh(force=True)
-    if ok:
-        _SOFA_HDR["Cookie"] = sofa_session.cookie_header()
-    return ok
+    return True  # no-op: no session to refresh
 
 
 def _sofa_norm_match(e: dict) -> Match | None:
-    """Returns None on malformed entries so callers can filter safely."""
     home_team = e.get("homeTeam") or {}
     away_team = e.get("awayTeam") or {}
     if not home_team.get("name") or not away_team.get("name"):
@@ -197,53 +173,31 @@ def _sofa_norm_incident(inc: dict, home: str, away: str) -> Event | None:
 
 
 def canonical_fingerprint(team_norm: str, minute: int, category: str) -> str:
-    """
-    Cross-provider dedup key.
-
-    Each provider assigns its own internal player/event IDs, so hashing those
-    (as this used to do) means the *same real goal* reported by SofaScore and
-    API-Football never produces the same fingerprint — both would get sent.
-    Team + minute + event category is provider-agnostic: whichever source
-    reports a given goal/card first "claims" it, and the same event coming
-    in from another source a moment later is recognized as a duplicate.
-
-    Trade-off: two distinct events by the same team, in the same minute, in
-    the same category (e.g. a brace in stoppage time) would collide and only
-    the first would be sent. This is rare enough to accept for a live-alert
-    bot; a stricter key would need reliable cross-provider player-ID mapping,
-    which doesn't exist between these sources.
-    """
     raw = f"{team_norm}_{minute}_{category}"
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
 async def sofa_live_matches() -> list[Match]:
-    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/sport/football/events/live", _SOFA_HDR,
-                        cache_key="sofa_live", provider="sofascore",
-                        refresh_fn=_sofa_refresh)
+                        cache_key="sofa_live", provider="sofascore")
     return [m for e in (data or {}).get("events", [])
             if (m := _sofa_norm_match(e)) is not None]
 
 
 async def sofa_incidents(sofa_id: int, home: str, away: str) -> list[Event]:
-    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/event/{sofa_id}/incidents", _SOFA_HDR,
-                        cache_key=f"sofa_inc_{sofa_id}", provider="sofascore",
-                        refresh_fn=_sofa_refresh)
+                        cache_key=f"sofa_inc_{sofa_id}", provider="sofascore")
     return [n for inc in (data or {}).get("incidents", [])
             if (n := _sofa_norm_incident(inc, home, away)) is not None]
 
 
 async def sofa_upcoming(sofa_lid: int, days: int = 7) -> list[Match]:
     from datetime import date, timedelta
-    await _ensure_sofa_session()
     results = []
     for i in range(days):
         d = (date.today() + timedelta(days=i)).strftime("%Y-%m-%d")
         data = await hc.get(f"{_SOFA}/sport/football/scheduled-events/{d}",
-                            _SOFA_HDR, provider="sofascore",
-                            refresh_fn=_sofa_refresh)
+                            _SOFA_HDR, provider="sofascore")
         for e in (data or {}).get("events", []):
             tid = e.get("tournament", {}).get("uniqueTournament", {}).get("id")
             if tid == sofa_lid:
@@ -254,16 +208,14 @@ async def sofa_upcoming(sofa_lid: int, days: int = 7) -> list[Match]:
 
 
 async def sofa_lineups(sofa_id: int) -> dict:
-    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/event/{sofa_id}/lineups", _SOFA_HDR,
-                        provider="sofascore", refresh_fn=_sofa_refresh)
+                        provider="sofascore")
     return data or {}
 
 
 async def sofa_h2h(sofa_id: int) -> list[Match]:
-    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/event/{sofa_id}/h2h/events", _SOFA_HDR,
-                        provider="sofascore", refresh_fn=_sofa_refresh)
+                        provider="sofascore")
     events = (data or {}).get("previousEvents", [])
     return [m for e in events[:10] if (m := _sofa_norm_match(e)) is not None]
 
@@ -520,15 +472,7 @@ async def apf_tomorrow(league_id: int) -> list[Match]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ESPN  (unofficial, free, no API key, no signed-request headers)
-#
-# Unlike SofaScore/API-Football, ESPN's scoreboard endpoint bundles each
-# match's goal/card feed directly in the response (`competitions[].details`),
-# so a single HTTP call gets both scores *and* events — no follow-up request
-# per fixture. That makes it the fastest of the three providers here.
-#
-# Coverage note: ESPN's `details` feed includes goals, own goals, penalties,
-# and cards, but not substitutions.
+# ESPN
 # ══════════════════════════════════════════════════════════════════════════
 
 _ESPN = "https://site.api.espn.com/apis/site/v2/sports/soccer"
@@ -541,7 +485,6 @@ _ESPN_HDR = {
 
 
 def _espn_parse_minute(display: str) -> tuple[int | None, int | None]:
-    """"43'" -> (43, None); "90'+4'" -> (90, 4)."""
     if not display:
         return None, None
     s = display.replace("'", "")
@@ -634,11 +577,6 @@ def _espn_norm(ev: dict, apf_lid: int) -> tuple[Match, list[Event]]:
 
 
 async def espn_live(espn_slug: str, apf_lid: int) -> tuple[list[Match], dict[str, list[Event]]]:
-    """
-    Returns (matches, events_by_team_pair_key) for one league's scoreboard.
-    events_by_team_pair_key is keyed by "home_norm|away_norm" so the caller
-    can cross-link it to whatever it already knows this match as.
-    """
     data = await hc.get(f"{_ESPN}/{espn_slug}/scoreboard", _ESPN_HDR,
                         cache_key=f"espn_live_{espn_slug}", provider="espn")
     matches: list[Match] = []

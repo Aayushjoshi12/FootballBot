@@ -16,7 +16,7 @@ from typing import Any
 
 import http_client as hc
 import sofa_session
-from config import APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV
+from config import APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV, TRACKED_LEAGUES
 from normalizer import normalize
 
 log = logging.getLogger("providers")
@@ -96,29 +96,38 @@ async def _sofa_refresh() -> bool:
     return ok
 
 
-def _sofa_norm_match(e: dict) -> Match:
+def _sofa_norm_match(e: dict) -> Match | None:
+    """Returns None on malformed entries so callers can filter safely."""
+    home_team = e.get("homeTeam") or {}
+    away_team = e.get("awayTeam") or {}
+    if not home_team.get("name") or not away_team.get("name"):
+        return None
+    eid = e.get("id")
+    if not eid:
+        return None
+
     code   = e.get("status", {}).get("code", 0)
     stype  = e.get("status", {}).get("type", "")
     minute = None
     if stype == "inprogress":
-        ts = (e.get("time") or {}).get("currentPeriodStartTimestamp")
+        ts  = (e.get("time") or {}).get("currentPeriodStartTimestamp")
         ini = (e.get("time") or {}).get("initial", 0)
         if ts:
             minute = min(int((time.time() - ts) / 60) + ini, 120)
     sofa_lid = e.get("tournament", {}).get("uniqueTournament", {}).get("id", 0)
     apf_lid  = LEAGUE_MAP_INV.get(sofa_lid, 0)
     return {
-        "id":          f"sofa_{e['id']}",
-        "sofa_id":     e["id"],
+        "id":          f"sofa_{eid}",
+        "sofa_id":     eid,
         "apf_id":      None,
-        "home":        e["homeTeam"]["name"],
-        "away":        e["awayTeam"]["name"],
-        "home_norm":   normalize(e["homeTeam"]["name"]),
-        "away_norm":   normalize(e["awayTeam"]["name"]),
+        "home":        home_team["name"],
+        "away":        away_team["name"],
+        "home_norm":   normalize(home_team["name"]),
+        "away_norm":   normalize(away_team["name"]),
         "home_score":  (e.get("homeScore") or {}).get("current"),
         "away_score":  (e.get("awayScore") or {}).get("current"),
-        "home_logo":   f"https://api.sofascore.com/api/v1/team/{e['homeTeam']['id']}/image",
-        "away_logo":   f"https://api.sofascore.com/api/v1/team/{e['awayTeam']['id']}/image",
+        "home_logo":   f"https://api.sofascore.com/api/v1/team/{home_team.get('id', 0)}/image",
+        "away_logo":   f"https://api.sofascore.com/api/v1/team/{away_team.get('id', 0)}/image",
         "status":      _SOFA_STATUS.get(code, e.get("status", {}).get("description", "?")),
         "status_code": code,
         "minute":      minute,
@@ -213,7 +222,8 @@ async def sofa_live_matches() -> list[Match]:
     data = await hc.get(f"{_SOFA}/sport/football/events/live", _SOFA_HDR,
                         cache_key="sofa_live", provider="sofascore",
                         refresh_fn=_sofa_refresh)
-    return [_sofa_norm_match(e) for e in (data or {}).get("events", [])]
+    return [m for e in (data or {}).get("events", [])
+            if (m := _sofa_norm_match(e)) is not None]
 
 
 async def sofa_incidents(sofa_id: int, home: str, away: str) -> list[Event]:
@@ -237,7 +247,9 @@ async def sofa_upcoming(sofa_lid: int, days: int = 7) -> list[Match]:
         for e in (data or {}).get("events", []):
             tid = e.get("tournament", {}).get("uniqueTournament", {}).get("id")
             if tid == sofa_lid:
-                results.append(_sofa_norm_match(e))
+                m = _sofa_norm_match(e)
+                if m:
+                    results.append(m)
     return results[:10]
 
 
@@ -253,7 +265,7 @@ async def sofa_h2h(sofa_id: int) -> list[Match]:
     data = await hc.get(f"{_SOFA}/event/{sofa_id}/h2h/events", _SOFA_HDR,
                         provider="sofascore", refresh_fn=_sofa_refresh)
     events = (data or {}).get("previousEvents", [])
-    return [_sofa_norm_match(e) for e in events[:10]]
+    return [m for e in events[:10] if (m := _sofa_norm_match(e)) is not None]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -326,8 +338,9 @@ def _apf_norm_event(e: dict, fixture_id: int) -> Event:
     detail    = e.get("detail", "") or ""
     etype     = e.get("type", "") or ""
     icon      = _APF_ICONS.get(detail) or _APF_ICONS.get(etype, "📌")
-    minute    = e["time"]["elapsed"]
-    added     = e["time"].get("extra")
+    time_data = e.get("time") or {}
+    minute    = time_data.get("elapsed", 0)
+    added     = time_data.get("extra")
     team_name = (e.get("team") or {}).get("name", "")
 
     category = _apf_category(etype, detail)
@@ -555,6 +568,8 @@ def _espn_norm(ev: dict, apf_lid: int) -> tuple[Match, list[Event]]:
     if status_type.get("state") == "in":
         minute, _ = _espn_parse_minute(status_type.get("shortDetail", ""))
 
+    league_name = TRACKED_LEAGUES.get(apf_lid, ev.get("name", ""))
+
     match: Match = {
         "id":          f"espn_{ev['id']}",
         "sofa_id":     None,
@@ -570,7 +585,7 @@ def _espn_norm(ev: dict, apf_lid: int) -> tuple[Match, list[Event]]:
         "status":      status_type.get("shortDetail", "?"),
         "status_code": 0,
         "minute":      minute,
-        "league":      ev.get("shortName", ""),
+        "league":      league_name,
         "league_id":   apf_lid,
         "sofa_lid":    0,
         "date":        (comp.get("date") or "")[:10],

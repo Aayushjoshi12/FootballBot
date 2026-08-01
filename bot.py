@@ -46,7 +46,7 @@ class FootballBot(discord.Client):
         await db.init()
         notifier.subscriptions = await db.get_all_subscriptions()
         await self.tree.sync()
-        self.loop.create_task(notifier.poll_loop(self))
+        asyncio.create_task(notifier.poll_loop(self))
         log.info("[bot] Setup complete. %d channels subscribed.", len(notifier.subscriptions))
 
     async def on_ready(self):
@@ -132,7 +132,7 @@ async def cmd_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── /live ──────────────────────────────────────────────────────────────────
+# ── /live ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="live", description="All live matches right now")
 async def cmd_live(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -162,11 +162,10 @@ async def cmd_live(interaction: discord.Interaction):
     for m in combined[:5]:
         await interaction.followup.send(embed=match_embed(m), view=MatchView(m))
     if len(combined) > 5:
-        # Use followup instead of channel.send — channel can be None in DMs
         await interaction.followup.send(f"…and {len(combined)-5} more live matches.")
 
 
-# ── /today ─────────────────────────────────────────────────────────────────
+# ── /today ──────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="today", description="Today's fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -178,7 +177,7 @@ async def cmd_today(interaction: discord.Interaction, league: str):
     await _send_paginated(interaction, embeds)
 
 
-# ── /tomorrow ──────────────────────────────────────────────────────────────
+# ── /tomorrow ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="tomorrow", description="Tomorrow's fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -190,7 +189,7 @@ async def cmd_tomorrow(interaction: discord.Interaction, league: str):
     await _send_paginated(interaction, embeds)
 
 
-# ── /fixtures ──────────────────────────────────────────────────────────────
+# ── /fixtures ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="fixtures", description="Upcoming fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -202,7 +201,7 @@ async def cmd_fixtures(interaction: discord.Interaction, league: str):
     await _send_paginated(interaction, embeds)
 
 
-# ── /match ─────────────────────────────────────────────────────────────────
+# ── /match ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="match", description="Events and stats for a fixture")
 @app_commands.describe(fixture_id="APF Fixture ID (from /live or /fixtures)")
 async def cmd_match(interaction: discord.Interaction, fixture_id: int):
@@ -224,7 +223,7 @@ async def cmd_match(interaction: discord.Interaction, fixture_id: int):
         await interaction.followup.send(chunk)
 
 
-# ── /team ──────────────────────────────────────────────────────────────────
+# ── /team ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="team", description="Last 5 results for a team")
 @app_commands.describe(name="Team name")
 async def cmd_team(interaction: discord.Interaction, name: str):
@@ -237,7 +236,7 @@ async def cmd_team(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /form ──────────────────────────────────────────────────────────────────
+# ── /form ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="form", description="Recent form for a team (last 10)")
 @app_commands.describe(name="Team name")
 async def cmd_form(interaction: discord.Interaction, name: str):
@@ -250,7 +249,7 @@ async def cmd_form(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /standings ─────────────────────────────────────────────────────────────
+# ── /standings ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="standings", description="League table")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -261,7 +260,7 @@ async def cmd_standings(interaction: discord.Interaction, league: str):
     await interaction.followup.send(embed=standings_embed(data, lid))
 
 
-# ── /topscorers ────────────────────────────────────────────────────────────
+# ── /topscorers ──────────────────────────────────────────────────────────────────
 @bot.tree.command(name="topscorers", description="Top scorers for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -272,7 +271,7 @@ async def cmd_topscorers(interaction: discord.Interaction, league: str):
     await interaction.followup.send(embed=topscorers_embed(data, lid))
 
 
-# ── /injuries ──────────────────────────────────────────────────────────────
+# ── /injuries ──────────────────────────────────────────────────────────────────
 @bot.tree.command(name="injuries", description="Team injury list")
 @app_commands.describe(name="Team name")
 async def cmd_injuries(interaction: discord.Interaction, name: str):
@@ -285,7 +284,7 @@ async def cmd_injuries(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=injuries_embed(team["name"], injuries))
 
 
-# ── /h2h ───────────────────────────────────────────────────────────────────
+# ── /h2h ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="h2h", description="Head to head between two teams")
 @app_commands.describe(team1="First team", team2="Second team")
 async def cmd_h2h(interaction: discord.Interaction, team1: str, team2: str):
@@ -299,7 +298,7 @@ async def cmd_h2h(interaction: discord.Interaction, team1: str, team2: str):
     await interaction.followup.send(embed=h2h_embed(t1["name"], t2["name"], fixtures))
 
 
-# ── /lineups ───────────────────────────────────────────────────────────────
+# ── /lineups ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="lineups", description="Match lineups (APF fixture ID)")
 @app_commands.describe(fixture_id="APF Fixture ID")
 async def cmd_lineups(interaction: discord.Interaction, fixture_id: int):
@@ -308,13 +307,15 @@ async def cmd_lineups(interaction: discord.Interaction, fixture_id: int):
     if not lineups:
         await interaction.followup.send("No lineup data yet.")
         return
-    m = {"home": lineups[0]["team"]["name"] if lineups else "?",
-         "away": lineups[1]["team"]["name"] if len(lineups) > 1 else "?",
-         "league_id": 0}
+    m = {
+        "home": (lineups[0].get("team") or {}).get("name", "?"),
+        "away": (lineups[1].get("team") or {}).get("name", "?") if len(lineups) > 1 else "?",
+        "league_id": 0,
+    }
     await interaction.followup.send(embed=lineups_embed(m, lineups))
 
 
-# ── /prediction ────────────────────────────────────────────────────────────
+# ── /prediction ──────────────────────────────────────────────────────────────────
 @bot.tree.command(name="prediction", description="AI match prediction (APF fixture ID)")
 @app_commands.describe(fixture_id="APF Fixture ID")
 async def cmd_prediction(interaction: discord.Interaction, fixture_id: int):
@@ -329,7 +330,7 @@ async def cmd_prediction(interaction: discord.Interaction, fixture_id: int):
     await interaction.followup.send(embed=prediction_embed(m, pred))
 
 
-# ── /player ────────────────────────────────────────────────────────────────
+# ── /player ───────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="player", description="Player stats by ID")
 @app_commands.describe(player_id="Player ID from API-Football")
 async def cmd_player(interaction: discord.Interaction, player_id: int):
@@ -354,7 +355,7 @@ async def cmd_player(interaction: discord.Interaction, player_id: int):
     await interaction.followup.send(embed=embed)
 
 
-# ── /transfers ─────────────────────────────────────────────────────────────
+# ── /transfers ─────────────────────────────────────────────────────────────────
 @bot.tree.command(name="transfers", description="Recent transfers for a team")
 @app_commands.describe(name="Team name")
 async def cmd_transfers(interaction: discord.Interaction, name: str):
@@ -381,7 +382,7 @@ async def cmd_transfers(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=embed)
 
 
-# ── /subscribe ─────────────────────────────────────────────────────────────
+# ── /subscribe ─────────────────────────────────────────────────────────────────
 @bot.tree.command(name="subscribe", description="Get live alerts in this channel")
 @app_commands.describe(league="League to subscribe to")
 @app_commands.choices(league=_league_choices())
@@ -399,7 +400,7 @@ async def cmd_subscribe(interaction: discord.Interaction, league: str):
     await interaction.response.send_message(embed=embed)
 
 
-# ── /unsubscribe ───────────────────────────────────────────────────────────
+# ── /unsubscribe ───────────────────────────────────────────────────────────────
 @bot.tree.command(name="unsubscribe", description="Stop all alerts in this channel")
 async def cmd_unsubscribe(interaction: discord.Interaction):
     cid = interaction.channel_id
@@ -410,7 +411,7 @@ async def cmd_unsubscribe(interaction: discord.Interaction):
     )
 
 
-# ── /subs ──────────────────────────────────────────────────────────────────
+# ── /subs ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="subs", description="Active subscriptions for this channel")
 async def cmd_subs(interaction: discord.Interaction):
     leagues = notifier.subscriptions.get(interaction.channel_id, set())
@@ -422,7 +423,7 @@ async def cmd_subs(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── /favorites ─────────────────────────────────────────────────────────────
+# ── /favorites ─────────────────────────────────────────────────────────────────
 favorites_group = app_commands.Group(name="favorites", description="Manage your favorite teams")
 bot.tree.add_command(favorites_group)
 
@@ -457,7 +458,7 @@ async def fav_remove(interaction: discord.Interaction, team_id: int):
     await interaction.response.send_message(f"Removed team `{team_id}` from favorites.", ephemeral=True)
 
 
-# ── /stats (bot performance) ───────────────────────────────────────────────
+# ── /stats (bot performance) ──────────────────────────────────────────────────────
 @bot.tree.command(name="stats", description="Bot performance stats (provider latency)")
 async def cmd_stats(interaction: discord.Interaction):
     from http_client import stats_summary

@@ -39,7 +39,7 @@ async def _no_events() -> list:
     return []
 
 
-# ── Live state ─────────────────────────────────────────────────────────────
+# ── Live state ─────────────────────────────────────────────────────────────────────
 # { sofa_id | "apf_{id}": FixtureState }
 _state: dict[Any, dict[str, Any]] = {}
 
@@ -84,15 +84,13 @@ async def _tick(bot: discord.Client) -> None:
         return
 
     # ── Build ESPN fetch tasks for every subscribed league that has a slug ──
-    # espn_live() returns (matches, events_by_home_norm|away_norm) in one HTTP
-    # call per league — no per-fixture follow-up needed.
     espn_slugs: list[tuple[int, str]] = [
         (apf_lid, slug)
         for apf_lid, slug in ESPN_LEAGUE_MAP.items()
         if apf_lid in active_leagues
     ]
 
-    # ── Fetch all three providers concurrently ──────────────────────────────
+    # ── Fetch all three providers concurrently ────────────────────────────────
     results = await asyncio.gather(
         prov.sofa_live_matches(),
         prov.apf_live(),
@@ -111,9 +109,7 @@ async def _tick(bot: discord.Client) -> None:
         log.warning("[notifier] API-Football fetch failed: %s", apf_matches)
         apf_matches = []
 
-    # ── Build ESPN events index keyed by "home_norm|away_norm" ─────────────
-    # This is what lets us look up pre-fetched ESPN events per match without
-    # any extra HTTP calls during the per-fixture loop below.
+    # ── Build ESPN events index keyed by "home_norm|away_norm" ─────────────────
     espn_events_index: dict[str, list[dict]] = {}
     for i, (apf_lid, slug) in enumerate(espn_slugs):
         result = espn_results[i]
@@ -130,7 +126,7 @@ async def _tick(bot: discord.Client) -> None:
 
     seen_sofa_ids: set[int] = set()
 
-    # ── Process SofaScore matches (primary source) ─────────────────────────
+    # ── Process SofaScore matches (primary source) ───────────────────────────
     for sm in sofa_matches:
         apf_lid = sm["league_id"]
         if apf_lid not in active_leagues:
@@ -140,7 +136,6 @@ async def _tick(bot: discord.Client) -> None:
         seen_sofa_ids.add(sofa_id)
         channels = _channels_for(apf_lid)
 
-        # Cross-link to APF match for stadium/referee metadata
         apf_m = apf_index.get(f"{sm['home_norm']}|{sm['away_norm']}")
         if apf_m:
             sm["apf_id"]  = apf_m["apf_id"]
@@ -161,7 +156,6 @@ async def _tick(bot: discord.Client) -> None:
         prev = _state[sofa_id]
         prev["match"] = sm
 
-        # ── Status transitions ──────────────────────────────────────────
         old_status, new_status = prev["status"], sm["status"]
         if new_status != old_status:
             prev["status"] = new_status
@@ -180,7 +174,6 @@ async def _tick(bot: discord.Client) -> None:
                 _state.pop(sofa_id, None)
                 continue
 
-        # ── Fetch SofaScore + APF events concurrently ──────────────────
         apf_id = prev.get("apf_id") or sm.get("apf_id")
         sofa_events, apf_events = await asyncio.gather(
             prov.sofa_incidents(sofa_id, sm["home"], sm["away"]),
@@ -192,10 +185,8 @@ async def _tick(bot: discord.Client) -> None:
         if isinstance(apf_events, Exception):
             apf_events = []
 
-        # ESPN events for this match pair (already in memory — no extra HTTP call)
         espn_evs = espn_events_index.get(f"{sm['home_norm']}|{sm['away_norm']}", [])
 
-        # ── Merge: ESPN first so it claims fingerprints before slower sources ──
         fps = prev["fingerprints"]
         for ev in list(espn_evs) + list(sofa_events) + list(apf_events):
             fp = ev.get("fingerprint", "")
@@ -211,7 +202,6 @@ async def _tick(bot: discord.Client) -> None:
         apf_lid = am["league_id"]
         if apf_lid not in active_leagues:
             continue
-        # Skip if already handled via SofaScore
         if any(
             names_match(s["match"]["home"], am["home"]) and
             names_match(s["match"]["away"], am["away"])
@@ -230,6 +220,7 @@ async def _tick(bot: discord.Client) -> None:
             continue
 
         prev       = _state[state_key]
+        prev["match"] = am
         old_status = prev["status"]
         new_status = am["status"]
         if new_status != old_status:
@@ -244,20 +235,28 @@ async def _tick(bot: discord.Client) -> None:
                 continue
 
         espn_evs = espn_events_index.get(f"{am['home_norm']}|{am['away_norm']}", [])
-        apf_events = await prov.apf_events(apf_fid)
-        if isinstance(apf_events, Exception):
-            apf_events = []
+        try:
+            apf_events_list = await prov.apf_events(apf_fid)
+        except Exception as exc:
+            log.warning("[notifier] APF events error for fixture %s: %s", apf_fid, exc)
+            apf_events_list = []
 
         fps = prev["fingerprints"]
-        for ev in list(espn_evs) + list(apf_events):
+        for ev in list(espn_evs) + list(apf_events_list):
             fp = ev.get("fingerprint", "")
             if not fp or fp in fps:
                 continue
             fps.add(fp)
             await _send(bot, channels, embed=event_embed(ev, am))
 
-    # ── Cleanup stale state entries ─────────────────────────────────────────
+    # ── Cleanup stale state entries ───────────────────────────────────────────
+    seen_apf_ids = {m["apf_id"] for m in apf_matches if m.get("apf_id")}
     for key in list(_state):
         if isinstance(key, int) and key not in seen_sofa_ids:
             if _state[key].get("match", {}).get("finished", False):
                 _state.pop(key, None)
+        elif isinstance(key, str):
+            apf_fid = _state[key].get("apf_id")
+            if apf_fid and apf_fid not in seen_apf_ids:
+                if _state[key].get("match", {}).get("finished", False):
+                    _state.pop(key, None)

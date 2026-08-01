@@ -21,14 +21,7 @@ _REFRESH_INTERVAL = 1800  # seconds — 30 min
 
 _cookies: str = ""
 _last_refresh: float = 0.0
-_lock: asyncio.Lock | None = None
-
-
-def _get_lock() -> asyncio.Lock:
-    global _lock
-    if _lock is None:
-        _lock = asyncio.Lock()
-    return _lock
+_lock = asyncio.Lock()
 
 
 def _fetch_sync() -> str:
@@ -38,7 +31,6 @@ def _fetch_sync() -> str:
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
     resp = scraper.get(_SOFA_HOME, timeout=30)
-    # Combine all cookies into a single Cookie header string
     return "; ".join(f"{k}={v}" for k, v in resp.cookies.items())
 
 
@@ -51,7 +43,7 @@ async def refresh(force: bool = False) -> bool:
     now = time.monotonic()
     if not force and _cookies and (now - _last_refresh) < _REFRESH_INTERVAL:
         return True
-    async with _get_lock():
+    async with _lock:
         # double-check after acquiring lock
         if not force and _cookies and (time.monotonic() - _last_refresh) < _REFRESH_INTERVAL:
             return True

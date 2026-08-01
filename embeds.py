@@ -154,7 +154,11 @@ def standings_embed(data: list, league_id: int) -> discord.Embed:
     if not data:
         embed.description = "No data."
         return embed
-    table = data[0]["league"]["standings"][0]
+    try:
+        table = data[0]["league"]["standings"][0]
+    except (KeyError, IndexError):
+        embed.description = "Standings data unavailable."
+        return embed
     rows  = ["`# ·  Team                 · P · W · D · L · GD· Pts`"]
     for r in table[:20]:
         rows.append(
@@ -215,7 +219,8 @@ def injuries_embed(team_name: str, injuries: list) -> discord.Embed:
     lines = []
     for item in injuries[:15]:
         p      = item.get("player", {})
-        reason = p.get("reason", "Injury")
+        inj    = item.get("injury") or {}
+        reason = inj.get("type") or inj.get("reason") or "Injury"
         lines.append(f"• **{p.get('name', '')}** — {reason}")
     embed.description = "\n".join(lines) or "No injury data."
     return embed
@@ -242,10 +247,10 @@ def lineups_embed(match: dict, lineups: list) -> discord.Embed:
         color=_color(lid),
     )
     for team_block in lineups[:2]:
-        team_name = team_block.get("team", {}).get("name", "?")
+        team_name = (team_block.get("team") or {}).get("name", "?")
         formation = team_block.get("formation", "?")
         starters  = team_block.get("startXI", [])
-        names     = [p["player"]["name"] for p in starters if p.get("player")]
+        names     = [p["player"].get("name", "?") for p in starters if p.get("player")]
         embed.add_field(
             name=f"{team_name} ({formation})",
             value="\n".join(f"{i+1}. {n}" for i, n in enumerate(names)) or "N/A",

@@ -5,12 +5,13 @@ Shared aiohttp session with:
 - Per-provider semaphore (max concurrent requests)
 - Response-time metrics
 - If-Modified-Since support
+- Optional refresh_fn callback invoked on HTTP 403 before retrying
 - Clean shutdown
 """
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 
@@ -66,18 +67,26 @@ async def get(
     params: dict | None = None,
     cache_key: str = "",
     provider: str = "unknown",
+    refresh_fn: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any] | None:
     """
     Perform a GET with retry, backoff, If-Modified-Since, and metrics.
+
+    refresh_fn: optional async callable invoked when a 403 is received.
+                After calling it, headers are re-copied on the next attempt
+                so any cookie updates land automatically.
+
     Returns None on 304 (not modified) or after all retries exhausted.
     """
-    hdrs = dict(headers)
-    if cache_key and cache_key in _last_modified:
-        hdrs["If-Modified-Since"] = _last_modified[cache_key]
-
     sem = get_semaphore()
 
     for attempt in range(MAX_RETRIES):
+        # Re-copy headers each attempt so cookie/token updates from refresh_fn
+        # are picked up without needing to restart the whole call.
+        hdrs = dict(headers)
+        if cache_key and cache_key in _last_modified:
+            hdrs["If-Modified-Since"] = _last_modified[cache_key]
+
         t0 = time.monotonic()
         try:
             async with sem:
@@ -91,6 +100,19 @@ async def get(
                     if resp.status == 304:
                         log.debug("[%s] 304 Not Modified: %s", provider, url)
                         return None
+
+                    if resp.status == 403:
+                        if refresh_fn and attempt < MAX_RETRIES - 1:
+                            log.warning(
+                                "[%s] HTTP 403 — refreshing session (attempt %d/%d)",
+                                provider, attempt + 1, MAX_RETRIES,
+                            )
+                            await refresh_fn()
+                            await asyncio.sleep(1)
+                            continue
+                        log.error("[%s] HTTP error 403: %s", provider, url)
+                        _errors[provider] = _errors.get(provider, 0) + 1
+                        break
 
                     if resp.status in RETRY_STATUSES:
                         wait = BACKOFF_BASE ** (attempt + 1)

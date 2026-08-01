@@ -1,6 +1,6 @@
 """
 Three free data providers, polled concurrently:
-  - SofaScore    (unofficial, no key)
+  - SofaScore    (unofficial, no key — session cookies via cloudscraper)
   - API-Football (official, needs APIFOOTBALL_API_KEY)
   - ESPN         (unofficial, no key, bundles events with the scoreboard —
                   usually the fastest since it needs only one HTTP call)
@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 import http_client as hc
+import sofa_session
 from config import APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV
 from normalizer import normalize
 
@@ -33,8 +34,9 @@ Event = dict[str, Any]
 
 _SOFA = "https://api.sofascore.com/api/v1"
 
-# Full Chrome 126 headers — incomplete UA or missing Sec-Fetch-* triggers 403
-_SOFA_HDR = {
+# Full Chrome 126 headers — incomplete UA or missing Sec-Fetch-* triggers 403.
+# The Cookie key is populated at runtime by _ensure_sofa_session().
+_SOFA_HDR: dict[str, str] = {
     "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept":             "application/json, text/plain, */*",
     "Accept-Language":    "en-US,en;q=0.9",
@@ -46,7 +48,7 @@ _SOFA_HDR = {
     "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest":     "empty",
     "Sec-Fetch-Mode":     "cors",
-    "Sec-Fetch-Site":     "same-origin",
+    "Sec-Fetch-Site":     "same-site",
     "Cache-Control":      "no-cache",
     "Pragma":             "no-cache",
 }
@@ -71,6 +73,27 @@ _SOFA_INCIDENT_MAP = {
 }
 _SOFA_CARD_ICONS = {"yellow": "🟨", "red": "🟥", "yellowRed": "🟨🟥"}
 _SOFA_GOAL_ICONS = {"ownGoal": ("⚽🙈", "Own Goal"), "penalty": ("⚽🎯", "Penalty Goal")}
+
+
+async def _ensure_sofa_session() -> None:
+    """Prime the SofaScore session on first use and inject cookies into _SOFA_HDR."""
+    if sofa_session.needs_refresh():
+        await sofa_session.refresh()
+    cookie = sofa_session.cookie_header()
+    if cookie:
+        _SOFA_HDR["Cookie"] = cookie
+
+
+async def _sofa_refresh() -> bool:
+    """
+    Passed as refresh_fn to hc.get for all SofaScore requests.
+    Forces a new cloudscraper session and updates the shared header dict
+    so the next retry attempt picks up fresh Cloudflare cookies.
+    """
+    ok = await sofa_session.refresh(force=True)
+    if ok:
+        _SOFA_HDR["Cookie"] = sofa_session.cookie_header()
+    return ok
 
 
 def _sofa_norm_match(e: dict) -> Match:
@@ -186,25 +209,31 @@ def canonical_fingerprint(team_norm: str, minute: int, category: str) -> str:
 
 
 async def sofa_live_matches() -> list[Match]:
+    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/sport/football/events/live", _SOFA_HDR,
-                        cache_key="sofa_live", provider="sofascore")
+                        cache_key="sofa_live", provider="sofascore",
+                        refresh_fn=_sofa_refresh)
     return [_sofa_norm_match(e) for e in (data or {}).get("events", [])]
 
 
 async def sofa_incidents(sofa_id: int, home: str, away: str) -> list[Event]:
+    await _ensure_sofa_session()
     data = await hc.get(f"{_SOFA}/event/{sofa_id}/incidents", _SOFA_HDR,
-                        cache_key=f"sofa_inc_{sofa_id}", provider="sofascore")
+                        cache_key=f"sofa_inc_{sofa_id}", provider="sofascore",
+                        refresh_fn=_sofa_refresh)
     return [n for inc in (data or {}).get("incidents", [])
             if (n := _sofa_norm_incident(inc, home, away)) is not None]
 
 
 async def sofa_upcoming(sofa_lid: int, days: int = 7) -> list[Match]:
     from datetime import date, timedelta
+    await _ensure_sofa_session()
     results = []
     for i in range(days):
         d = (date.today() + timedelta(days=i)).strftime("%Y-%m-%d")
         data = await hc.get(f"{_SOFA}/sport/football/scheduled-events/{d}",
-                            _SOFA_HDR, provider="sofascore")
+                            _SOFA_HDR, provider="sofascore",
+                            refresh_fn=_sofa_refresh)
         for e in (data or {}).get("events", []):
             tid = e.get("tournament", {}).get("uniqueTournament", {}).get("id")
             if tid == sofa_lid:
@@ -213,12 +242,16 @@ async def sofa_upcoming(sofa_lid: int, days: int = 7) -> list[Match]:
 
 
 async def sofa_lineups(sofa_id: int) -> dict:
-    data = await hc.get(f"{_SOFA}/event/{sofa_id}/lineups", _SOFA_HDR, provider="sofascore")
+    await _ensure_sofa_session()
+    data = await hc.get(f"{_SOFA}/event/{sofa_id}/lineups", _SOFA_HDR,
+                        provider="sofascore", refresh_fn=_sofa_refresh)
     return data or {}
 
 
 async def sofa_h2h(sofa_id: int) -> list[Match]:
-    data = await hc.get(f"{_SOFA}/event/{sofa_id}/h2h/events", _SOFA_HDR, provider="sofascore")
+    await _ensure_sofa_session()
+    data = await hc.get(f"{_SOFA}/event/{sofa_id}/h2h/events", _SOFA_HDR,
+                        provider="sofascore", refresh_fn=_sofa_refresh)
     events = (data or {}).get("previousEvents", [])
     return [_sofa_norm_match(e) for e in events[:10]]
 

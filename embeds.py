@@ -29,7 +29,20 @@ def _source_dot(provider: str) -> str:
     return _SOURCE_DOTS.get(provider, "⚪")
 
 
-# ── Match card ─────────────────────────────────────────────────────────────
+def _apf_id(match: dict) -> int | None:
+    """
+    Return a numeric API-Football fixture ID from a match dict, or None.
+    ESPN IDs ("espn_...") and SofaScore IDs ("sofa_...") are not valid
+    APF IDs and must be rejected before passing to apf_* functions.
+    """
+    raw = match.get("apf_id") or match.get("id")
+    if raw is None:
+        return None
+    s = str(raw)
+    return int(s) if s.isdigit() else None
+
+
+# ── Match card ────────────────────────────────────────────────────────────────────────
 
 def match_embed(m: dict, title_prefix: str = "") -> discord.Embed:
     lid    = m.get("league_id", 0)
@@ -105,11 +118,11 @@ def alert_embed(msg_type: str, match: dict) -> discord.Embed:
     )
     embed.set_author(name=match["league"], icon_url=_logo(lid))
     if match.get("stadium"):
-        embed.set_footer(text=f"🏟 {match['stadium']}")
+        embed.set_footer(text=f"🏙 {match['stadium']}")
     return embed
 
 
-# ── Fixtures list ──────────────────────────────────────────────────────────
+# ── Fixtures list ────────────────────────────────────────────────────────────────────
 
 def fixtures_embed(fixtures: list[dict], league_id: int, title: str) -> list[discord.Embed]:
     """Paginate fixtures into ≤10 per embed."""
@@ -130,7 +143,7 @@ def fixtures_embed(fixtures: list[dict], league_id: int, title: str) -> list[dis
     return embeds or [discord.Embed(title=title, description="No fixtures found.", color=0x888888)]
 
 
-# ── Standings ──────────────────────────────────────────────────────────────
+# ── Standings ──────────────────────────────────────────────────────────────────────
 
 def standings_embed(data: list, league_id: int) -> discord.Embed:
     embed = discord.Embed(
@@ -158,7 +171,7 @@ def standings_embed(data: list, league_id: int) -> discord.Embed:
     return embed
 
 
-# ── Top scorers ────────────────────────────────────────────────────────────
+# ── Top scorers ────────────────────────────────────────────────────────────────────
 
 def topscorers_embed(data: list, league_id: int) -> discord.Embed:
     embed = discord.Embed(
@@ -177,10 +190,10 @@ def topscorers_embed(data: list, league_id: int) -> discord.Embed:
     return embed
 
 
-# ── Team last N ────────────────────────────────────────────────────────────
+# ── Team last N ────────────────────────────────────────────────────────────────────
 
 def team_embed(team_name: str, fixtures: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"🏟 {team_name} — Last {len(fixtures)}", color=0x2B2D31)
+    embed = discord.Embed(title=f"🏙 {team_name} — Last {len(fixtures)}", color=0x2B2D31)
     lines = []
     for f in fixtures:
         sh, sa = f["home_score"], f["away_score"]
@@ -195,20 +208,20 @@ def team_embed(team_name: str, fixtures: list[dict]) -> discord.Embed:
     return embed
 
 
-# ── Injuries ───────────────────────────────────────────────────────────────
+# ── Injuries ───────────────────────────────────────────────────────────────────────
 
 def injuries_embed(team_name: str, injuries: list) -> discord.Embed:
     embed = discord.Embed(title=f"🏥 {team_name} — Injuries", color=0xE53935)
     lines = []
     for item in injuries[:15]:
         p      = item.get("player", {})
-        reason = p.get("reason", "Injury")  # was fetched twice before; single fetch now
+        reason = p.get("reason", "Injury")
         lines.append(f"• **{p.get('name', '')}** — {reason}")
     embed.description = "\n".join(lines) or "No injury data."
     return embed
 
 
-# ── H2H ───────────────────────────────────────────────────────────────────
+# ── H2H ─────────────────────────────────────────────────────────────────────────────
 
 def h2h_embed(team1: str, team2: str, fixtures: list[dict]) -> discord.Embed:
     embed = discord.Embed(title=f"⚔️ H2H: {team1} vs {team2}", color=0x7B68EE)
@@ -220,7 +233,7 @@ def h2h_embed(team1: str, team2: str, fixtures: list[dict]) -> discord.Embed:
     return embed
 
 
-# ── Lineups ────────────────────────────────────────────────────────────────
+# ── Lineups ────────────────────────────────────────────────────────────────────────
 
 def lineups_embed(match: dict, lineups: list) -> discord.Embed:
     lid   = match.get("league_id", 0)
@@ -241,7 +254,7 @@ def lineups_embed(match: dict, lineups: list) -> discord.Embed:
     return embed
 
 
-# ── Prediction ─────────────────────────────────────────────────────────────
+# ── Prediction ─────────────────────────────────────────────────────────────────────
 
 def prediction_embed(match: dict, pred: dict) -> discord.Embed:
     lid    = match.get("league_id", 0)
@@ -268,12 +281,16 @@ class MatchView(discord.ui.View):
     @discord.ui.button(label="📊 Stats", style=discord.ButtonStyle.secondary)
     async def stats_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
         from providers import apf_stats
-        apf_id = self.match.get("apf_id") or self.match.get("id")
+        apf_id = _apf_id(self.match)
         await interaction.response.defer(ephemeral=True)
-        if not apf_id or str(apf_id).startswith("sofa_"):
-            await interaction.followup.send("Stats require an API-Football fixture ID.", ephemeral=True)
+        if apf_id is None:
+            await interaction.followup.send(
+                "Stats require an API-Football fixture ID. "
+                "This match was sourced from ESPN or SofaScore only.",
+                ephemeral=True,
+            )
             return
-        stats = await apf_stats(int(apf_id))
+        stats = await apf_stats(apf_id)
         if not stats:
             await interaction.followup.send("No stats available yet.", ephemeral=True)
             return
@@ -287,12 +304,16 @@ class MatchView(discord.ui.View):
     @discord.ui.button(label="📋 Events", style=discord.ButtonStyle.secondary)
     async def events_btn(self, interaction: discord.Interaction, btn: discord.ui.Button):
         from providers import apf_events
-        apf_id = self.match.get("apf_id") or self.match.get("id")
+        apf_id = _apf_id(self.match)
         await interaction.response.defer(ephemeral=True)
-        if not apf_id or str(apf_id).startswith("sofa_"):
-            await interaction.followup.send("Events require an API-Football fixture ID.", ephemeral=True)
+        if apf_id is None:
+            await interaction.followup.send(
+                "Events require an API-Football fixture ID. "
+                "This match was sourced from ESPN or SofaScore only.",
+                ephemeral=True,
+            )
             return
-        events = await apf_events(int(apf_id))
+        events = await apf_events(apf_id)
         if not events:
             await interaction.followup.send("No events yet.", ephemeral=True)
             return

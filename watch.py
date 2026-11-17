@@ -42,6 +42,12 @@ DETAIL_ADVANCED = "advanced"
 # enough to end a watch).
 MISSING_TICKS_TO_END = 10
 
+# Gemini gets this long to resolve free text; on timeout the
+# caller falls back to the candidate list instead of hanging the
+# /watch reply. (wait_for cancels the wait, not the model call —
+# the thread finishes on its own in the background.)
+AI_TIMEOUT_S = 15
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # RENDERING (pure — no Discord, no network)
@@ -307,8 +313,14 @@ async def parse_watch_ai(text: str, grounding: list[dict],
         for g in grounding)
     prompt = _AI_PROMPT.replace("__GAMES__", games).replace("__TEXT__", text)
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, prompt),
+            timeout=AI_TIMEOUT_S)
         raw = (getattr(response, "text", "") or "").strip()
+    except asyncio.TimeoutError:
+        log.warning("[watch] Gemini resolve timed out (%ss) — using candidates",
+                    AI_TIMEOUT_S)
+        return None
     except Exception as exc:
         log.warning("[watch] Gemini resolve failed (%s)", type(exc).__name__)
         return None
@@ -358,25 +370,30 @@ async def resolve_watch(text: str, model) -> dict:
     """Resolve free text to a game: game ID first, then exact/
     unique team-name match, then Gemini on the grounding list.
     Returns {"game_id"|None, "action", "detail", "candidates",
-    "entry"|None, "source"}. Never invents an id."""
+    "entry"|None, "source"}. Never invents an id.
+    "detail" is None for the deterministic paths — the /watch
+    dropdown always wins, and a hardcoded "simple" here used to
+    discard the user's Advanced choice. The AI path keeps the
+    AI's parsed detail as advisory only; the command still
+    prefers the dropdown."""
     q = (text or "").strip()
     if not q:
-        return {"game_id": None, "action": "follow", "detail": DETAIL_SIMPLE,
+        return {"game_id": None, "action": "follow", "detail": None,
                 "candidates": [], "entry": None, "source": "none"}
     if q.isdigit() and len(q) >= 5:
-        return {"game_id": q, "action": "follow", "detail": DETAIL_SIMPLE,
+        return {"game_id": q, "action": "follow", "detail": None,
                 "candidates": [], "entry": None, "source": "id"}
     grounding = await prov.onex_grounding()
     exact = [g for g in grounding
              if _norm(g["home"]) == _norm(q) or _norm(g["away"]) == _norm(q)]
     if len(exact) == 1:
         return {"game_id": str(exact[0]["id"]), "action": "follow",
-                "detail": DETAIL_SIMPLE, "candidates": [], "entry": exact[0],
+                "detail": None, "candidates": [], "entry": exact[0],
                 "source": "name"}
     matches = _match_entries(q, grounding)
     if len(matches) == 1:
         return {"game_id": str(matches[0]["id"]), "action": "follow",
-                "detail": DETAIL_SIMPLE, "candidates": [], "entry": matches[0],
+                "detail": None, "candidates": [], "entry": matches[0],
                 "source": "name"}
     ai = await parse_watch_ai(q, grounding, model)
     if ai and ai.get("game_id"):
@@ -385,7 +402,7 @@ async def resolve_watch(text: str, model) -> dict:
         return {"game_id": str(ai["game_id"]), "action": ai["action"],
                 "detail": ai["detail"], "candidates": [],
                 "entry": entry, "source": "ai", "note": ai.get("note", "")}
-    return {"game_id": None, "action": "follow", "detail": DETAIL_SIMPLE,
+    return {"game_id": None, "action": "follow", "detail": None,
             "candidates": matches[:5], "entry": None, "source": "none"}
 
 

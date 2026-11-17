@@ -11,9 +11,11 @@ from the footballbot directory.
 import asyncio
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -508,6 +510,145 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("no longer live", self.channel.sent[0].content)
         self.assertEqual(wmod._watches, {})
+
+
+class FakeResponse:
+    async def defer(self, ephemeral=False):
+        return None
+
+
+class FakeFollowup:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send(self, content, ephemeral=False):
+        self.sent.append(content)
+
+
+class FakeInteraction:
+    """Stand-in for a /watch slash-command interaction."""
+
+    def __init__(self, channel_id=777):
+        self.channel_id = channel_id
+        self.channel = SimpleNamespace(id=channel_id)
+        self.response = FakeResponse()
+        self.followup = FakeFollowup()
+
+
+class SlowModel:
+    """Gemini that takes 0.5s to answer (too slow for the timeout)."""
+
+    def generate_content(self, prompt):
+        time.sleep(0.5)
+        response = Mock()
+        response.text = ('{"game_id": "771800001", "action": "follow", '
+                         '"detail": "simple", "note": "Lumbini"}')
+        return response
+
+
+class TestLatencyFixes(unittest.IsolatedAsyncioTestCase):
+    """The /watch slowness fix: the scoreboard's 1s tick cache is
+    shared with /game and /watch, fixtures are cached ~60s, a slow
+    Gemini call times out, and the user's Advanced dropdown wins."""
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {
+            "771747666": _load("gameinfo_771747666.json"),
+            "771747795": _load("gameinfo_alias.json"),
+        }
+        self.stub = StubHttp(self)
+        prov.hc.get = self.stub.get
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+
+    async def test_live_raw_second_call_uses_tick_cache(self):
+        first = await prov.onex_live_raw()
+        self.assertEqual(sorted(self.stub.calls), ["games1x2", "top"])
+        second = await prov.onex_live_raw()
+        self.assertEqual(self.stub.calls, ["games1x2", "top"])
+        self.assertEqual(second, first)
+
+    async def test_grounding_second_call_makes_no_http_call(self):
+        await prov.onex_grounding()
+        calls_after_first = list(self.stub.calls)
+        # First grounding: live list + the NPL line menu only
+        # (UEFA champ discovery is served from the live cache).
+        self.assertIn("line", calls_after_first)
+        await prov.onex_grounding()
+        self.assertEqual(self.stub.calls, calls_after_first)
+
+    async def test_fixture_cache_reused_within_60s(self):
+        await prov.onex_npl_fixtures()
+        self.assertEqual(self.stub.calls.count("line"), 1)
+        await prov.onex_npl_fixtures()
+        self.assertEqual(self.stub.calls.count("line"), 1)
+        # Forcing the entry stale makes the next call re-fetch.
+        ts, data = prov._fix_cache["npl"]
+        prov._fix_cache["npl"] = (time.monotonic() - 61, data)
+        await prov.onex_npl_fixtures()
+        self.assertEqual(self.stub.calls.count("line"), 2)
+
+    async def test_live_cache_expires_after_tick_window(self):
+        await prov.onex_live_raw()
+        self.assertEqual(len(self.stub.calls), 2)
+        prov._live_cache["ts"] = time.monotonic() - 4
+        await prov.onex_live_raw()
+        self.assertEqual(len(self.stub.calls), 4)
+
+    async def test_resolve_id_and_name_return_no_detail(self):
+        # Deterministic paths must not hardcode "simple" — the
+        # /watch dropdown decides the detail level.
+        out = await wmod.resolve_watch("771747666", None)
+        self.assertEqual(out["game_id"], "771747666")
+        self.assertIsNone(out["detail"])
+        out = await wmod.resolve_watch("Gambia", None)
+        self.assertEqual(out["game_id"], "771747666")
+        self.assertIsNone(out["detail"])
+
+    async def test_dropdown_advanced_wins_over_resolved_simple(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771747666", "action": "follow",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771747666",
+                              "home": "Republic of the Gambia",
+                              "away": "Ivory Coast",
+                              "league": "Africa Cup of Nations",
+                              "status": "2H"},
+                    "source": "id"}
+        started = {"game_id": "771747666",
+                   "home": "Republic of the Gambia",
+                   "away": "Ivory Coast",
+                   "league": "Africa Cup of Nations",
+                   "status": "2H", "detail": "advanced"}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)), \
+             patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(interaction, "771747666",
+                                            detail="advanced")
+        mock_start.assert_awaited_once()
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[2], "advanced")
+        self.assertTrue(any("advanced alerts" in s
+                            for s in interaction.followup.sent))
+
+    async def test_slow_gemini_times_out_and_returns_none(self):
+        with patch.object(wmod, "AI_TIMEOUT_S", 0.05):
+            start = time.monotonic()
+            out = await wmod.parse_watch_ai("the lions game",
+                                            TestAiParse.GROUNDING, SlowModel())
+            elapsed = time.monotonic() - start
+        self.assertIsNone(out)
+        self.assertLess(elapsed, 0.4)
 
 
 if __name__ == "__main__":

@@ -1312,24 +1312,57 @@ async def onex_game_detail(raw: dict) -> dict | None:
     return detail
 
 
+# --- shared tick cache --------------------------------------------------
+# The scoreboard loop fetches the live list every second
+# (onex_fetch_tick). Command handlers (/game, /watch) need the SAME
+# data — they must not re-fetch it. onex_live_raw() serves a copy
+# younger than _ONEX_LIVE_TTL_S; fixtures change slowly, so they are
+# cached for _ONEX_FIXTURES_TTL_S. Single event loop only — no locks
+# needed. Only non-empty results are cached: on a failed/empty fetch
+# the next call retries immediately, exactly like before, so the
+# scoreboard's back-off still sees one empty tick per second.
+_ONEX_LIVE_TTL_S = 3.0
+_ONEX_FIXTURES_TTL_S = 60.0
+_live_cache: dict[str, Any] = {"ts": 0.0, "raw": None}
+_fix_cache: dict[str, tuple[float, list[dict] | None]] = {
+    "npl": (0.0, None), "uefa": (0.0, None),
+}
+
+
+def _onex_reset_caches() -> None:
+    """Clear the live + fixture caches (tests only)."""
+    _live_cache["ts"] = 0.0
+    _live_cache["raw"] = None
+    _fix_cache["npl"] = (0.0, None)
+    _fix_cache["uefa"] = (0.0, None)
+
+
 async def onex_live_raw() -> list[dict]:
     """Merged raw live entries (games1x2 + topGamesByStat, deduped
-    by id), cache bypassed. One tick's worth of live data for the
-    scoreboard and the game watches — a single shared fetch."""
-    try:
-        data1 = await hc.get(f"{_ONEX_FEED}/games1x2", _ONEX_HDR,
-                             dict(_ONEX_GAMES1X2_PARAMS),
-                             cache_key="", provider="onexbet")
-    except Exception as exc:
-        log.warning("[onexbet] games1x2 failed (%s)", type(exc).__name__)
-        data1 = None
-    try:
-        data2 = await hc.get(f"{_ONEX_FEED}/topGamesByStat", _ONEX_HDR,
-                             dict(_ONEX_TOP_PARAMS),
-                             cache_key="", provider="onexbet")
-    except Exception as exc:
-        log.warning("[onexbet] topGamesByStat failed (%s)", type(exc).__name__)
-        data2 = None
+    by id). Served from the shared tick cache when it is younger
+    than _ONEX_LIVE_TTL_S — the scoreboard's 1-second loop refreshes
+    it, so /game and /watch usually cost zero HTTP calls. Otherwise
+    both lists are fetched in parallel and the cache is refreshed.
+    Callers must not mutate the returned list (it is the cache)."""
+    now = time.monotonic()
+    cached = _live_cache["raw"]
+    if cached is not None and now - _live_cache["ts"] < _ONEX_LIVE_TTL_S:
+        return cached
+
+    async def _one(url: str, params: dict) -> list | None:
+        try:
+            data = await hc.get(url, _ONEX_HDR, dict(params),
+                                cache_key="", provider="onexbet")
+        except Exception as exc:
+            log.warning("[onexbet] %s failed (%s)",
+                        url.rsplit("/", 1)[-1], type(exc).__name__)
+            return None
+        return data if isinstance(data, list) else None
+
+    data1, data2 = await asyncio.gather(
+        _one(f"{_ONEX_FEED}/games1x2", _ONEX_GAMES1X2_PARAMS),
+        _one(f"{_ONEX_FEED}/topGamesByStat", _ONEX_TOP_PARAMS),
+    )
     out: list[dict] = []
     seen: set[str] = set()
     for data in (data1, data2):
@@ -1341,6 +1374,9 @@ async def onex_live_raw() -> list[dict]:
                 continue
             seen.add(gid)
             out.append(g)
+    if out:
+        _live_cache["ts"] = time.monotonic()
+        _live_cache["raw"] = out
     return out
 
 
@@ -1436,9 +1472,25 @@ def _onex_norm_line_game(g: dict, league: str, default_format: str = "") -> dict
     return detail
 
 
+async def _onex_safe_fixtures(label: str, coro) -> list[dict]:
+    """One fixture list, [] on failure — search/grounding carry on."""
+    try:
+        return await coro
+    except Exception as exc:
+        log.warning("[onexbet] %s fixtures failed (%s)", label,
+                    type(exc).__name__)
+        return []
+
+
 async def onex_npl_fixtures() -> list[dict]:
     """NPL fixtures from the 1xBet line feed (champ 2791573).
-    1xBet only — no official-API merge here."""
+    1xBet only — no official-API merge here. Cached ~60s: fixtures
+    change slowly, and /game + /watch ask for them on every
+    command."""
+    now = time.monotonic()
+    ts, cached = _fix_cache["npl"]
+    if cached is not None and now - ts < _ONEX_FIXTURES_TTL_S:
+        return cached
     menu = await _onex_line_menu("1.66.2791573,2.66.2791573,10.66.2791573",
                                  "/en/line/cricket/2791573-nepal-premier-league")
     found = _onex_find_liga_games(menu, _ONEX_NPL_CHAMP_ID)
@@ -1448,32 +1500,38 @@ async def onex_npl_fixtures() -> list[dict]:
     for g in found["games"]:
         if (m := _onex_norm_line_game(g, "Nepal Premier League", "T20")) is not None:
             out.append(m)
+    if out:
+        _fix_cache["npl"] = (time.monotonic(), out)
     return out
 
 
 async def onex_uefa_fixtures() -> list[dict]:
     """UEFA fixtures from the line feed, for the champs that have
-    live games right now (champ ids discovered from games1x2).
+    live games right now (champ ids discovered from games1x2 —
+    served from the shared tick cache, not a fresh call).
     The line feed has no general search, so upcoming coverage is
-    NPL + UEFA only."""
-    try:
-        data = await hc.get(f"{_ONEX_FEED}/games1x2", _ONEX_HDR,
-                            dict(_ONEX_GAMES1X2_PARAMS),
-                            cache_key="", provider="onexbet")
-    except Exception:
-        return []
+    NPL + UEFA only. Cached ~60s, like the NPL fixtures."""
+    now = time.monotonic()
+    ts, cached = _fix_cache["uefa"]
+    if cached is not None and now - ts < _ONEX_FIXTURES_TTL_S:
+        return cached
+    raw = await onex_live_raw()
     champ_ids: list[int] = []
-    if isinstance(data, list):
-        for g in data:
-            liga = g.get("liga") or {}
-            if "uefa" in str(liga.get("name") or "").lower():
-                cid = liga.get("id")
-                if isinstance(cid, int) and cid not in champ_ids:
-                    champ_ids.append(cid)
+    for g in raw:
+        liga = g.get("liga") or {}
+        if "uefa" in str(liga.get("name") or "").lower():
+            cid = liga.get("id")
+            if isinstance(cid, int) and cid not in champ_ids:
+                champ_ids.append(cid)
+    if not champ_ids:
+        return []
+    menus = await asyncio.gather(*[
+        _onex_line_menu(f"1.1.{cid},2.1.{cid},10.1.{cid}",
+                        "/en/line/football")
+        for cid in champ_ids[:_ONEX_UEFA_MAX_CHAMPS]
+    ])
     out: list[dict] = []
-    for cid in champ_ids[:_ONEX_UEFA_MAX_CHAMPS]:
-        menu = await _onex_line_menu(f"1.1.{cid},2.1.{cid},10.1.{cid}",
-                                     "/en/line/football")
+    for cid, menu in zip(champ_ids[:_ONEX_UEFA_MAX_CHAMPS], menus):
         found = _onex_find_liga_games(menu, cid)
         if not found:
             continue
@@ -1481,6 +1539,8 @@ async def onex_uefa_fixtures() -> list[dict]:
             if (m := _onex_norm_line_game(g, found["name"])) is not None:
                 if not any(x["onex_id"] == m["onex_id"] for x in out):
                     out.append(m)
+    if out:
+        _fix_cache["uefa"] = (time.monotonic(), out)
     return out
 
 
@@ -1545,17 +1605,14 @@ async def onex_search(query: str) -> dict:
     for g in raw:
         _push(_onex_detail_from_raw(g))
     if len(out) < _ONEX_SEARCH_MAX:
-        try:
-            for m in await onex_npl_fixtures():
-                _push(m)
-        except Exception as exc:
-            log.warning("[onexbet] NPL fixtures failed (%s)", type(exc).__name__)
-    if len(out) < _ONEX_SEARCH_MAX:
-        try:
-            for m in await onex_uefa_fixtures():
-                _push(m)
-        except Exception as exc:
-            log.warning("[onexbet] UEFA fixtures failed (%s)", type(exc).__name__)
+        # Both fixture lists at once; each is cached ~60s, so this
+        # is usually free. A failed list is [] — search carries on.
+        npl, uefa = await asyncio.gather(
+            _onex_safe_fixtures("NPL", onex_npl_fixtures()),
+            _onex_safe_fixtures("UEFA", onex_uefa_fixtures()),
+        )
+        for m in npl + uefa:
+            _push(m)
     return {"games": out[:_ONEX_SEARCH_MAX], "detail": None}
 
 
@@ -1576,15 +1633,11 @@ async def onex_grounding() -> list[dict]:
         seen.add(gid)
         out.append({"id": gid, "home": m["home"], "away": m["away"],
                     "league": m["league"], "status": m["status"]})
-    try:
-        fixtures = await onex_npl_fixtures()
-    except Exception:
-        fixtures = []
-    try:
-        fixtures += await onex_uefa_fixtures()
-    except Exception:
-        pass
-    for m in fixtures:
+    npl, uefa = await asyncio.gather(
+        _onex_safe_fixtures("NPL", onex_npl_fixtures()),
+        _onex_safe_fixtures("UEFA", onex_uefa_fixtures()),
+    )
+    for m in npl + uefa:
         gid = str(m["onex_id"])
         if gid in seen:
             continue

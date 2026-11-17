@@ -494,8 +494,10 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         except Exception:
             result = {"detail": None}
         if result.get("detail"):
+            # The detail dropdown always wins: the resolver's
+            # "detail" is advisory only (None for id/name matches).
             await interaction.followup.send(
-                watch.render_detail(result["detail"], resolved.get("detail") or detail),
+                watch.render_detail(result["detail"], detail),
                 ephemeral=True)
             return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
@@ -522,8 +524,9 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
     entry = resolved.get("entry") or {"id": resolved["game_id"], "home": "",
                                       "away": "", "league": "", "status": ""}
     try:
-        started = await watch.start_watch(target.id, entry,
-                                          resolved.get("detail") or detail)
+        # The detail dropdown always wins — the resolver's "detail"
+        # (None for id/name matches) must never override it.
+        started = await watch.start_watch(target.id, entry, detail)
     except Exception:
         log.exception("[watch] start failed")
         await interaction.followup.send(

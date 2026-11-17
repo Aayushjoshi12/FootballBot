@@ -73,11 +73,11 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         await watch.load_watches()
-        # Persistent alert buttons: one view per watched game, so the
-        # 📊 Detail / 🔄 Live buttons on old alerts keep working
-        # after a restart.
-        for _cid, _gid in list(watch._watches):
-            self.add_view(watch.WatchAlertView(_gid))
+        # Persistent alert buttons: one static view covers every
+        # 📊 Detail / 🔄 Live button — the game id is resolved from
+        # the message each button sits on, so old buttons keep
+        # working after a restart.
+        self.add_view(watch.WatchAlertView())
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.
@@ -169,7 +169,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Live scores from **1xBet 🟠** for game search and watches; "
+            "Live scores for game search and watches; "
             "**SofaScore 🟡** + **ESPN 🟢** + **TheSportsDB** for fixtures and /live.\n"
         ),
         color=0x00C851,
@@ -425,8 +425,8 @@ async def cmd_stats(interaction: discord.Interaction):
 
 
 # ── /game ─────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="game", description="Detail for one game — by ID or team name (1xBet)")
-@app_commands.describe(query="Team, league or 1xBet game ID", detail="Simple or advanced detail")
+@bot.tree.command(name="game", description="Detail for one game — by ID or team name")
+@app_commands.describe(query="Team, league or game ID", detail="Simple or advanced detail")
 @app_commands.choices(detail=[
     app_commands.Choice(name="Simple", value="simple"),
     app_commands.Choice(name="Advanced", value="advanced"),
@@ -439,11 +439,12 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
     except Exception:
         log.exception("[game] search failed")
         await interaction.followup.send(
-            "Could not reach 1xBet right now. Please try again shortly.")
+            "Could not reach the live scores right now. Please try again shortly.")
         return
     if result.get("detail"):
         await interaction.followup.send(
-            watch.render_detail(result["detail"], detail))
+            watch.render_detail(result["detail"], detail),
+            view=watch.WatchAlertView())
         return
     games = result.get("games") or []
     if len(games) == 1:
@@ -453,9 +454,12 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
             again = {"detail": None}
         if again.get("detail"):
             await interaction.followup.send(
-                watch.render_detail(again["detail"], detail))
+                watch.render_detail(again["detail"], detail),
+                view=watch.WatchAlertView())
             return
-        await interaction.followup.send(watch.render_detail(games[0], detail))
+        await interaction.followup.send(
+            watch.render_detail(games[0], detail),
+            view=watch.WatchAlertView())
         return
     if games:
         await interaction.followup.send(watch.render_match_list(games))
@@ -467,12 +471,12 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
             + watch.render_top_games(suggestions, header=""))
         return
     await interaction.followup.send(
-        f"No game found for '{query}' on 1xBet. Try a team name, a league, "
+        f"No game found for '{query}'. Try a team name, a league, "
         "or the game ID from the match page.")
 
 
 # ── /watch ────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="watch", description="Follow one game — alerts here when it changes (1xBet)")
+@bot.tree.command(name="watch", description="Follow one game — alerts here when it changes")
 @app_commands.describe(
     what="Game ID, team/league name, or plain words like 'follow Lumbini, send advanced alerts to #general'",
     detail="Simple or advanced alerts (leave blank and the words decide)",
@@ -532,7 +536,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         if result.get("detail"):
             await interaction.followup.send(
                 watch.render_detail(result["detail"], level),
-                ephemeral=True)
+                ephemeral=True, view=watch.WatchAlertView())
             return
     if resolved.get("action") == "list":
         games = resolved.get("games") or []
@@ -541,7 +545,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                 watch.render_top_games(games), ephemeral=True)
         else:
             await interaction.followup.send(
-                "No games are live on 1xBet right now — try again when a match is on.",
+                "No games are live right now — try again when a match is on.",
                 ephemeral=True)
         return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
@@ -569,7 +573,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                     ephemeral=True)
             else:
                 await interaction.followup.send(
-                    f"Could not find a game for '{what}' on 1xBet. Try a game ID "
+                    f"Could not find a game for '{what}'. Try a game ID "
                     "or a team name.", ephemeral=True)
         return
     entry = resolved.get("entry") or {"id": resolved["game_id"], "home": "",
@@ -584,7 +588,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         return
     if not started:
         await interaction.followup.send(
-            "Could not find that game on 1xBet right now.", ephemeral=True)
+            "Could not find that game right now.", ephemeral=True)
         return
     await interaction.followup.send(
         f"👀 Watching **{started['home']} vs {started['away']}** "

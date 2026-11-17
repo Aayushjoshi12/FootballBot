@@ -17,7 +17,7 @@ _SOURCE_BADGES = {
     "sofascore":   "🟡 SofaScore",
     "apifootball": "🔵 API-Football",
     "espn":        "🟢 ESPN",
-    "onexbet":     "🟠 1xBet",
+    "onexbet":     "🟠 Live",
 }
 _SOURCE_DOTS = {"sofascore": "🟡", "apifootball": "🔵", "espn": "🟢", "onexbet": "🟠"}
 

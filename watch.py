@@ -691,41 +691,84 @@ async def _fetch_live_detail(game_id: str) -> dict | None:
     return detail
 
 
-class WatchAlertView(discord.ui.View):
-    """Buttons on a watch alert. Persistent (timeout=None) with the
-    game id in the custom_id, so the buttons keep working after a
-    restart — bot.py re-registers one per watched game in setup_hook."""
+_GAME_ID_RE = re.compile(r"Game ID:\s*(\d+)")
 
-    def __init__(self, game_id: str):
+
+def _resolve_game_id(interaction: discord.Interaction) -> str | None:
+    """Game id for a 📊 Detail / 🔄 Live button click. First the
+    per-game custom_id ("watch:detail:<id>" / "watch:live:<id>")
+    when the button was built with one; otherwise the "Game ID:
+    <id>" line in the message the button sits on — every detail
+    reply and every alert prints one. None when neither is there."""
+    custom_id = ""
+    try:
+        custom_id = str((interaction.data or {}).get("custom_id") or "")
+    except Exception:
+        custom_id = ""
+    parts = custom_id.split(":")
+    if len(parts) >= 3 and parts[2].isdigit():
+        return parts[2]
+    message = getattr(interaction, "message", None)
+    content = getattr(message, "content", "") or ""
+    match = _GAME_ID_RE.search(content)
+    if match:
+        return match.group(1)
+    return None
+
+
+class WatchAlertView(discord.ui.View):
+    """Buttons on a watch alert or a detail reply. Persistent
+    (timeout=None) with STATIC custom_ids ("watch:detail" /
+    "watch:live") — the game id is resolved from the message the
+    button sits on, so one view registered in setup_hook covers
+    every button on every message, even after a restart. A
+    per-game custom_id ("watch:detail:<id>") still works as a
+    fallback when the view was built with a game id."""
+
+    def __init__(self, game_id: str | None = None):
         super().__init__(timeout=None)
-        self.game_id = str(game_id)
+        self.game_id = str(game_id) if game_id else None
+        detail_id = (f"watch:detail:{self.game_id}" if self.game_id
+                     else "watch:detail")
+        live_id = (f"watch:live:{self.game_id}" if self.game_id
+                   else "watch:live")
         detail_btn = discord.ui.Button(
             label="📊 Detail", style=discord.ButtonStyle.primary,
-            custom_id=f"watch:detail:{self.game_id}")
+            custom_id=detail_id)
         detail_btn.callback = self._on_detail
         self.add_item(detail_btn)
         live_btn = discord.ui.Button(
             label="🔄 Live", style=discord.ButtonStyle.secondary,
-            custom_id=f"watch:live:{self.game_id}")
+            custom_id=live_id)
         live_btn.callback = self._on_live
         self.add_item(live_btn)
 
     async def _on_detail(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        detail = await _fetch_live_detail(self.game_id)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
         if detail is None:
             await interaction.followup.send(
-                "That game is no longer live on 1xBet.", ephemeral=True)
+                "That game is no longer live.", ephemeral=True)
             return
         await interaction.followup.send(
             render_detail(detail, DETAIL_ADVANCED), ephemeral=True)
 
     async def _on_live(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        detail = await _fetch_live_detail(self.game_id)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
         if detail is None:
             await interaction.followup.send(
-                "That game is no longer live on 1xBet.", ephemeral=True)
+                "That game is no longer live.", ephemeral=True)
             return
         await interaction.followup.send(live_line(detail), ephemeral=True)
 
@@ -788,8 +831,8 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
                 if watch["missing"] >= MISSING_TICKS_TO_END:
                     await _send_to_channel(
                         bot, channel_id,
-                        f"🏁 **{watch['home']} vs {watch['away']}** is no longer live "
-                        f"on 1xBet — the watch has ended.")
+                        f"🏁 **{watch['home']} vs {watch['away']}** is no longer live — "
+                        f"the watch has ended.")
                     await remove_watch(channel_id, game_id)
                     log.info("[watch] ended %s vs %s (gone from live list)",
                              watch["home"], watch["away"])
@@ -815,8 +858,11 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
                 table = format_stats_table(detail.get("stats"))
                 if table:
                     text += "\n\n**Match stats**\n" + "\n".join(table)
+            # The buttons resolve the game from the message, so the
+            # alert carries its id like the detail card does.
+            text += f"\nGame ID: {game_id}"
             if await _send_to_channel(bot, channel_id, text,
-                                      view=WatchAlertView(game_id)):
+                                      view=WatchAlertView()):
                 log.info("[watch] alert for %s vs %s: %s",
                          watch["home"], watch["away"], events[0][:80])
             watch["snapshot"] = snapshot

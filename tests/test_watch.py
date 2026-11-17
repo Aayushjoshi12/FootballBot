@@ -509,8 +509,9 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(msg.view)
         labels = [b.label for b in msg.view.children]
         self.assertEqual(labels, ["📊 Detail", "🔄 Live"])
-        self.assertTrue(all("771747666" in b.custom_id
-                            for b in msg.view.children))
+        self.assertEqual([b.custom_id for b in msg.view.children],
+                         ["watch:detail", "watch:live"])
+        self.assertIn("Game ID: 771747666", msg.content)
 
     async def test_event_line_shows_mmss_clock(self):
         # The fixture carries timerSec 4020 (67:00) — the old code
@@ -534,16 +535,18 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeResponse:
-    async def defer(self, ephemeral=False):
+    async def defer(self, ephemeral=False, thinking=False, **kwargs):
         return None
 
 
 class FakeFollowup:
     def __init__(self):
         self.sent: list[str] = []
+        self.sent_views: list = []
 
-    async def send(self, content, ephemeral=False):
+    async def send(self, content=None, ephemeral=False, view=None, **kwargs):
         self.sent.append(content)
+        self.sent_views.append(view)
 
 
 class FakeGuild:
@@ -563,10 +566,12 @@ class FakeGuild:
 class FakeInteraction:
     """Stand-in for a /watch slash-command interaction."""
 
-    def __init__(self, channel_id=777, guild=None):
+    def __init__(self, channel_id=777, guild=None, message=None, data=None):
         self.channel_id = channel_id
         self.channel = SimpleNamespace(id=channel_id)
         self.guild = guild
+        self.message = message
+        self.data = data
         self.response = FakeResponse()
         self.followup = FakeFollowup()
 
@@ -903,17 +908,48 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
         self.games1x2 = _load("games1x2.json")
         self.detail = prov._onex_detail_from_raw(self.games1x2[0])
 
-    def _view(self):
-        return wmod.WatchAlertView("771747666")
+    def _view(self, game_id=None):
+        return wmod.WatchAlertView(game_id)
+
+    def _interaction(self, custom_id="watch:detail", with_game_id=True):
+        # A button click on a detail reply: the message carries the
+        # "Game ID:" line, the custom_id is the static one.
+        content = wmod.render_detail(self.detail, wmod.DETAIL_ADVANCED)
+        if not with_game_id:
+            content = content.replace("Game ID: 771747666", "Game ID: ?")
+        return FakeInteraction(
+            message=SimpleNamespace(content=content),
+            data={"custom_id": custom_id})
 
     def _mock_search(self, detail):
         return patch.object(
             prov, "onex_search",
             new=AsyncMock(return_value={"games": [], "detail": detail}))
 
+    async def test_view_has_static_custom_ids(self):
+        view = self._view()
+        self.assertEqual([b.custom_id for b in view.children],
+                         ["watch:detail", "watch:live"])
+
+    async def test_detail_button_resolves_game_from_message(self):
+        # Static custom_id: the game comes from the message's
+        # "Game ID:" line, and the fetch is for that id.
+        view = self._view()
+        interaction = self._interaction("watch:detail")
+        mock_search = AsyncMock(
+            return_value={"games": [], "detail": self.detail})
+        with patch.object(prov, "onex_search", mock_search):
+            await view.children[0].callback(interaction)
+        mock_search.assert_awaited_once_with("771747666")
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Match stats", text)
+        self.assertIn("Possession", text)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", text)
+
     async def test_detail_button_renders_advanced_ephemerally(self):
         view = self._view()
-        interaction = FakeInteraction()
+        interaction = self._interaction("watch:detail")
         with self._mock_search(self.detail):
             await view.children[0].callback(interaction)
         self.assertEqual(len(interaction.followup.sent), 1)
@@ -924,7 +960,7 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_button_replies_score_and_mmss(self):
         view = self._view()
-        interaction = FakeInteraction()
+        interaction = self._interaction("watch:live")
         with self._mock_search(self.detail):
             await view.children[1].callback(interaction)
         self.assertEqual(len(interaction.followup.sent), 1)
@@ -944,7 +980,7 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
                         "run_rate": "6.55"},
         }
         view = self._view()
-        interaction = FakeInteraction()
+        interaction = self._interaction("watch:live")
         with self._mock_search(cricket_detail):
             await view.children[1].callback(interaction)
         self.assertIn("16.4 ov", interaction.followup.sent[0])
@@ -953,11 +989,11 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
     async def test_gone_game_says_no_longer_live(self):
         view = self._view()
         for child in view.children:
-            interaction = FakeInteraction()
+            interaction = self._interaction(child.custom_id)
             with self._mock_search(None):
                 await child.callback(interaction)
             self.assertEqual(interaction.followup.sent,
-                             ["That game is no longer live on 1xBet."])
+                             ["That game is no longer live."])
 
     async def test_gone_game_score_less_detail_says_no_longer_live(self):
         gone = {"home": "", "away": "", "home_score": None,
@@ -965,11 +1001,98 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
                 "clock": "Score not available right now", "stats": None,
                 "cricket": None}
         view = self._view()
-        interaction = FakeInteraction()
+        interaction = self._interaction("watch:detail")
         with self._mock_search(gone):
             await view.children[0].callback(interaction)
         self.assertEqual(interaction.followup.sent,
-                         ["That game is no longer live on 1xBet."])
+                         ["That game is no longer live."])
+
+    async def test_per_game_custom_id_fallback(self):
+        # A button built with a game id still resolves from the
+        # custom_id even when the message has no "Game ID:" line.
+        view = self._view("771747666")
+        interaction = FakeInteraction(
+            message=SimpleNamespace(content="no id here"),
+            data={"custom_id": "watch:detail:771747666"})
+        mock_search = AsyncMock(
+            return_value={"games": [], "detail": self.detail})
+        with patch.object(prov, "onex_search", mock_search):
+            await view.children[0].callback(interaction)
+        mock_search.assert_awaited_once_with("771747666")
+        self.assertIn("Match stats", interaction.followup.sent[0])
+
+    async def test_no_id_anywhere_says_could_not_tell(self):
+        view = self._view()
+        interaction = self._interaction("watch:detail",
+                                        with_game_id=False)
+        mock_search = AsyncMock(
+            return_value={"games": [], "detail": self.detail})
+        with patch.object(prov, "onex_search", mock_search):
+            await view.children[0].callback(interaction)
+        mock_search.assert_not_awaited()
+        self.assertEqual(interaction.followup.sent,
+                         ["Could not tell which game this is."])
+
+
+class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
+    """Detail followups — /game and the /watch detail action — carry
+    the 📊 Detail / 🔄 Live buttons too, not just on_tick alerts."""
+
+    def setUp(self):
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+
+    @staticmethod
+    def _labels(view):
+        return [b.label for b in view.children]
+
+    @staticmethod
+    def _ids(view):
+        return [b.custom_id for b in view.children]
+
+    async def test_game_detail_reply_has_buttons(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        with patch.object(
+                botmod, "onex_search",
+                new=AsyncMock(return_value={"detail": self.detail})):
+            await botmod.cmd_game.callback(interaction, "Gambia")
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertIn("Game ID: 771747666", interaction.followup.sent[0])
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertEqual(self._labels(view), ["📊 Detail", "🔄 Live"])
+        self.assertEqual(self._ids(view),
+                         ["watch:detail", "watch:live"])
+
+    async def test_watch_detail_action_reply_has_buttons(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771747666", "action": "detail",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771747666",
+                              "home": "Republic of the Gambia",
+                              "away": "Ivory Coast",
+                              "league": "Africa Cup of Nations",
+                              "status": "2H"},
+                    "source": "id", "channel": None, "channel_id": None,
+                    "channel_named": None, "note": ""}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)), \
+             patch.object(
+                 botmod, "onex_search",
+                 new=AsyncMock(return_value={"detail": self.detail})):
+            await botmod.cmd_watch.callback(
+                interaction, "show me the Gambia game")
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertIn("Game ID: 771747666", interaction.followup.sent[0])
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertEqual(self._labels(view), ["📊 Detail", "🔄 Live"])
+        self.assertEqual(self._ids(view),
+                         ["watch:detail", "watch:live"])
 
 
 class TestMmssClock(unittest.TestCase):

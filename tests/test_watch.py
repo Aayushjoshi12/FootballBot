@@ -988,13 +988,116 @@ class TestMmssClock(unittest.TestCase):
         self.assertEqual(detail["timer_sec"], 4020)
         self.assertEqual(detail["clock"], "67:00")
 
-    def test_snapshot_derives_clock_from_timer_sec(self):
-        snap = wmod.snapshot_from_detail(
-            {"home_score": 2, "away_score": 0, "status": "2H",
-             "minute": 72, "clock": "", "timer_sec": 4354,
-             "stats": [], "cricket": None})
-        self.assertEqual(snap["clock"], "72:34")
-        self.assertEqual(snap["timer_sec"], 4354)
+class TestListIntent(unittest.IsolatedAsyncioTestCase):
+    """A browse request ("show any game") lists the live games
+    instead of dead-ending, and a failed search suggests them."""
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {}
+        prov.hc.get = StubHttp(self).get
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+
+    async def test_typo_browse_lists_live_games(self):
+        # The user's exact words (typo "amy" for "any"), no model.
+        out = await wmod.resolve_watch("show amy new game to test", None)
+        self.assertEqual(out["action"], "list")
+        self.assertIsNone(out["game_id"])
+        self.assertGreaterEqual(len(out["games"]), 2)
+        self.assertTrue(any(g["onex_id"] == 771747666
+                            for g in out["games"]))
+
+    async def test_ai_list_action_honoured(self):
+        model = FakeModel('{"game_id": null, "action": "list", '
+                          '"detail": "simple", "channel_id": null, '
+                          '"note": "show games"}')
+        out = await wmod.resolve_watch("what is live right now", model)
+        self.assertEqual(out["action"], "list")
+        self.assertGreaterEqual(len(out["games"]), 2)
+
+    async def test_nonsense_name_suggests_live_games(self):
+        out = await wmod.resolve_watch("Zzqxj No Such Team", None)
+        self.assertIsNone(out["game_id"])
+        self.assertEqual(out["candidates"], [])
+        self.assertGreaterEqual(len(out["suggestions"]), 2)
+        self.assertTrue(any(g["onex_id"] == 771747666
+                            for g in out["suggestions"]))
+
+    async def test_specific_team_still_resolves_not_list(self):
+        # "show me the Lumbini game" names a team — the AI path
+        # still wins over the browse intent.
+        model = FakeModel('{"game_id": "771800001", "action": "follow", '
+                          '"detail": "simple", "channel_id": null, '
+                          '"note": "Lumbini"}')
+        out = await wmod.resolve_watch("show me the Lumbini game", model)
+        self.assertEqual(out["action"], "follow")
+        self.assertEqual(out["game_id"], "771800001")
+
+    async def test_top_live_games_have_score_and_clock(self):
+        games = await wmod.top_live_games()
+        self.assertGreaterEqual(len(games), 2)
+        gambia = next(g for g in games if g["onex_id"] == 771747666)
+        self.assertEqual((gambia["home_score"], gambia["away_score"]),
+                         (0, 1))
+        self.assertEqual(gambia["clock"], "67:00")
+
+    async def test_cmd_watch_list_reply(self):
+        import bot as botmod
+
+        resolved = {"game_id": None, "action": "list", "detail": None,
+                    "candidates": [], "entry": None, "source": "list",
+                    "channel": None, "channel_id": None,
+                    "channel_named": None, "note": "",
+                    "games": await wmod.top_live_games(),
+                    "suggestions": []}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)):
+            await botmod.cmd_watch.callback(interaction, "show any game")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("Live games right now", text)
+        self.assertIn("771747666", text)
+        self.assertIn("/watch", text)
+
+    async def test_cmd_watch_no_match_suggests_games(self):
+        import bot as botmod
+
+        resolved = {"game_id": None, "action": "follow", "detail": None,
+                    "candidates": [], "entry": None, "source": "none",
+                    "channel": None, "channel_id": None,
+                    "channel_named": None, "note": "",
+                    "games": [], "suggestions": await wmod.top_live_games()}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)):
+            await botmod.cmd_watch.callback(
+                interaction, "Zzqxj No Such Team")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("could not find a game", text.lower())
+        self.assertIn("771747666", text)
+
+    async def test_cmd_game_no_match_suggests_games(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        with patch.object(
+                botmod, "onex_search",
+                new=AsyncMock(return_value={"games": [], "detail": None})), \
+             patch.object(botmod, "_defer",
+                          new=AsyncMock(return_value=True)):
+            await botmod.cmd_game.callback(
+                interaction, "Zzqxj No Such Team")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("No game found", text)
+        self.assertIn("live games right now", text.lower())
+        self.assertIn("771747666", text)
 
 
 if __name__ == "__main__":

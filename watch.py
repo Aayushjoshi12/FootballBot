@@ -170,6 +170,33 @@ def render_match_list(games: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def render_top_games(games: list[dict],
+                     header: str = "⚽ **Live games right now — pick one:**") -> str:
+    """Top live games as a pick list — when the user asks to see
+    games, or as suggestions after a search found nothing.
+    Same line format as render_match_list (score, clock, league,
+    game ID); pass header=\"\" when the caller's own sentence is
+    already the header."""
+    lines = ([header] if header else [])
+    for i, g in enumerate(games, 1):
+        clock = _clock_str(g)
+        lines.append(
+            f"{i}. **{g.get('home', '?')} {_score_str(g)} {g.get('away', '?')}**"
+            f" · {clock} · {g.get('league', '')} · ID `{g.get('onex_id')}`")
+    lines.append("\nUse `/game <ID>` for the full detail, or `/watch <ID>` to follow one.")
+    return "\n".join(lines)
+
+
+async def top_live_games(limit: int = 5) -> list[dict]:
+    """Top live games with score + clock, for pick lists and
+    suggestions. Never raises — a failed fetch is an empty list."""
+    try:
+        return await prov.onex_top_live(limit)
+    except Exception as exc:
+        log.warning("[watch] top live games failed (%s)", type(exc).__name__)
+        return []
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # SNAPSHOT + CHANGE DETECTION (pure)
 # ══════════════════════════════════════════════════════════════════════════
@@ -295,10 +322,11 @@ def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str
 
 _AI_PROMPT = """You resolve a Discord user's request about a live sports game to ONE game from the list below.
 Reply with STRICT JSON only — no other text, no markdown, no explanation:
-{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "note": "<one short line>"}
+{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail|list", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "note": "<one short line>"}
 Rules:
 - game_id MUST be one of the ids in the games list. If no game matches the request, use null.
 - action is "follow" when the user wants alerts/updates for a game, "unfollow" when they want to stop following it, "detail" when they only want to see it now.
+- action is "list" when the user wants to browse/see the live games rather than follow one specific game (e.g. "show me a game", "what's live", "any game to test") — then game_id is null.
 - detail is "advanced" only when the user asks for full/advanced/detailed stats; otherwise "simple".
 - channel_id MUST be one of the ids in the channels list, or null when the user does not name a channel. If the user names a channel that is not in the list, use null.
 - note is one short line saying what you understood, e.g. "Lumbini vs Sudurpaschim, NPL, alerts to #general".
@@ -360,7 +388,7 @@ async def parse_watch_ai(text: str, grounding: list[dict],
             log.warning("[watch] Gemini returned an id outside the grounding list")
             return None
     action = data.get("action")
-    if action not in ("follow", "unfollow", "detail"):
+    if action not in ("follow", "unfollow", "detail", "list"):
         action = "follow"
     detail = data.get("detail")
     if detail not in (DETAIL_SIMPLE, DETAIL_ADVANCED):
@@ -443,6 +471,25 @@ def _channel_from_words(text: str,
     return None, named
 
 
+# Words that mean "show me the games" rather than "follow this
+# one game" — checked when no game matched, so "show amy new
+# game to test" (a typo for "any") still lists games instead of
+# dead-ending. Runs AFTER the AI attempt, so a request naming
+# a specific team ("show me the Lumbini game") still resolves
+# to that game first.
+_SHOW_WORDS = ("show", "list", "see", "browse", "display", "any",
+               "whats", "what's", "what")
+_GAME_WORDS = ("game", "games", "match", "matches", "live", "playing",
+               "on now", "test")
+
+
+def _wants_list(text: str) -> bool:
+    """The user wants to browse games, not follow one."""
+    n = _norm(text or "")
+    return (any(w in n for w in _SHOW_WORDS)
+            and any(w in n for w in _GAME_WORDS))
+
+
 async def resolve_watch(text: str, model, channels: list[dict] | None = None) -> dict:
     """Resolve free text to a game — and, when the words name
     one, to a channel and a detail level. Game: game ID first,
@@ -452,22 +499,26 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
     keywords first, then Gemini's parsed detail.
     Returns {"game_id"|None, "action", "detail"|None,
     "channel"|None, "channel_id"|None, "channel_named"|None,
-    "candidates", "entry"|None, "source"}. Never invents an id
-    or a channel id. "detail" is None when the words say nothing
-    about it — the /watch dropdown always wins, and a hardcoded
-    "simple" here used to discard the user's Advanced choice."""
+    "candidates", "entry"|None, "source", "games", "suggestions"}.
+    "games" holds the top live games when action is "list";
+    "suggestions" holds them when nothing matched at all, so the
+    caller can offer them instead of a bare dead end. Never
+    invents an id or a channel id. "detail" is None when the words
+    say nothing about it — the /watch dropdown always wins, and a
+    hardcoded "simple" here used to discard the user's Advanced choice."""
     q = (text or "").strip()
     words_detail = _detail_from_words(q)
     word_channel, channel_named = _channel_from_words(q, channels)
 
     def _out(game_id, action, detail, candidates, entry, source,
-             channel=None, note=""):
+             channel=None, note="", games=None, suggestions=None):
         channel = channel if channel is not None else word_channel
         return {"game_id": game_id, "action": action, "detail": detail,
                 "candidates": candidates, "entry": entry, "source": source,
                 "note": note, "channel": channel,
                 "channel_id": (str(channel["id"]) if channel else None),
-                "channel_named": channel_named}
+                "channel_named": channel_named,
+                "games": games or [], "suggestions": suggestions or []}
 
     if not q:
         return _out(None, "follow", words_detail, [], None, "none")
@@ -484,6 +535,10 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
         return _out(str(matches[0]["id"]), "follow", words_detail, [],
                     matches[0], "name")
     ai = await parse_watch_ai(q, grounding, model, channels)
+    if ai and ai.get("action") == "list":
+        top = await top_live_games()
+        return _out(None, "list", words_detail, [], None, "ai",
+                    games=top, note=ai.get("note", ""))
     if ai and ai.get("game_id"):
         entry = next((g for g in grounding
                       if str(g["id"]) == str(ai["game_id"])), None)
@@ -497,7 +552,13 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
         return _out(str(ai["game_id"]), ai["action"], detail, [],
                     entry, "ai", channel=ai_channel,
                     note=ai.get("note", ""))
-    return _out(None, "follow", words_detail, matches[:5], None, "none")
+    if _wants_list(q):
+        top = await top_live_games()
+        return _out(None, "list", words_detail, [], None, "list",
+                    games=top)
+    suggestions = await top_live_games()
+    return _out(None, "follow", words_detail, matches[:5], None, "none",
+                suggestions=suggestions)
 
 
 # ══════════════════════════════════════════════════════════════════════════

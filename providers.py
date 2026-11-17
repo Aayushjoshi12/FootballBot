@@ -1665,3 +1665,33 @@ async def onex_grounding() -> list[dict]:
         out.append({"id": gid, "home": m["home"], "away": m["away"],
                     "league": m["league"], "status": m["status"]})
     return out[:40]
+
+
+# Statuses that mean "live right now" in _onex_status /
+# currentPeriodName terms. FT and "?" are never live.
+_ONEX_LIVE_STATUSES = ("1H", "2H", "ET", "PEN", "HT", "Half-time",
+                       "1st innings", "2nd innings")
+
+
+async def onex_top_live(limit: int = 5) -> list[dict]:
+    """Top live games with score + clock, for pick lists and
+    "did you mean" suggestions. Served from the shared tick
+    cache via onex_live_raw — no extra 1xBet calls."""
+    raw = await onex_live_raw()
+    live = {s.lower() for s in _ONEX_LIVE_STATUSES}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for g in raw:
+        m = _onex_detail_from_raw(g)
+        if m is None:
+            continue
+        if str(m.get("status") or "").lower() not in live:
+            continue
+        gid = str(m.get("onex_id"))
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return out

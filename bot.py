@@ -460,6 +460,12 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
     if games:
         await interaction.followup.send(watch.render_match_list(games))
         return
+    suggestions = await watch.top_live_games()
+    if suggestions:
+        await interaction.followup.send(
+            f"No game found for '{query}' — here are the live games right now:\n"
+            + watch.render_top_games(suggestions, header=""))
+        return
     await interaction.followup.send(
         f"No game found for '{query}' on 1xBet. Try a team name, a league, "
         "or the game ID from the match page.")
@@ -528,6 +534,16 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                 watch.render_detail(result["detail"], level),
                 ephemeral=True)
             return
+    if resolved.get("action") == "list":
+        games = resolved.get("games") or []
+        if games:
+            await interaction.followup.send(
+                watch.render_top_games(games), ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "No games are live on 1xBet right now — try again when a match is on.",
+                ephemeral=True)
+        return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
         removed = await watch.remove_watch(target.id, str(resolved["game_id"]))
         if removed:
@@ -545,9 +561,16 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                 "I could not tell exactly which game — did you mean one of these?\n"
                 + watch.render_match_list(candidates), ephemeral=True)
         else:
-            await interaction.followup.send(
-                f"Could not find a game for '{what}' on 1xBet. Try a game ID "
-                "or a team name.", ephemeral=True)
+            suggestions = resolved.get("suggestions") or []
+            if suggestions:
+                await interaction.followup.send(
+                    f"I could not find a game for '{what}' — here are the live games right now:\n"
+                    + watch.render_top_games(suggestions, header=""),
+                    ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"Could not find a game for '{what}' on 1xBet. Try a game ID "
+                    "or a team name.", ephemeral=True)
         return
     entry = resolved.get("entry") or {"id": resolved["game_id"], "home": "",
                                       "away": "", "league": "", "status": ""}

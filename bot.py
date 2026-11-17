@@ -73,6 +73,11 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         await watch.load_watches()
+        # Persistent alert buttons: one view per watched game, so the
+        # 📊 Detail / 🔄 Live buttons on old alerts keep working
+        # after a restart.
+        for _cid, _gid in list(watch._watches):
+            self.add_view(watch.WatchAlertView(_gid))
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.

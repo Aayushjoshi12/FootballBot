@@ -1213,6 +1213,14 @@ def _onex_apply_cricket(m: dict, scores: dict) -> None:
                     "balls_left": old.get("balls_left")}
 
 
+def format_mmss(seconds: int | float | None) -> str | None:
+    """Seconds since kick-off -> 'MM:SS', e.g. 4354 -> '72:34'."""
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return None
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
+
+
 def _onex_detail_from_raw(g: dict) -> dict | None:
     """Rich detail dict from one raw live-list entry (no network).
     Score, clock/overs, stats table, cricket detail. Venue/format/
@@ -1237,6 +1245,18 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
     timer = scores.get("timer") or {}
     m["timer_sec"] = timer.get("timeSec") if isinstance(
         timer.get("timeSec"), (int, float)) else None
+    if not m.get("clock"):
+        # Football entries carry no clock string — build MM:SS from
+        # the timer while the game is live. HT/FT get a label, never
+        # a fake clock; no timer means no clock at all. (Cricket
+        # already sets its overs clock above.)
+        status = str(m.get("status") or "")
+        if status in ("1H", "2H", "ET", "PEN"):
+            m["clock"] = format_mmss(m["timer_sec"]) or ""
+        elif status == "HT":
+            m["clock"] = "Half-time"
+        elif status == "FT":
+            m["clock"] = "Full-time"
     m["start_ts"] = g.get("startTs") if isinstance(
         g.get("startTs"), (int, float)) else None
     info = g.get("matchInfoObj") or {}

@@ -192,12 +192,20 @@ def snapshot_from_detail(d: dict) -> dict:
         stats[str(s.get("name"))] = (str(s.get("home", "")),
                                      str(s.get("away", "")))
     cricket = d.get("cricket") or {}
+    clock = str(d.get("clock") or "")
+    timer_sec = d.get("timer_sec")
+    if not clock and isinstance(timer_sec, (int, float)) \
+            and str(d.get("status") or "") in ("1H", "2H", "ET", "PEN"):
+        # Football detail with a timer but no clock string — the
+        # event lines need MM:SS, not a bare minute.
+        clock = prov.format_mmss(timer_sec) or ""
     return {
         "home_score": "" if d.get("home_score") is None else str(d["home_score"]),
         "away_score": "" if d.get("away_score") is None else str(d["away_score"]),
         "status": str(d.get("status") or ""),
         "minute": d.get("minute") if isinstance(d.get("minute"), int) else None,
-        "clock": str(d.get("clock") or ""),
+        "clock": clock,
+        "timer_sec": timer_sec if isinstance(timer_sec, (int, float)) else None,
         "is_break": bool(cricket.get("is_break")),
         "stats": stats,
         "cricket": {
@@ -590,8 +598,79 @@ async def list_channel_watches(channel_id: int) -> list[dict]:
     return out
 
 
+def live_line(d: dict) -> str:
+    """One short live line for the 🔄 Live button: teams, score,
+    and the MM:SS clock for football, overs for cricket."""
+    title = f"{d.get('home', '?')} {_score_str(d)} {d.get('away', '?')}"
+    cricket = d.get("cricket") or {}
+    if cricket.get("is_break"):
+        return f"{title} · Innings break"
+    if cricket.get("over_str") is not None:
+        return f"{title} · {cricket['over_str']} ov"
+    clock = _clock_str(d)
+    return f"{title} · {clock}" if clock else title
+
+
+async def _fetch_live_detail(game_id: str) -> dict | None:
+    """Current detail for a game via onex_search (tick cache, fast).
+    None when the game is gone from the live list — a score-less
+    gameInfo-only detail is not live data either."""
+    try:
+        result = await prov.onex_search(str(game_id))
+    except Exception as exc:
+        log.warning("[watch] live detail fetch failed for %s (%s)",
+                    game_id, type(exc).__name__)
+        return None
+    detail = (result or {}).get("detail")
+    if detail is None:
+        return None
+    if detail.get("home_score") is None and detail.get("away_score") is None \
+            and str(detail.get("status") or "") in ("?", "upcoming", ""):
+        return None
+    return detail
+
+
+class WatchAlertView(discord.ui.View):
+    """Buttons on a watch alert. Persistent (timeout=None) with the
+    game id in the custom_id, so the buttons keep working after a
+    restart — bot.py re-registers one per watched game in setup_hook."""
+
+    def __init__(self, game_id: str):
+        super().__init__(timeout=None)
+        self.game_id = str(game_id)
+        detail_btn = discord.ui.Button(
+            label="📊 Detail", style=discord.ButtonStyle.primary,
+            custom_id=f"watch:detail:{self.game_id}")
+        detail_btn.callback = self._on_detail
+        self.add_item(detail_btn)
+        live_btn = discord.ui.Button(
+            label="🔄 Live", style=discord.ButtonStyle.secondary,
+            custom_id=f"watch:live:{self.game_id}")
+        live_btn.callback = self._on_live
+        self.add_item(live_btn)
+
+    async def _on_detail(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        detail = await _fetch_live_detail(self.game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live on 1xBet.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            render_detail(detail, DETAIL_ADVANCED), ephemeral=True)
+
+    async def _on_live(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        detail = await _fetch_live_detail(self.game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live on 1xBet.", ephemeral=True)
+            return
+        await interaction.followup.send(live_line(detail), ephemeral=True)
+
+
 async def _send_to_channel(bot: discord.Client, channel_id: int,
-                           text: str) -> bool:
+                           text: str, view: discord.ui.View | None = None) -> bool:
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
@@ -601,7 +680,8 @@ async def _send_to_channel(bot: discord.Client, channel_id: int,
                         type(exc).__name__)
             return False
     try:
-        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        await channel.send(text, view=view,
+                           allowed_mentions=discord.AllowedMentions.none())
         return True
     except discord.Forbidden:
         log.warning("[watch] no permission to send to channel %s", channel_id)
@@ -667,11 +747,15 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
             if not events:
                 continue
             text = "\n".join(events)
+            # Automatic alert stays exactly as before: event line(s)
+            # PLUS the full stats table for advanced watches. The
+            # buttons below are only for on-demand detail / live.
             if watch.get("detail") == DETAIL_ADVANCED:
                 table = format_stats_table(detail.get("stats"))
                 if table:
                     text += "\n\n**Match stats**\n" + "\n".join(table)
-            if await _send_to_channel(bot, channel_id, text):
+            if await _send_to_channel(bot, channel_id, text,
+                                      view=WatchAlertView(game_id)):
                 log.info("[watch] alert for %s vs %s: %s",
                          watch["home"], watch["away"], events[0][:80])
             watch["snapshot"] = snapshot

@@ -402,9 +402,10 @@ class TestDetectChanges(unittest.TestCase):
 
 
 class FakeMessage:
-    def __init__(self, mid, content):
+    def __init__(self, mid, content, view=None):
         self.id = mid
         self.content = content
+        self.view = view
         self.edits = []
         self.edit_error = None
 
@@ -420,9 +421,9 @@ class FakeChannel:
         self.sent: list[FakeMessage] = []
         self._next_id = 2000
 
-    async def send(self, content, allowed_mentions=None):
+    async def send(self, content, allowed_mentions=None, view=None):
         self._next_id += 1
-        msg = FakeMessage(self._next_id, content)
+        msg = FakeMessage(self._next_id, content, view=view)
         self.sent.append(msg)
         return msg
 
@@ -492,14 +493,34 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         await wmod.on_tick(self.bot, self.games1x2)
         self.assertEqual(len(self.channel.sent), 0)
 
-    async def test_advanced_alert_includes_stats_table(self):
+    async def test_advanced_alert_keeps_stats_table_and_has_buttons(self):
+        # Automatic alert stays exactly as before: event line PLUS
+        # the full stats table for advanced watches — the buttons
+        # are only for on-demand detail / live.
         self._seed_watch(level="advanced")
         changed = json.loads(json.dumps(self.games1x2[0]))
         changed["scores"]["scoreOpp1"] = 1
         await wmod.on_tick(self.bot, [changed])
         self.assertEqual(len(self.channel.sent), 1)
-        self.assertIn("Match stats", self.channel.sent[0].content)
-        self.assertIn("Yellow cards", self.channel.sent[0].content)
+        msg = self.channel.sent[0]
+        self.assertIn("GOAL", msg.content)
+        self.assertIn("Match stats", msg.content)
+        self.assertIn("Possession", msg.content)
+        self.assertIsNotNone(msg.view)
+        labels = [b.label for b in msg.view.children]
+        self.assertEqual(labels, ["📊 Detail", "🔄 Live"])
+        self.assertTrue(all("771747666" in b.custom_id
+                            for b in msg.view.children))
+
+    async def test_event_line_shows_mmss_clock(self):
+        # The fixture carries timerSec 4020 (67:00) — the old code
+        # showed no clock at all on football alerts.
+        self._seed_watch(level="advanced")
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("(67:00)", self.channel.sent[0].content)
 
     async def test_missing_game_ends_watch_after_ten_ticks(self):
         self._seed_watch()
@@ -872,6 +893,108 @@ class TestAiWatchAll(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[0], 222)
         self.assertTrue(any("<#222>" in s
                             for s in interaction.followup.sent))
+
+
+class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
+    """The 📊 Detail / 🔄 Live buttons on watch alerts (mocked
+    providers + fake Discord interactions, no network)."""
+
+    def setUp(self):
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+
+    def _view(self):
+        return wmod.WatchAlertView("771747666")
+
+    def _mock_search(self, detail):
+        return patch.object(
+            prov, "onex_search",
+            new=AsyncMock(return_value={"games": [], "detail": detail}))
+
+    async def test_detail_button_renders_advanced_ephemerally(self):
+        view = self._view()
+        interaction = FakeInteraction()
+        with self._mock_search(self.detail):
+            await view.children[0].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Match stats", text)
+        self.assertIn("Possession", text)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", text)
+
+    async def test_live_button_replies_score_and_mmss(self):
+        view = self._view()
+        interaction = FakeInteraction()
+        with self._mock_search(self.detail):
+            await view.children[1].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("0 – 1", text)
+        self.assertIn("67:00", text)
+        self.assertNotIn("Match stats", text)
+
+    async def test_live_button_cricket_shows_overs(self):
+        cricket_detail = {
+            "home": "Lumbini Lions", "away": "Sudurpaschim Royals",
+            "home_score": "108/4", "away_score": "105/8",
+            "status": "live", "minute": None, "clock": "16.4 ov",
+            "stats": None, "format": "T20",
+            "cricket": {"is_break": False, "team": 2, "over_str": "16.4",
+                        "target": 106, "need": 1, "balls_left": 20,
+                        "run_rate": "6.55"},
+        }
+        view = self._view()
+        interaction = FakeInteraction()
+        with self._mock_search(cricket_detail):
+            await view.children[1].callback(interaction)
+        self.assertIn("16.4 ov", interaction.followup.sent[0])
+        self.assertIn("108/4", interaction.followup.sent[0])
+
+    async def test_gone_game_says_no_longer_live(self):
+        view = self._view()
+        for child in view.children:
+            interaction = FakeInteraction()
+            with self._mock_search(None):
+                await child.callback(interaction)
+            self.assertEqual(interaction.followup.sent,
+                             ["That game is no longer live on 1xBet."])
+
+    async def test_gone_game_score_less_detail_says_no_longer_live(self):
+        gone = {"home": "", "away": "", "home_score": None,
+                "away_score": None, "status": "?", "minute": None,
+                "clock": "Score not available right now", "stats": None,
+                "cricket": None}
+        view = self._view()
+        interaction = FakeInteraction()
+        with self._mock_search(gone):
+            await view.children[0].callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is no longer live on 1xBet."])
+
+
+class TestMmssClock(unittest.TestCase):
+    def test_format_mmss(self):
+        self.assertEqual(prov.format_mmss(4354), "72:34")
+        self.assertEqual(prov.format_mmss(4020), "67:00")
+        self.assertEqual(prov.format_mmss(61), "1:01")
+        self.assertEqual(prov.format_mmss(0), "0:00")
+        self.assertIsNone(prov.format_mmss(None))
+        self.assertIsNone(prov.format_mmss(-5))
+
+    def test_detail_from_raw_sets_mmss_clock(self):
+        # The screenshot bug: football detail had timer_sec but no
+        # clock string, so alerts showed no clock at all.
+        detail = prov._onex_detail_from_raw(_load("games1x2.json")[0])
+        self.assertEqual(detail["timer_sec"], 4020)
+        self.assertEqual(detail["clock"], "67:00")
+
+    def test_snapshot_derives_clock_from_timer_sec(self):
+        snap = wmod.snapshot_from_detail(
+            {"home_score": 2, "away_score": 0, "status": "2H",
+             "minute": 72, "clock": "", "timer_sec": 4354,
+             "stats": [], "cricket": None})
+        self.assertEqual(snap["clock"], "72:34")
+        self.assertEqual(snap["timer_sec"], 4354)
 
 
 if __name__ == "__main__":

@@ -2,34 +2,81 @@
   {
     "id": 771747666,
     "mainGameId": 771747666,
-    "liga": {"id": 2304860, "name": "Africa Cup of Nations"},
-    "opponent1": {"fullName": "Republic of the Gambia"},
-    "opponent2": {"fullName": "Ivory Coast"},
+    "liga": {
+      "id": 2304860,
+      "name": "Africa Cup of Nations"
+    },
+    "opponent1": {
+      "fullName": "Republic of the Gambia"
+    },
+    "opponent2": {
+      "fullName": "Ivory Coast"
+    },
     "startTs": 1794931200,
     "scores": {
-      "scoreOpp1": 0, "scoreOpp2": 1,
-      "timer": {"timeSec": 4020},
+      "scoreOpp1": 0,
+      "scoreOpp2": 1,
+      "timer": {
+        "timeSec": 4020
+      },
       "statusLineStr": "67 minutes",
-      "currentPeriod": 2, "currentPeriodName": "2nd half",
-      "tabloStats": {"0": [
-        {"id": 1, "s1": "3", "s2": "1", "name": "Yellow cards"},
-        {"id": 2, "s1": "0", "s2": "0", "name": "Red card"},
-        {"id": 3, "s1": "3", "s2": "0", "name": "Corner"}
-      ]}
+      "currentPeriod": 2,
+      "currentPeriodName": "2nd half",
+      "tabloStats": {
+        "0": [
+          {
+            "id": 1,
+            "s1": "3",
+            "s2": "1",
+            "name": "Yellow cards"
+          },
+          {
+            "id": 2,
+            "s1": "0",
+            "s2": "0",
+            "name": "Red card"
+          },
+          {
+            "id": 3,
+            "s1": "3",
+            "s2": "0",
+            "name": "Corner"
+          }
+        ]
+      }
+    },
+    "sport": {
+      "id": 1,
+      "name": "Football"
     }
   },
   {
     "id": 771747999,
     "mainGameId": 771747999,
-    "liga": {"id": 2304860, "name": "Africa Cup of Nations"},
-    "opponent1": {"fullName": "Kenya"},
-    "opponent2": {"fullName": "South Africa"},
+    "liga": {
+      "id": 2304860,
+      "name": "Africa Cup of Nations"
+    },
+    "opponent1": {
+      "fullName": "Kenya"
+    },
+    "opponent2": {
+      "fullName": "South Africa"
+    },
     "startTs": 1794931200,
     "scores": {
-      "scoreOpp1": 0, "scoreOpp2": 0,
-      "timer": {"timeSec": 3900},
+      "scoreOpp1": 0,
+      "scoreOpp2": 0,
+      "timer": {
+        "timeSec": 3900
+      },
       "statusLineStr": "65 minutes",
-      "currentPeriod": 2, "currentPeriodName": "2nd half"
+      "currentPeriod": 2,
+      "currentPeriodName": "2nd half"
+    },
+    "sport": {
+      "id": 1,
+      "name": "Football"
     }
   }
 ]

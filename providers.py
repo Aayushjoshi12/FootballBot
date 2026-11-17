@@ -1241,6 +1241,16 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
             # gameInfo knows — filled in by onex_game_detail().
             m["cricket"].update({"target": None, "need": None,
                                 "balls_left": None})
+    # Sport, in 1xBet's own words ("Football", "Cricket", ...):
+    # the live list carries it on every entry. Older/trimmed
+    # shapes have no sport key — a cricket score shape is
+    # unambiguous, anything else stays unknown (never guessed).
+    sport = (g.get("sport") or {}).get("name") if isinstance(
+        g.get("sport"), dict) else None
+    if not sport and (ext.get("cricketScore") or {}).get(
+            "wicketScore") is not None:
+        sport = "Cricket"
+    m["sport"] = sport or None
     m["stats"] = _onex_tabular_stats(scores)
     timer = scores.get("timer") or {}
     m["timer_sec"] = timer.get("timeSec") if isinstance(
@@ -1444,9 +1454,13 @@ def _onex_find_liga_games(menu: list | None, champ_id: int) -> dict | None:
     return None
 
 
-def _onex_norm_line_game(g: dict, league: str, default_format: str = "") -> dict | None:
+def _onex_norm_line_game(g: dict, league: str, default_format: str = "",
+                         sport: str | None = None) -> dict | None:
     """A line-feed game (fixture, or a live game still listed):
-    status upcoming/live/FT from its scores or kickoff time."""
+    status upcoming/live/FT from its scores or kickoff time.
+    The caller knows the sport (NPL is cricket, UEFA is
+    football) — the line feed groups games by sport, so it is
+    passed in rather than guessed from the scores."""
     o1, o2 = g.get("opponent1") or {}, g.get("opponent2") or {}
     home, away = o1.get("fullName") or "", o2.get("fullName") or ""
     gid = g.get("id") or g.get("mainGameId")
@@ -1479,6 +1493,7 @@ def _onex_norm_line_game(g: dict, league: str, default_format: str = "") -> dict
         "date": "", "stadium": info.get("location") or "",
         "referee": "", "provider": "onexbet",
         "finished": status == "FT",
+        "sport": sport,
         "clock": clock, "start_ts": start_ts,
         "format": info.get("matchFormat") or default_format,
         "stats": _onex_tabular_stats(scores) if scores else None,
@@ -1518,7 +1533,8 @@ async def onex_npl_fixtures() -> list[dict]:
         return []
     out = []
     for g in found["games"]:
-        if (m := _onex_norm_line_game(g, "Nepal Premier League", "T20")) is not None:
+        if (m := _onex_norm_line_game(g, "Nepal Premier League", "T20",
+                                      "Cricket")) is not None:
             out.append(m)
     if out:
         _fix_cache["npl"] = (time.monotonic(), out)
@@ -1556,7 +1572,8 @@ async def onex_uefa_fixtures() -> list[dict]:
         if not found:
             continue
         for g in found["games"]:
-            if (m := _onex_norm_line_game(g, found["name"])) is not None:
+            if (m := _onex_norm_line_game(g, found["name"],
+                                          sport="Football")) is not None:
                 if not any(x["onex_id"] == m["onex_id"] for x in out):
                     out.append(m)
     if out:
@@ -1652,7 +1669,8 @@ async def onex_grounding() -> list[dict]:
             continue
         seen.add(gid)
         out.append({"id": gid, "home": m["home"], "away": m["away"],
-                    "league": m["league"], "status": m["status"]})
+                    "league": m["league"], "sport": m.get("sport"),
+                    "status": m["status"]})
     npl, uefa = await asyncio.gather(
         _onex_safe_fixtures("NPL", onex_npl_fixtures()),
         _onex_safe_fixtures("UEFA", onex_uefa_fixtures()),
@@ -1663,7 +1681,8 @@ async def onex_grounding() -> list[dict]:
             continue
         seen.add(gid)
         out.append({"id": gid, "home": m["home"], "away": m["away"],
-                    "league": m["league"], "status": m["status"]})
+                    "league": m["league"], "sport": m.get("sport"),
+                    "status": m["status"]})
     return out[:40]
 
 
@@ -1673,12 +1692,17 @@ _ONEX_LIVE_STATUSES = ("1H", "2H", "ET", "PEN", "HT", "Half-time",
                        "1st innings", "2nd innings")
 
 
-async def onex_top_live(limit: int = 5) -> list[dict]:
+async def onex_top_live(limit: int = 5,
+                        sport: str | None = None) -> list[dict]:
     """Top live games with score + clock, for pick lists and
     "did you mean" suggestions. Served from the shared tick
-    cache via onex_live_raw — no extra 1xBet calls."""
+    cache via onex_live_raw — no extra 1xBet calls. With a
+    sport, only games of that sport (1xBet's own name, e.g.
+    "Football") — games whose sport is unknown are left out
+    rather than guessed."""
     raw = await onex_live_raw()
     live = {s.lower() for s in _ONEX_LIVE_STATUSES}
+    want = (sport or "").strip().lower() or None
     out: list[dict] = []
     seen: set[str] = set()
     for g in raw:
@@ -1686,6 +1710,8 @@ async def onex_top_live(limit: int = 5) -> list[dict]:
         if m is None:
             continue
         if str(m.get("status") or "").lower() not in live:
+            continue
+        if want and (str(m.get("sport") or "").strip().lower() != want):
             continue
         gid = str(m.get("onex_id"))
         if gid in seen:

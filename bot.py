@@ -434,6 +434,20 @@ async def cmd_stats(interaction: discord.Interaction):
 async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "simple"):
     if not await _defer(interaction):
         return
+    # A bare sport word ("football", "show any cricket game")
+    # is a browse request, not a failed search: list that
+    # sport's live games as a pick list.
+    sport = watch._sport_from_words(query)
+    if sport and watch._is_sport_only_query(query, sport):
+        games = await watch.top_live_games(sport=sport)
+        if games:
+            await interaction.followup.send(
+                watch.render_top_games(
+                    games, header=watch.sport_list_header(sport)))
+        else:
+            await interaction.followup.send(
+                watch.no_live_sport_message(sport))
+        return
     try:
         result = await onex_search(query)
     except Exception:
@@ -464,11 +478,20 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
     if games:
         await interaction.followup.send(watch.render_match_list(games))
         return
-    suggestions = await watch.top_live_games()
+    # Suggestions follow the sport the query names, if any — a
+    # football query never suggests cricket. When that sport has
+    # nothing live, say so instead of listing other sports.
+    sport = watch._sport_from_words(query)
+    suggestions = await watch.top_live_games(sport=sport)
     if suggestions:
+        noun = f"live {sport.lower()} games" if sport else "live games"
         await interaction.followup.send(
-            f"No game found for '{query}' — here are the live games right now:\n"
+            f"No game found for '{query}' — here are the {noun} right now:\n"
             + watch.render_top_games(suggestions, header=""))
+        return
+    if sport:
+        await interaction.followup.send(
+            watch.no_live_sport_message(sport))
         return
     await interaction.followup.send(
         f"No game found for '{query}'. Try a team name, a league, "
@@ -540,13 +563,16 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             return
     if resolved.get("action") == "list":
         games = resolved.get("games") or []
+        sport = resolved.get("sport")
         if games:
             await interaction.followup.send(
-                watch.render_top_games(games), ephemeral=True)
-        else:
-            await interaction.followup.send(
-                "No games are live right now — try again when a match is on.",
+                watch.render_top_games(
+                    games, header=watch.sport_list_header(sport)),
                 ephemeral=True)
+        else:
+            msg = (watch.no_live_sport_message(sport) if sport
+                   else "No games are live right now — try again when a match is on.")
+            await interaction.followup.send(msg, ephemeral=True)
         return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
         removed = await watch.remove_watch(target.id, str(resolved["game_id"]))
@@ -566,11 +592,17 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                 + watch.render_match_list(candidates), ephemeral=True)
         else:
             suggestions = resolved.get("suggestions") or []
+            sport = resolved.get("sport")
             if suggestions:
+                noun = (f"live {sport.lower()} games" if sport
+                        else "live games")
                 await interaction.followup.send(
-                    f"I could not find a game for '{what}' — here are the live games right now:\n"
+                    f"I could not find a game for '{what}' — here are the {noun} right now:\n"
                     + watch.render_top_games(suggestions, header=""),
                     ephemeral=True)
+            elif sport:
+                await interaction.followup.send(
+                    watch.no_live_sport_message(sport), ephemeral=True)
             else:
                 await interaction.followup.send(
                     f"Could not find a game for '{what}'. Try a game ID "

@@ -1223,5 +1223,217 @@ class TestListIntent(unittest.IsolatedAsyncioTestCase):
         self.assertIn("771747666", text)
 
 
+class TestSportFilter(unittest.IsolatedAsyncioTestCase):
+    """Asking for football lists football only — no cricket in
+    the reply. Fixtures: 2 football + 1 featured football game
+    and 3 cricket games live (sport keys verified against the
+    real games1x2 shape, which carries sport.name per entry)."""
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {}
+        prov.hc.get = StubHttp(self).get
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+
+    def test_sport_words(self):
+        self.assertEqual(wmod._sport_from_words("show any football game"),
+                         "Football")
+        self.assertEqual(wmod._sport_from_words("soccer tonight"),
+                         "Football")
+        self.assertEqual(wmod._sport_from_words("any cricket live?"),
+                         "Cricket")
+        self.assertEqual(wmod._sport_from_words("hockey"), "Ice Hockey")
+        self.assertEqual(wmod._sport_from_words("table tennis"),
+                         "Table Tennis")
+        # "football" must not steal "american football".
+        self.assertEqual(
+            wmod._sport_from_words("show any american football game"),
+            "American Football")
+        self.assertIsNone(wmod._sport_from_words("show amy new game"))
+        self.assertIsNone(wmod._sport_from_words("Lumbini Lions"))
+
+    def test_canonical_sport(self):
+        self.assertEqual(wmod._canonical_sport("Football"), "Football")
+        self.assertEqual(wmod._canonical_sport("soccer"), "Football")
+        self.assertEqual(wmod._canonical_sport("Ice hockey"),
+                         "Ice Hockey")
+        self.assertIsNone(wmod._canonical_sport("Quidditch"))
+        self.assertIsNone(wmod._canonical_sport(None))
+
+    def test_is_sport_only_query(self):
+        self.assertTrue(wmod._is_sport_only_query("football", "Football"))
+        self.assertTrue(wmod._is_sport_only_query(
+            "show any cricket game", "Cricket"))
+        self.assertFalse(wmod._is_sport_only_query(
+            "football team X", "Football"))
+
+    async def test_football_list_only_football(self):
+        out = await wmod.resolve_watch("show any football game", None)
+        self.assertEqual(out["action"], "list")
+        self.assertEqual(out["sport"], "Football")
+        self.assertGreaterEqual(len(out["games"]), 2)
+        self.assertTrue(all(g.get("sport") == "Football"
+                            for g in out["games"]))
+        self.assertTrue(any(g["onex_id"] == 771747666
+                            for g in out["games"]))
+        self.assertFalse(any(g["onex_id"] in (771739998, 771750037,
+                                              771750038)
+                            for g in out["games"]))
+
+    async def test_cricket_list_only_cricket(self):
+        out = await wmod.resolve_watch("show me cricket", None)
+        self.assertEqual(out["action"], "list")
+        self.assertEqual(out["sport"], "Cricket")
+        self.assertTrue(all(g.get("sport") == "Cricket"
+                            for g in out["games"]))
+        self.assertTrue(any(g["onex_id"] == 771739998
+                            for g in out["games"]))
+        self.assertFalse(any(g["onex_id"] in (771747666, 771747706)
+                            for g in out["games"]))
+
+    async def test_sport_with_nothing_live(self):
+        out = await wmod.resolve_watch("show any basketball game", None)
+        self.assertEqual(out["action"], "list")
+        self.assertEqual(out["sport"], "Basketball")
+        self.assertEqual(out["games"], [])
+
+    async def test_cmd_watch_list_empty_sport_says_so(self):
+        import bot as botmod
+
+        resolved = {"game_id": None, "action": "list", "detail": None,
+                    "candidates": [], "entry": None, "source": "list",
+                    "channel": None, "channel_id": None,
+                    "channel_named": None, "note": "",
+                    "games": [], "suggestions": [],
+                    "sport": "Basketball"}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)):
+            await botmod.cmd_watch.callback(
+                interaction, "show any basketball game")
+        text = "\n".join(interaction.followup.sent)
+        self.assertEqual(text, "No basketball games live right now.")
+
+    async def test_cmd_watch_list_sport_header(self):
+        import bot as botmod
+
+        resolved = {"game_id": None, "action": "list", "detail": None,
+                    "candidates": [], "entry": None, "source": "list",
+                    "channel": None, "channel_id": None,
+                    "channel_named": None, "note": "",
+                    "games": await wmod.top_live_games(sport="Football"),
+                    "suggestions": [], "sport": "Football"}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)):
+            await botmod.cmd_watch.callback(
+                interaction, "show any football game")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("Live football right now", text)
+        self.assertIn("771747666", text)
+        self.assertNotIn("771739998", text)
+
+    async def test_ai_list_sport_honoured(self):
+        model = FakeModel('{"game_id": null, "action": "list", '
+                          '"sport": "Football", "detail": "simple", '
+                          '"channel_id": null, "note": "football"}')
+        out = await wmod.resolve_watch("show me football games", model)
+        self.assertEqual(out["action"], "list")
+        self.assertEqual(out["sport"], "Football")
+        self.assertTrue(all(g.get("sport") == "Football"
+                            for g in out["games"]))
+
+    async def test_ai_unknown_sport_means_no_filter(self):
+        model = FakeModel('{"game_id": null, "action": "list", '
+                          '"sport": "Quidditch", "detail": "simple", '
+                          '"channel_id": null, "note": "games"}')
+        out = await wmod.resolve_watch("show me some games", model)
+        self.assertEqual(out["action"], "list")
+        self.assertIsNone(out["sport"])
+        sports = {g.get("sport") for g in out["games"]}
+        self.assertIn("Football", sports)
+        self.assertIn("Cricket", sports)
+
+    async def test_ai_prompt_grounds_sport(self):
+        grounding = await prov.onex_grounding()
+        model = FakeModel('{"game_id": "771747666", "action": "follow", '
+                          '"detail": "simple", "note": "Gambia"}')
+        out = await wmod.parse_watch_ai("gambia", grounding, model)
+        self.assertEqual(out["game_id"], "771747666")
+        prompt = model.prompts[0]
+        self.assertIn("771747666 | Republic of the Gambia vs Ivory Coast "
+                      "| Africa Cup of Nations | Football |", prompt)
+        self.assertIn("| Cricket |", prompt)
+
+    async def test_game_bare_sport_returns_pick_list(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        with patch.object(botmod, "_defer",
+                          new=AsyncMock(return_value=True)):
+            await botmod.cmd_game.callback(interaction, "football")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("Live football right now", text)
+        self.assertIn("771747666", text)
+        self.assertNotIn("771739998", text)
+
+    async def test_game_bare_sport_nothing_live(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        with patch.object(botmod, "_defer",
+                          new=AsyncMock(return_value=True)):
+            await botmod.cmd_game.callback(interaction, "basketball")
+        text = "\n".join(interaction.followup.sent)
+        self.assertEqual(text, "No basketball games live right now.")
+
+    async def test_game_no_match_suggestions_filtered_by_sport(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        with patch.object(
+                botmod, "onex_search",
+                new=AsyncMock(return_value={"games": [], "detail": None})), \
+             patch.object(botmod, "_defer",
+                          new=AsyncMock(return_value=True)):
+            await botmod.cmd_game.callback(
+                interaction, "Zzqxj football team")
+        text = "\n".join(interaction.followup.sent)
+        self.assertIn("live football games right now", text)
+        self.assertIn("771747666", text)
+        self.assertNotIn("771739998", text)
+
+    async def test_watch_no_match_sport_empty_says_so(self):
+        import bot as botmod
+
+        out = await wmod.resolve_watch(
+            "follow the basketball team Zzqxj", None)
+        self.assertIsNone(out["game_id"])
+        self.assertEqual(out["sport"], "Basketball")
+        self.assertEqual(out["suggestions"], [])
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=out)):
+            await botmod.cmd_watch.callback(
+                interaction, "follow the basketball team Zzqxj")
+        text = "\n".join(interaction.followup.sent)
+        self.assertEqual(text, "No basketball games live right now.")
+
+    async def test_plain_browse_still_mixed(self):
+        out = await wmod.resolve_watch("show amy new game to test", None)
+        self.assertEqual(out["action"], "list")
+        self.assertIsNone(out["sport"])
+        sports = {g.get("sport") for g in out["games"]}
+        self.assertIn("Football", sports)
+        self.assertIn("Cricket", sports)
+
+
 if __name__ == "__main__":
     unittest.main()

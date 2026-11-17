@@ -187,11 +187,13 @@ def render_top_games(games: list[dict],
     return "\n".join(lines)
 
 
-async def top_live_games(limit: int = 5) -> list[dict]:
+async def top_live_games(limit: int = 5,
+                         sport: str | None = None) -> list[dict]:
     """Top live games with score + clock, for pick lists and
-    suggestions. Never raises — a failed fetch is an empty list."""
+    suggestions. Never raises — a failed fetch is an empty list.
+    With a sport, only that sport's games."""
     try:
-        return await prov.onex_top_live(limit)
+        return await prov.onex_top_live(limit, sport=sport)
     except Exception as exc:
         log.warning("[watch] top live games failed (%s)", type(exc).__name__)
         return []
@@ -322,16 +324,17 @@ def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str
 
 _AI_PROMPT = """You resolve a Discord user's request about a live sports game to ONE game from the list below.
 Reply with STRICT JSON only — no other text, no markdown, no explanation:
-{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail|list", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "note": "<one short line>"}
+{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail|list", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "sport": "<sport name or null>", "note": "<one short line>"}
 Rules:
 - game_id MUST be one of the ids in the games list. If no game matches the request, use null.
 - action is "follow" when the user wants alerts/updates for a game, "unfollow" when they want to stop following it, "detail" when they only want to see it now.
 - action is "list" when the user wants to browse/see the live games rather than follow one specific game (e.g. "show me a game", "what's live", "any game to test") — then game_id is null.
+- sport is the sport the user names when they want to browse games of one sport (e.g. "show me football games" -> "Football", "any cricket live?" -> "Cricket") — use only a sport name from the games list, or null when the user names none. Never invent a sport name.
 - detail is "advanced" only when the user asks for full/advanced/detailed stats; otherwise "simple".
 - channel_id MUST be one of the ids in the channels list, or null when the user does not name a channel. If the user names a channel that is not in the list, use null.
 - note is one short line saying what you understood, e.g. "Lumbini vs Sudurpaschim, NPL, alerts to #general".
 
-Games (id | home vs away | league | status):
+Games (id | home vs away | league | sport | status):
 __GAMES__
 
 Channels (id | #name):
@@ -351,7 +354,8 @@ async def parse_watch_ai(text: str, grounding: list[dict],
     if model is None:
         return None
     games = "\n".join(
-        f"{g['id']} | {g['home']} vs {g['away']} | {g['league']} | {g['status']}"
+        f"{g['id']} | {g['home']} vs {g['away']} | {g['league']} | "
+        f"{g.get('sport') or '?'} | {g['status']}"
         for g in grounding)
     if channels:
         chans = "\n".join(
@@ -404,6 +408,7 @@ async def parse_watch_ai(text: str, grounding: list[dict],
                         "outside the channel list")
     return {"game_id": gid, "action": action, "detail": detail,
             "channel_id": channel_id,
+            "sport": _canonical_sport(data.get("sport")),
             "note": str(data.get("note") or "")}
 
 
@@ -440,6 +445,116 @@ def _detail_from_words(text: str) -> str | None:
     if any(w in n for w in _SIMPLE_WORDS):
         return DETAIL_SIMPLE
     return None
+
+
+# User words -> the sport name the live data uses. Multi-word
+# phrases first (longest first) so "football" never steals
+# "american football", and "hockey" means ice hockey — the data
+# carries no field hockey. Sports the data never carries
+# (baseball, rugby, American football as a real sport) still
+# map — the filter then honestly finds nothing live instead of
+# guessing a different sport.
+_SPORT_WORDS = (
+    ("american football", "American Football"),
+    ("beach volleyball", "Beach Volleyball"),
+    ("basketball 3x3", "Basketball 3x3"),
+    ("ice hockey", "Ice Hockey"),
+    ("table tennis", "Table Tennis"),
+    ("field hockey", "Field Hockey"),
+    ("ping pong", "Table Tennis"),
+    ("football", "Football"),
+    ("soccer", "Football"),
+    ("cricket", "Cricket"),
+    ("basketball", "Basketball"),
+    ("hockey", "Ice Hockey"),
+    ("tennis", "Tennis"),
+    ("volleyball", "Volleyball"),
+    ("handball", "Handball"),
+    ("badminton", "Badminton"),
+    ("baseball", "Baseball"),
+    ("rugby", "Rugby"),
+    ("futsal", "Futsal"),
+    ("golf", "Golf"),
+    ("boxing", "Boxing"),
+    ("snooker", "Snooker"),
+    ("darts", "Darts"),
+    ("floorball", "Floorball"),
+    ("billiards", "Billiards"),
+    ("athletics", "Athletics"),
+    ("fifa", "FIFA"),
+    ("esports", "Esports"),
+)
+
+_SPORT_EMOJI = {
+    "Football": "⚽", "Cricket": "🏏", "Basketball": "🏀",
+    "Tennis": "🎾", "Ice Hockey": "🏒", "Volleyball": "🏐",
+    "Beach Volleyball": "🏐", "Table Tennis": "🏓",
+    "Badminton": "🏸", "Handball": "🤾", "Baseball": "⚾",
+    "Rugby": "🏉", "American Football": "🏈", "Golf": "⛳",
+    "Boxing": "🥊", "Snooker": "🎱", "Billiards": "🎱",
+    "Futsal": "⚽", "Athletics": "🏃", "Esports": "🎮",
+    "Basketball 3x3": "🏀", "Field Hockey": "🏑", "FIFA": "🎮",
+    "Darts": "🎯", "Floorball": "🏑",
+}
+
+
+def _sport_from_words(text: str) -> str | None:
+    """The sport the user's words name, in the live data's own
+    words — or None. Whole-word match, so "football" never
+    matches inside "American football" (checked first) or a
+    team name."""
+    n = _norm(text or "")
+    if not n:
+        return None
+    for phrase, sport in _SPORT_WORDS:
+        if re.search(r"\b" + re.escape(phrase) + r"\b", n):
+            return sport
+    return None
+
+
+def _canonical_sport(name: object) -> str | None:
+    """An AI-returned sport name -> the canonical name the live
+    data uses, or None when it is not a sport we know (never
+    invented — an unknown sport means "no filter")."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+    n = _norm(name)
+    for phrase, sport in _SPORT_WORDS:
+        if n == _norm(phrase) or n == _norm(sport):
+            return sport
+    return None
+
+
+def sport_list_header(sport: str | None) -> str:
+    """Pick-list header: "⚽ Live football right now — pick one:"
+    for a sport, the plain header when none."""
+    if not sport:
+        return "⚽ **Live games right now — pick one:**"
+    return (f"{_SPORT_EMOJI.get(sport, '⚽')} **Live "
+            f"{sport.lower()} right now — pick one:**")
+
+
+def no_live_sport_message(sport: str) -> str:
+    """Plain answer when no game of that sport is live — no
+    other sport is offered in its place."""
+    return f"No {sport.lower()} games live right now."
+
+
+_SPORT_QUERY_FILLER = {"live", "games", "game", "matches", "match",
+                       "any", "show", "list", "me", "the", "please",
+                       "right", "now", "on", "today", "tonight"}
+
+
+def _is_sport_only_query(text: str, sport: str) -> bool:
+    """The query is just the sport (plus filler like "live
+    games") — e.g. /game "football" or "show any cricket game",
+    not "football team X"."""
+    n = _norm(text or "")
+    if not n or not sport:
+        return False
+    for phrase, _name in _SPORT_WORDS:
+        n = re.sub(r"\b" + re.escape(phrase) + r"\b", " ", n)
+    return not [w for w in n.split() if w not in _SPORT_QUERY_FILLER]
 
 
 def _channel_mentions(text: str) -> list[str]:
@@ -484,10 +599,14 @@ _GAME_WORDS = ("game", "games", "match", "matches", "live", "playing",
 
 
 def _wants_list(text: str) -> bool:
-    """The user wants to browse games, not follow one."""
+    """The user wants to browse games, not follow one. A show
+    word plus a game word ("show any game") — or plus a sport
+    word ("show me cricket", "show football") — means browse."""
     n = _norm(text or "")
-    return (any(w in n for w in _SHOW_WORDS)
-            and any(w in n for w in _GAME_WORDS))
+    if not any(w in n for w in _SHOW_WORDS):
+        return False
+    return (any(w in n for w in _GAME_WORDS)
+            or _sport_from_words(text) is not None)
 
 
 async def resolve_watch(text: str, model, channels: list[dict] | None = None) -> dict:
@@ -499,10 +618,14 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
     keywords first, then Gemini's parsed detail.
     Returns {"game_id"|None, "action", "detail"|None,
     "channel"|None, "channel_id"|None, "channel_named"|None,
-    "candidates", "entry"|None, "source", "games", "suggestions"}.
+    "candidates", "entry"|None, "source", "games", "suggestions",
+    "sport"|None}.
     "games" holds the top live games when action is "list";
     "suggestions" holds them when nothing matched at all, so the
-    caller can offer them instead of a bare dead end. Never
+    caller can offer them instead of a bare dead end. "sport"
+    is the sport the words name — list and suggestion games are
+    filtered to it, and an empty filtered list means "no game of
+    that sport is live", never a list of other sports. Never
     invents an id or a channel id. "detail" is None when the words
     say nothing about it — the /watch dropdown always wins, and a
     hardcoded "simple" here used to discard the user's Advanced choice."""
@@ -511,14 +634,16 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
     word_channel, channel_named = _channel_from_words(q, channels)
 
     def _out(game_id, action, detail, candidates, entry, source,
-             channel=None, note="", games=None, suggestions=None):
+             channel=None, note="", games=None, suggestions=None,
+             sport=None):
         channel = channel if channel is not None else word_channel
         return {"game_id": game_id, "action": action, "detail": detail,
                 "candidates": candidates, "entry": entry, "source": source,
                 "note": note, "channel": channel,
                 "channel_id": (str(channel["id"]) if channel else None),
                 "channel_named": channel_named,
-                "games": games or [], "suggestions": suggestions or []}
+                "games": games or [], "suggestions": suggestions or [],
+                "sport": sport}
 
     if not q:
         return _out(None, "follow", words_detail, [], None, "none")
@@ -536,9 +661,13 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
                     matches[0], "name")
     ai = await parse_watch_ai(q, grounding, model, channels)
     if ai and ai.get("action") == "list":
-        top = await top_live_games()
+        # The AI's sport wins; the words back it up when the
+        # model did not name one — "show any football game"
+        # must not fall back to mixed sports.
+        sport = ai.get("sport") or _sport_from_words(q)
+        top = await top_live_games(sport=sport)
         return _out(None, "list", words_detail, [], None, "ai",
-                    games=top, note=ai.get("note", ""))
+                    games=top, note=ai.get("note", ""), sport=sport)
     if ai and ai.get("game_id"):
         entry = next((g for g in grounding
                       if str(g["id"]) == str(ai["game_id"])), None)
@@ -553,12 +682,14 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
                     entry, "ai", channel=ai_channel,
                     note=ai.get("note", ""))
     if _wants_list(q):
-        top = await top_live_games()
+        sport = _sport_from_words(q)
+        top = await top_live_games(sport=sport)
         return _out(None, "list", words_detail, [], None, "list",
-                    games=top)
-    suggestions = await top_live_games()
+                    games=top, sport=sport)
+    sport = _sport_from_words(q)
+    suggestions = await top_live_games(sport=sport)
     return _out(None, "follow", words_detail, matches[:5], None, "none",
-                suggestions=suggestions)
+                suggestions=suggestions, sport=sport)
 
 
 # ══════════════════════════════════════════════════════════════════════════

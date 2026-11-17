@@ -1009,16 +1009,19 @@ def _onex_norm_event(ev: dict, home: str, away: str) -> Event | None:
     }
 
 
-async def onex_live_matches() -> list[Match]:
+async def onex_live_matches(use_cache: bool = True) -> list[Match]:
     """Featured live football games from 1xBet (topGamesByStat).
 
     One HTTP call. Only the games 1xBet features — not every live match
     (see the section header). Unmapped leagues keep league_id 0 and are
     ignored by the notifier, but are still returned for /live.
+    use_cache=False skips http_client's cache entirely: the scoreboard
+    watches 1xBet every second and must reach the server on every poll.
     """
     data = await hc.get(f"{_ONEX_FEED}/topGamesByStat", _ONEX_HDR,
                         dict(_ONEX_TOP_PARAMS),
-                        cache_key="onex_live", provider="onexbet")
+                        cache_key="onex_live" if use_cache else "",
+                        provider="onexbet")
     if not isinstance(data, list):
         return []
     return [m for g in data if (m := _onex_norm_match(g)) is not None]
@@ -1042,3 +1045,217 @@ async def onex_events(game_id: int, home: str, away: str) -> list[Event]:
             if (n := _onex_norm_event(ev, home, away)) is not None:
                 events.append(n)
     return events
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NPL (Nepal Premier League) — live cricket for the scoreboard
+#
+# onex_live_matches() only returns featured games, and NPL is rarely
+# featured, so the scoreboard fetches it directly:
+#   1. 1xBet live list (games1x2, all live games, count=50 max) filtered
+#      by liga name "Nepal. Premier league" — score + overs from
+#      scores.extendedScore (cricketScore.wicketScore + innsStats.overStr,
+#      the same fields the site's Vercel proxy uses).
+#   2. If 1xBet has no live NPL game or no score for it, the NPL
+#      official site's public API (nplcricketleague.com/api/live-scores.php,
+#      ESPN source) fills in — same merge the site proxy does.
+# NPL is always T20, so the chasing target is first-innings + 1.
+# ══════════════════════════════════════════════════════════════════════════
+
+_ONEX_GAMES1X2_PARAMS: dict[str, Any] = {
+    "cfView": 3, "count": 50, "country": 130, "fcountry": 130,
+    "gr": 909, "grMode": 4, "lng": "en", "ref": 1,
+}
+_NPL_LIGA_NAME = "nepal. premier league"
+_NPL_LIVE_URL = "https://nplcricketleague.com/api/live-scores.php"
+_NPL_LIVE_HDR: dict[str, str] = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://nplcricketleague.com/",
+}
+_NPL_TOTAL_BALLS = 120  # T20
+
+
+def _onex_cricket_clock(scores: dict) -> str | None:
+    """Overs line for a live cricket game, e.g. "16.4 ov".
+
+    Innings break (isBreak / "Half-time"): the overs read 0.0 for the
+    innings that hasn't started — say so instead of "0.0 ov".
+    """
+    ext = (scores or {}).get("extendedScore") or {}
+    inns = ext.get("innsStats") or {}
+    if scores and scores.get("isBreak"):
+        return "Innings break"
+    over = inns.get("overStr")
+    clock = f"{over} ov" if over is not None else None
+    pname = str((scores or {}).get("currentPeriodName") or "")
+    if pname in ("1st innings", "2nd innings") and clock:
+        return f"{pname} \u00b7 {clock}"
+    return clock
+
+
+def _onex_cricket_target(home_score: Any, away_score: Any,
+                         batting_team: int | None,
+                         over_str: str | None) -> dict:
+    """Chasing target for a T20 game: team 2 needs first-innings + 1."""
+    out: dict[str, Any] = {"target": None, "need": None, "balls_left": None}
+    if batting_team != 2:
+        return out
+
+    def _runs(v: Any) -> int | None:
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            try:
+                return int(v.split("/")[0])
+            except ValueError:
+                return None
+        return None
+
+    first, second = _runs(home_score), _runs(away_score)
+    if first is None or second is None:
+        return out
+    out["target"] = first + 1
+    out["need"] = max(0, out["target"] - second)
+    if over_str:
+        try:
+            ov, balls = str(over_str).split(".")
+            bowled = int(ov) * 6 + int(balls)
+            out["balls_left"] = max(0, _NPL_TOTAL_BALLS - bowled)
+        except ValueError:
+            pass
+    return out
+
+
+def _onex_norm_npl_match(g: dict) -> Match | None:
+    """A live NPL game from a games1x2 entry, with cricket detail."""
+    m = _onex_norm_match(g)
+    if m is None:
+        return None
+    scores = g.get("scores") or {}
+    ext = scores.get("extendedScore") or {}
+    wk = (ext.get("cricketScore") or {}).get("wicketScore") or {}
+    if wk.get("opponent1") is not None:
+        m["home_score"] = str(wk["opponent1"])
+    if wk.get("opponent2") is not None:
+        m["away_score"] = str(wk["opponent2"])
+    inns = ext.get("innsStats") or {}
+    team = inns.get("team") if isinstance(inns.get("team"), int) else None
+    m["league"] = "Nepal Premier League"
+    m["clock"] = _onex_cricket_clock(scores)
+    m["cricket"] = {
+        "is_break": scores.get("isBreak") is True,
+        "team": team,
+        "over_str": str(inns["overStr"]) if inns.get("overStr") is not None else None,
+        **_onex_cricket_target(m["home_score"], m["away_score"], team,
+                               inns.get("overStr")),
+    }
+    return m
+
+
+def _onex_npl_from_games1x2(data: Any) -> list[Match]:
+    """Pure filter: live NPL games out of a games1x2 list."""
+    if not isinstance(data, list):
+        return []
+    out = []
+    for g in data:
+        liga = (g.get("liga") or {}).get("name") or ""
+        if _NPL_LIGA_NAME not in normalize(liga):
+            continue
+        if (m := _onex_norm_npl_match(g)) is not None:
+            out.append(m)
+    return out
+
+
+def _npl_score_str(s: Any) -> str | None:
+    if s is None:
+        return None
+    t = str(s).strip()
+    return t or None
+
+
+def _npl_official_norm(m: dict) -> Match | None:
+    """One live match from the NPL official API (ESPN source)."""
+    if not isinstance(m, dict) or m.get("status") != "live":
+        return None
+    home = str(m.get("team1") or "").strip()
+    away = str(m.get("team2") or "").strip()
+    if not home or not away:
+        return None
+    # The scorecard lists innings in order; the last one is the innings
+    # in progress, so its overs are the current overs.
+    innings = ((m.get("scorecard") or {}).get("innings") or [])
+    current = innings[-1] if innings else None
+    overs = (_npl_score_str(current.get("overs")) if current else None) \
+        or _npl_score_str(m.get("overs1")) or _npl_score_str(m.get("overs2"))
+    return {
+        "id": f"npl-{m.get('id')}",
+        "sofa_id": None, "apf_id": None, "onex_id": None,
+        "home": home, "away": away,
+        "home_norm": normalize(home), "away_norm": normalize(away),
+        "home_score": _npl_score_str(m.get("score1")),
+        "away_score": _npl_score_str(m.get("score2")),
+        "home_logo": "", "away_logo": "",
+        "status": "live", "status_code": 0, "minute": None,
+        "league": "Nepal Premier League", "league_id": 0, "sofa_lid": 0,
+        "date": "", "stadium": "", "referee": "",
+        "provider": "npl-official", "finished": False,
+        "clock": f"{overs} ov" if overs else "Live",
+        "cricket": {"is_break": False, "team": None, "over_str": overs,
+                    "target": None, "need": None, "balls_left": None},
+    }
+
+
+def _npl_has_score(matches: list[Match]) -> bool:
+    return any(m.get("home_score") not in (None, "")
+               or m.get("away_score") not in (None, "")
+               for m in matches)
+
+
+def _npl_same_teams(a: Match, b: Match) -> bool:
+    return (a.get("home_norm") == b.get("home_norm")
+            and a.get("away_norm") == b.get("away_norm"))
+
+
+async def onex_npl_live() -> list[Match]:
+    """Live NPL cricket: 1xBet first, official API when 1xBet has no score.
+
+    Returns [] when no NPL match is live. Never raises — a failed fetch
+    is an empty list, so the scoreboard loop keeps running.
+    """
+    try:
+        data = await hc.get(f"{_ONEX_FEED}/games1x2", _ONEX_HDR,
+                            dict(_ONEX_GAMES1X2_PARAMS),
+                            cache_key="", provider="onexbet")
+        npl = _onex_npl_from_games1x2(data)
+    except Exception as exc:
+        log.warning("[onexbet] NPL games1x2 failed (%s)", type(exc).__name__)
+        npl = []
+    if _npl_has_score(npl):
+        return npl
+    # 1xBet has no live NPL score — the official feed is the fallback.
+    try:
+        data = await hc.get(_NPL_LIVE_URL, _NPL_LIVE_HDR,
+                            cache_key="", provider="npl-official")
+        raw = data.get("matches") if isinstance(data, dict) else data
+        official = [_npl_official_norm(m) for m in (raw or [])]
+        official = [m for m in official if m is not None]
+    except Exception as exc:
+        log.warning("[npl-official] live-scores failed (%s)", type(exc).__name__)
+        return npl
+    if not npl:
+        return official
+    # 1xBet lists the game but carries no score yet — fill it in from
+    # the official feed by team name.
+    for om in official:
+        if any(_npl_same_teams(om, m) for m in npl):
+            continue
+        npl.append(om)
+    for m in npl:
+        if _npl_has_score([m]):
+            continue
+        for om in official:
+            if _npl_same_teams(m, om):
+                m["home_score"], m["away_score"] = om["home_score"], om["away_score"]
+                m["clock"], m["provider"] = om["clock"], "npl-official"
+    return npl

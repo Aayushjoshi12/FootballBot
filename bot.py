@@ -11,6 +11,7 @@ import db
 import http_client as hc
 import notifier
 import barcelona_reminder
+import scoreboard
 from config import (
     DISCORD_BOT_TOKEN, TRACKED_LEAGUES,
     GEMINI_API_KEY, GEMINI_MODEL, SPORTSDB_LEAGUE_MAP, ESPN_LEAGUE_MAP,
@@ -90,6 +91,7 @@ class FootballBot(discord.Client):
             await self.tree.sync(guild=guild)
         asyncio.create_task(notifier.poll_loop(self))
         barcelona_reminder.ensure_running(self)
+        scoreboard.ensure_running(self)
         log.info("[bot] Setup complete. %d channels subscribed.", len(notifier.subscriptions))
 
     async def on_ready(self):
@@ -109,6 +111,10 @@ class FootballBot(discord.Client):
         if reminder_task is not None:
             reminder_task.cancel()
             await asyncio.gather(reminder_task, return_exceptions=True)
+        sb_task = getattr(self, "scoreboard_task", None)
+        if sb_task is not None:
+            sb_task.cancel()
+            await asyncio.gather(sb_task, return_exceptions=True)
         await hc.close()
         await db.close()
         await super().close()
@@ -181,6 +187,7 @@ async def cmd_help(interaction: discord.Interaction):
     )
     embed.add_field(name="📡 Live", value=(
         "`/live` — all live matches\n"
+        "`/scoreboard` — live scoreboard in this channel\n"
         "`/today` — today's fixtures\n"
         "`/tomorrow` — tomorrow's fixtures\n"
         "`/live` shows an empty result when no supported match is live"
@@ -330,6 +337,28 @@ async def cmd_live(interaction: discord.Interaction):
         await interaction.followup.send(embed=match_embed(m), view=MatchView(m))
     if len(combined) > 5:
         await interaction.followup.send(f"…and {len(combined)-5} more live matches.")
+
+
+# ── /scoreboard ───────────────────────────────────────────────────────────────
+@bot.tree.command(name="scoreboard", description="Live scoreboard in this channel (NPL + top games)")
+async def cmd_scoreboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        posted = await scoreboard.start_for_channel(bot, interaction.channel_id)
+    except Exception:
+        log.exception("[scoreboard] start failed")
+        await interaction.followup.send(
+            "Could not start the scoreboard here. Please try again shortly.",
+            ephemeral=True)
+        return
+    if posted:
+        await interaction.followup.send(
+            "📊 Live scoreboard started in this channel — it updates when "
+            "a score changes.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "Could not post the scoreboard here — check the bot can send "
+            "messages in this channel.", ephemeral=True)
 
 
 # ── /today ──────────────────────────────────────────────────────────────────────

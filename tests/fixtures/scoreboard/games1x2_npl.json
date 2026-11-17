@@ -1,0 +1,35 @@
+[
+  {
+    "id": 771678099,
+    "mainGameId": 771678099,
+    "startTs": 1794931200,
+    "liga": {"name": "Nepal. Premier league", "id": 2791573},
+    "opponent1": {"fullName": "Lumbini Lions"},
+    "opponent2": {"fullName": "Sudurpaschim Royals"},
+    "scores": {
+      "scoreOpp1": 157,
+      "scoreOpp2": 76,
+      "isBreak": false,
+      "currentPeriodName": "2nd innings",
+      "statusLineStr": "Event in progress",
+      "extendedScore": {
+        "innsStats": {"team": 2, "overStr": "10.5", "wickets": 2},
+        "cricketScore": {"wicketScore": {"opponent1": "157", "opponent2": "76/2"}}
+      }
+    }
+  },
+  {
+    "id": 771747706,
+    "liga": {"name": "Africa Cup of Nations"},
+    "opponent1": {"fullName": "Sierra Leone"},
+    "opponent2": {"fullName": "DR Congo"},
+    "scores": {
+      "scoreOpp1": 0,
+      "scoreOpp2": 1,
+      "currentPeriod": 1,
+      "currentPeriodName": "1st half",
+      "timer": {"timeSec": 2568, "timeRun": true},
+      "statusLineStr": "42 minutes"
+    }
+  }
+]

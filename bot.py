@@ -1,29 +1,31 @@
-"""
-Football Discord Bot — production grade
-Commands: /live /fixtures /match /team /standings /subscribe /unsubscribe /subs
-          /today /tomorrow /h2h /lineups /topscorers /injuries /form /player
-          /prediction /transfers /favorites /stats
-"""
+"""Football Discord Bot using verified public football-data sources."""
 import asyncio
 import logging
+from datetime import date, datetime, timedelta
 
 import discord
 from discord import app_commands
+import google.generativeai as genai
 
 import db
 import http_client as hc
 import notifier
-from config import DISCORD_BOT_TOKEN, TRACKED_LEAGUES, ESPN_LEAGUE_MAP
+import barcelona_reminder
+from config import (
+    DISCORD_BOT_TOKEN, TRACKED_LEAGUES,
+    GEMINI_API_KEY, GEMINI_MODEL, SPORTSDB_LEAGUE_MAP, ESPN_LEAGUE_MAP,
+)
 from embeds import (
     match_embed, fixtures_embed, standings_embed, team_embed,
     injuries_embed, h2h_embed, lineups_embed, topscorers_embed,
     prediction_embed, MatchView,
 )
 from providers import (
-    sofa_live_matches, apf_live, espn_live, onex_live_matches, apf_upcoming, apf_stats, apf_events,
-    apf_standings, apf_team_fixtures, apf_search_team, apf_topscorers,
-    apf_injuries, apf_h2h, apf_prediction, apf_lineups, apf_transfers,
-    apf_player, apf_today, apf_tomorrow,
+    apf_upcoming, apf_stats, apf_events, apf_standings, apf_team_fixtures,
+    apf_search_team, apf_topscorers, apf_injuries, apf_h2h, apf_prediction,
+    apf_lineups, apf_transfers, apf_player, free_fixtures_for_day,
+    sportsdb_day, sportsdb_live_matches,
+    sofa_live_matches, apf_live, espn_live, onex_live_matches,
 )
 
 logging.basicConfig(
@@ -33,8 +35,13 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 
-def _league_choices() -> list[app_commands.Choice[str]]:
-    return [app_commands.Choice(name=name, value=str(lid)) for lid, name in TRACKED_LEAGUES.items()]
+ai_model = None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    ai_model = genai.GenerativeModel(GEMINI_MODEL)
+    log.info("[ai] Gemini enabled with model %s", GEMINI_MODEL)
+else:
+    log.warning("[ai] Gemini disabled: GEMINI_API_KEY is not set")
 
 
 def _crosslink_apf(matches: list[dict], apf_matches: list[dict]) -> None:
@@ -52,6 +59,14 @@ def _crosslink_apf(matches: list[dict], apf_matches: list[dict]) -> None:
                 m["apf_id"] = apf_id
 
 
+def _league_choices() -> list[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(name=name, value=str(lid))
+        for lid, name in TRACKED_LEAGUES.items()
+        if lid in SPORTSDB_LEAGUE_MAP
+    ]
+
+
 class FootballBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
@@ -60,21 +75,64 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         notifier.subscriptions = await db.get_all_subscriptions()
+        # These need API-Football endpoints that are unavailable with the
+        # rejected key.  Do not publish commands that cannot return data.
+        for name in (
+            "match", "team", "form", "standings", "topscorers", "injuries",
+            "h2h", "lineups", "prediction", "player", "transfers", "favorites",
+        ):
+            self.tree.remove_command(name)
         await self.tree.sync()
+        # Global updates can take up to an hour to appear.  This bot is used
+        # in a small set of servers, so also perform an immediate guild sync.
+        for guild in self.guilds:
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
         asyncio.create_task(notifier.poll_loop(self))
+        barcelona_reminder.ensure_running(self)
         log.info("[bot] Setup complete. %d channels subscribed.", len(notifier.subscriptions))
 
     async def on_ready(self):
+        barcelona_reminder.ensure_running(self)
         log.info("[bot] Ready as %s", self.user)
+        for guild in self.guilds:
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            log.info("[bot] Synced current commands to %s", guild.name)
         await self.change_presence(activity=discord.Game("⚽ Football Live"))
 
+    async def on_resumed(self):
+        barcelona_reminder.ensure_running(self)
+
     async def close(self):
+        reminder_task = getattr(self, "barcelona_task", None)
+        if reminder_task is not None:
+            reminder_task.cancel()
+            await asyncio.gather(reminder_task, return_exceptions=True)
         await hc.close()
         await db.close()
         await super().close()
 
 
 bot = FootballBot()
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    """Keep command failures private and useful without leaking internals."""
+    original = getattr(error, "original", error)
+    log.exception("[command] %s failed", interaction.command, exc_info=original)
+    message = "Football data is temporarily unavailable. Please try again shortly."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except (discord.NotFound, discord.HTTPException):
+        # Discord may have already expired or acknowledged the interaction.
+        log.warning("[command] could not send error response for %s", interaction.command)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -88,6 +146,16 @@ async def _send_paginated(interaction: discord.Interaction, embeds: list[discord
         return
     for emb in embeds:
         await interaction.followup.send(embed=emb)
+
+
+async def _defer(interaction: discord.Interaction) -> bool:
+    """Acknowledge promptly; never make a second error from an expired command."""
+    try:
+        await interaction.response.defer(thinking=True)
+        return True
+    except (discord.InteractionResponded, discord.NotFound, discord.HTTPException):
+        log.warning("[command] acknowledgement unavailable for %s", interaction.command)
+        return False
 
 
 async def _find_team(name: str) -> tuple[dict | None, list]:
@@ -106,8 +174,8 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Four providers: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢** + **1xBet 🟠**\n"
-            "Live alerts sent to subscribed channels automatically.\n​"
+            "Five providers: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢** + **1xBet 🟠** + **TheSportsDB**\n"
+            "Live alerts are sent automatically to subscribed channels."
         ),
         color=0x00C851,
     )
@@ -115,47 +183,121 @@ async def cmd_help(interaction: discord.Interaction):
         "`/live` — all live matches\n"
         "`/today` — today's fixtures\n"
         "`/tomorrow` — tomorrow's fixtures\n"
-        "`/match` — events + stats\n"
-        "`/lineups` — team lineups"
+        "`/live` shows an empty result when no supported match is live"
     ), inline=True)
-    embed.add_field(name="📊 Stats", value=(
-        "`/standings` — league table\n"
-        "`/topscorers` — top scorers\n"
-        "`/form` — team recent form\n"
-        "`/h2h` — head to head\n"
-        "`/prediction` — match prediction"
-    ), inline=True)
-    embed.add_field(name="🔍 Search", value=(
-        "`/team` — last 5 results\n"
-        "`/player` — player stats\n"
-        "`/injuries` — team injuries\n"
-        "`/transfers` — team transfers\n"
-        "`/fixtures` — upcoming games"
+    embed.add_field(name="📅 Fixtures", value=(
+        "`/today` — today's fixtures\n"
+        "`/tomorrow` — tomorrow's fixtures\n"
+        "`/fixtures` — upcoming games\n"
+        "`/live` — live scores"
     ), inline=True)
     embed.add_field(name="🔔 Alerts", value=(
         "`/subscribe` — live alerts here\n"
         "`/unsubscribe` — stop alerts\n"
         "`/subs` — active subscriptions"
     ), inline=True)
-    embed.add_field(name="⭐ Favorites", value=(
-        "`/favorites list` — your teams\n"
-        "`/favorites add` — add a team\n"
-        "`/favorites remove` — remove a team"
+    embed.add_field(name="🛠 Tools", value=(
+        "`/ping` — bot connection health\n"
+        "`/health` — service and reminder status\n"
+        "`/nextbarca` — Barcelona's next match\n"
+        "`/ai` — ask Gemini a question"
     ), inline=True)
-    leagues = "\n".join(f"`{lid}` {name}" for lid, name in TRACKED_LEAGUES.items())
+    leagues = "\n".join(f"`{lid}` {name}" for lid, name in TRACKED_LEAGUES.items() if lid in SPORTSDB_LEAGUE_MAP)
     embed.add_field(name="🏆 Available Leagues", value=leagues, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── /live ──────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="ping", description="Check whether the bot is online")
+async def cmd_ping(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"🏓 Pong — {round(bot.latency * 1000)} ms", ephemeral=True
+    )
+
+
+@bot.tree.command(name="health", description="Check bot, providers, and Barcelona reminders")
+async def cmd_health(interaction: discord.Interaction):
+    from http_client import stats_summary
+    reminder = barcelona_reminder.health_snapshot(bot)
+    embed = discord.Embed(title="🩺 Football Bot Health", color=0x00C851)
+    embed.add_field(name="Discord", value=f"Connected • {round(bot.latency * 1000)} ms", inline=True)
+    embed.add_field(name="Reminder worker", value=reminder["worker"], inline=True)
+    embed.add_field(name="Reminder channel", value="configured" if reminder["channel_configured"] else "missing", inline=True)
+    embed.add_field(name="Last reminder poll", value=reminder["last_poll"], inline=False)
+    if reminder["last_result"]:
+        result = reminder["last_result"]
+        embed.add_field(name="Last reminder result", value=(
+            f"fixtures: {result.get('fixtures', 0)} • due: {result.get('due', 0)} • "
+            f"sent: {result.get('sent', 0)} • errors: {result.get('errors', 0)}"
+        ), inline=False)
+    embed.add_field(name="Provider status", value=f"```\n{stats_summary()}\n```", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="nextbarca", description="Show Barcelona's next match and reminder time")
+async def cmd_nextbarca(interaction: discord.Interaction):
+    if not await _defer(interaction):
+        return
+    now = datetime.now(barcelona_reminder.NEPAL)
+    candidates = []
+    for offset in range(9):
+        fixtures = await free_fixtures_for_day(140, (now.date() + timedelta(days=offset)).isoformat())
+        for match in fixtures:
+            if not barcelona_reminder._is_barcelona(match):
+                continue
+            kickoff = barcelona_reminder._kickoff(match)
+            if kickoff and kickoff > now:
+                candidates.append((kickoff, match))
+    if not candidates:
+        await interaction.followup.send("No upcoming Barcelona fixture is available from the provider yet.")
+        return
+    kickoff, match = min(candidates, key=lambda item: item[0])
+    local = kickoff.astimezone(barcelona_reminder.NEPAL)
+    due = barcelona_reminder._send_at(kickoff)
+    embed = discord.Embed(title="🔵🔴 Next Barcelona Match", color=0xA50044)
+    embed.description = f"**{match.get('home', 'TBD')} vs {match.get('away', 'TBD')}**"
+    embed.add_field(name="Kickoff", value=f"<t:{int(kickoff.timestamp())}:F>\n{local.strftime('%I:%M %p')} Nepal time", inline=False)
+    embed.add_field(name="Reminder", value=f"<t:{int(due.timestamp())}:F>\n{due.strftime('%I:%M %p')} Nepal time", inline=False)
+    await interaction.followup.send(embed=embed)
+
+
+async def _ask_gemini(prompt: str) -> str:
+    if ai_model is None:
+        raise RuntimeError("Gemini is not configured on this bot.")
+    response = await asyncio.to_thread(ai_model.generate_content, prompt)
+    text = getattr(response, "text", "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned no text for that request.")
+    return text
+
+
+@bot.tree.command(name="ai", description="Ask Gemini a question")
+@app_commands.describe(prompt="Your question or request")
+async def cmd_ai(interaction: discord.Interaction, prompt: str):
+    await interaction.response.defer(thinking=True)
+    try:
+        answer = await _ask_gemini(prompt)
+    except Exception:
+        log.exception("[ai] Request failed")
+        await interaction.followup.send(
+            "❌ AI is temporarily unavailable. Please try again shortly.", ephemeral=True
+        )
+        return
+
+    for start in range(0, len(answer), 2000):
+        await interaction.followup.send(answer[start:start + 2000])
+
+
+# ── /live ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="live", description="All live matches right now")
 async def cmd_live(interaction: discord.Interaction):
     await interaction.response.defer()
     espn_tasks = [espn_live(slug, lid) for lid, slug in ESPN_LEAGUE_MAP.items()]
     results = await asyncio.gather(
-        sofa_live_matches(), apf_live(), onex_live_matches(), *espn_tasks, return_exceptions=True
+        sportsdb_live_matches(), sofa_live_matches(), apf_live(), onex_live_matches(), *espn_tasks,
+        return_exceptions=True,
     )
-    sofa, apf, onex, *espn_results = results
+    sportsdb, sofa, apf, onex, *espn_results = results
+    sportsdb = sportsdb if isinstance(sportsdb, list) else []
     sofa = sofa if isinstance(sofa, list) else []
     apf  = apf  if isinstance(apf,  list) else []
     onex = onex if isinstance(onex, list) else []
@@ -164,9 +306,9 @@ async def cmd_live(interaction: discord.Interaction):
         if isinstance(r, tuple):
             espn.extend(r[0])
 
-    # Deduplicate: APF/SofaScore take priority over ESPN and 1xBet
-    seen_pairs = {(m["home"], m["away"]) for m in sofa} | {(m["home"], m["away"]) for m in apf}
-    combined   = sofa + apf
+    # Deduplicate: SportsDB/SofaScore/API-Football take priority over ESPN and 1xBet
+    seen_pairs = {(m["home"], m["away"]) for m in sportsdb} | {(m["home"], m["away"]) for m in sofa} | {(m["home"], m["away"]) for m in apf}
+    combined   = sportsdb + sofa + apf
     for m in espn:
         pair = (m["home"], m["away"])
         if pair not in seen_pairs:
@@ -190,43 +332,51 @@ async def cmd_live(interaction: discord.Interaction):
         await interaction.followup.send(f"…and {len(combined)-5} more live matches.")
 
 
-# ── /today ─────────────────────────────────────────────────────────────────────
+# ── /today ──────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="today", description="Today's fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
 async def cmd_today(interaction: discord.Interaction, league: str):
-    await interaction.response.defer()
+    if not await _defer(interaction):
+        return
     lid      = int(league)
-    fixtures = await apf_today(lid)
+    fixtures = await free_fixtures_for_day(lid, date.today().isoformat())
     embeds   = fixtures_embed(fixtures, lid, f"📅 Today — {TRACKED_LEAGUES[lid]}")
     await _send_paginated(interaction, embeds)
 
 
-# ── /tomorrow ──────────────────────────────────────────────────────────────────
+# ── /tomorrow ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="tomorrow", description="Tomorrow's fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
 async def cmd_tomorrow(interaction: discord.Interaction, league: str):
-    await interaction.response.defer()
+    if not await _defer(interaction):
+        return
     lid      = int(league)
-    fixtures = await apf_tomorrow(lid)
+    fixtures = await free_fixtures_for_day(lid, (date.today() + timedelta(days=1)).isoformat())
     embeds   = fixtures_embed(fixtures, lid, f"📅 Tomorrow — {TRACKED_LEAGUES[lid]}")
     await _send_paginated(interaction, embeds)
 
 
-# ── /fixtures ──────────────────────────────────────────────────────────────────
+# ── /fixtures ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="fixtures", description="Upcoming fixtures for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
 async def cmd_fixtures(interaction: discord.Interaction, league: str):
     await interaction.response.defer()
     lid      = int(league)
-    fixtures = await apf_upcoming(lid, next_n=10)
+    fixtures = []
+    for offset in range(7):
+        fixtures.extend(await sportsdb_day(lid, (date.today() + timedelta(days=offset)).isoformat()))
+        if len(fixtures) >= 10:
+            break
+    if not fixtures:
+        fixtures = await apf_upcoming(lid, next_n=10)
     embeds   = fixtures_embed(fixtures, lid, f"📆 Upcoming — {TRACKED_LEAGUES[lid]}")
     await _send_paginated(interaction, embeds)
 
 
-# ── /match ─────────────────────────────────────────────────────────────────────
+# ── /match ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="match", description="Events and stats for a fixture")
 @app_commands.describe(fixture_id="APF Fixture ID (from /live or /fixtures)")
 async def cmd_match(interaction: discord.Interaction, fixture_id: int):
@@ -248,7 +398,7 @@ async def cmd_match(interaction: discord.Interaction, fixture_id: int):
         await interaction.followup.send(chunk)
 
 
-# ── /team ──────────────────────────────────────────────────────────────────────
+# ── /team ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="team", description="Last 5 results for a team")
 @app_commands.describe(name="Team name")
 async def cmd_team(interaction: discord.Interaction, name: str):
@@ -261,7 +411,7 @@ async def cmd_team(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /form ──────────────────────────────────────────────────────────────────────
+# ── /form ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="form", description="Recent form for a team (last 10)")
 @app_commands.describe(name="Team name")
 async def cmd_form(interaction: discord.Interaction, name: str):
@@ -274,7 +424,7 @@ async def cmd_form(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /standings ─────────────────────────────────────────────────────────────────
+# ── /standings ───────────────────────────────────────────────────────────────────
 @bot.tree.command(name="standings", description="League table")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -285,7 +435,7 @@ async def cmd_standings(interaction: discord.Interaction, league: str):
     await interaction.followup.send(embed=standings_embed(data, lid))
 
 
-# ── /topscorers ────────────────────────────────────────────────────────────────
+# ── /topscorers ──────────────────────────────────────────────────────────────────
 @bot.tree.command(name="topscorers", description="Top scorers for a league")
 @app_commands.describe(league="Pick a league")
 @app_commands.choices(league=_league_choices())
@@ -309,7 +459,7 @@ async def cmd_injuries(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=injuries_embed(team["name"], injuries))
 
 
-# ── /h2h ───────────────────────────────────────────────────────────────────────
+# ── /h2h ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="h2h", description="Head to head between two teams")
 @app_commands.describe(team1="First team", team2="Second team")
 async def cmd_h2h(interaction: discord.Interaction, team1: str, team2: str):
@@ -340,7 +490,7 @@ async def cmd_lineups(interaction: discord.Interaction, fixture_id: int):
     await interaction.followup.send(embed=lineups_embed(m, lineups))
 
 
-# ── /prediction ────────────────────────────────────────────────────────────────
+# ── /prediction ──────────────────────────────────────────────────────────────────
 @bot.tree.command(name="prediction", description="AI match prediction (APF fixture ID)")
 @app_commands.describe(fixture_id="APF Fixture ID")
 async def cmd_prediction(interaction: discord.Interaction, fixture_id: int):
@@ -355,7 +505,7 @@ async def cmd_prediction(interaction: discord.Interaction, fixture_id: int):
     await interaction.followup.send(embed=prediction_embed(m, pred))
 
 
-# ── /player ────────────────────────────────────────────────────────────────────
+# ── /player ───────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="player", description="Player stats by ID")
 @app_commands.describe(player_id="Player ID from API-Football")
 async def cmd_player(interaction: discord.Interaction, player_id: int):
@@ -436,7 +586,7 @@ async def cmd_unsubscribe(interaction: discord.Interaction):
     )
 
 
-# ── /subs ──────────────────────────────────────────────────────────────────────
+# ── /subs ────────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="subs", description="Active subscriptions for this channel")
 async def cmd_subs(interaction: discord.Interaction):
     leagues = notifier.subscriptions.get(interaction.channel_id, set())
@@ -483,7 +633,7 @@ async def fav_remove(interaction: discord.Interaction, team_id: int):
     await interaction.response.send_message(f"Removed team `{team_id}` from favorites.", ephemeral=True)
 
 
-# ── /stats (bot performance) ───────────────────────────────────────────────────
+# ── /stats (bot performance) ──────────────────────────────────────────────────────
 @bot.tree.command(name="stats", description="Bot performance stats (provider latency)")
 async def cmd_stats(interaction: discord.Interaction):
     from http_client import stats_summary

@@ -6,7 +6,8 @@ load_dotenv()
 
 DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
 APIFOOTBALL_API_KEY = os.getenv("APIFOOTBALL_API_KEY", "")
-
+GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # 1xBet live scores (unofficial service-api on the lite mirror, no key).
 # The lite mirror domain rotates (1xlite-6229051.com, 1xlite-6428119.com,
 # ...), so override this when the default mirror stops answering.
@@ -23,7 +24,19 @@ def _current_season() -> int:
     return today.year if today.month >= 7 else today.year - 1
 
 
-POLL_INTERVAL   = 12    # seconds
+def _current_season() -> int:
+    """
+    API-Football labels a season by its start year (e.g. the 2026-27
+    season is `season=2026`). Most tracked leagues start around July/
+    August, so before July we're still in the previous season.
+    """
+    today = date.today()
+    return today.year if today.month >= 7 else today.year - 1
+
+
+# Public data sources have rate limits. Thirty seconds is responsive enough
+# for Discord alerts without repeatedly hammering a daily-scoreboard endpoint.
+POLL_INTERVAL   = 30    # seconds
 CURRENT_SEASON  = _current_season()
 MAX_CONCURRENCY = 10    # max simultaneous HTTP requests
 
@@ -90,6 +103,18 @@ ESPN_LEAGUE_MAP: dict[int, str] = {
     3:   "uefa.europa",       # UEL
     848: "uefa.europa.conf",  # UECL
     15:  "fifa.cwc",          # Club World Cup
+}
+
+# API-Football league ID → TheSportsDB league ID.  TheSportsDB's documented
+# public V1 key is used only as a no-account fallback for daily schedules.
+SPORTSDB_LEAGUE_MAP: dict[int, int] = {
+    39:  4328,  # Premier League
+    140: 4335,  # La Liga
+    135: 4332,  # Serie A
+    78:  4331,  # Bundesliga
+    61:  4334,  # Ligue 1
+    2:   4480,  # UEFA Champions League
+    3:   4481,  # UEFA Europa League
 }
 
 LEAGUE_LOGOS: dict[int, str] = {

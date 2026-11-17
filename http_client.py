@@ -9,6 +9,7 @@ Shared aiohttp session with:
 - Clean shutdown
 """
 import asyncio
+import copy
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -24,6 +25,8 @@ _semaphore: asyncio.Semaphore | None = None
 
 # { cache_key: Last-Modified value }
 _last_modified: dict[str, str] = {}
+_response_bodies: dict[str, Any] = {}
+MAX_CACHE_ENTRIES = 256
 
 # Simple latency metrics { provider: [float, ...] }
 _latencies: dict[str, list[float]] = {}
@@ -76,7 +79,7 @@ async def get(
                 After calling it, headers are re-copied on the next attempt
                 so any cookie updates land automatically.
 
-    Returns None on 304 (not modified) or after all retries exhausted.
+    Reuses the last successful JSON body on 304; returns None on failure.
     """
     sem = get_semaphore()
 
@@ -84,7 +87,7 @@ async def get(
         # Re-copy headers each attempt so cookie/token updates from refresh_fn
         # are picked up without needing to restart the whole call.
         hdrs = dict(headers)
-        if cache_key and cache_key in _last_modified:
+        if cache_key and cache_key in _last_modified and cache_key in _response_bodies:
             hdrs["If-Modified-Since"] = _last_modified[cache_key]
 
         t0 = time.monotonic()
@@ -98,8 +101,10 @@ async def get(
                         _latencies[provider] = _latencies[provider][-100:]
 
                     if resp.status == 304:
-                        log.debug("[%s] 304 Not Modified: %s", provider, url)
-                        return None
+                        if cache_key in _response_bodies:
+                            return copy.deepcopy(_response_bodies[cache_key])
+                        _last_modified.pop(cache_key, None)
+                        continue
 
                     if resp.status == 403:
                         if refresh_fn and attempt < MAX_RETRIES - 1:
@@ -125,11 +130,19 @@ async def get(
 
                     resp.raise_for_status()
 
-                    if cache_key and "Last-Modified" in resp.headers:
-                        _last_modified[cache_key] = resp.headers["Last-Modified"]
-
                     try:
-                        return await resp.json(content_type=None)
+                        body = await resp.json(content_type=None)
+                        if cache_key:
+                            _response_bodies[cache_key] = copy.deepcopy(body)
+                            if "Last-Modified" in resp.headers:
+                                _last_modified[cache_key] = resp.headers["Last-Modified"]
+                            else:
+                                _last_modified.pop(cache_key, None)
+                            while len(_response_bodies) > MAX_CACHE_ENTRIES:
+                                oldest = next(iter(_response_bodies))
+                                _response_bodies.pop(oldest, None)
+                                _last_modified.pop(oldest, None)
+                        return body
                     except Exception:
                         text = await resp.text()
                         log.error("[%s] Malformed JSON from %s: %.200s", provider, url, text)

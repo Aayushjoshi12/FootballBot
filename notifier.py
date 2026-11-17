@@ -3,13 +3,13 @@ Production-grade quad-provider live poller.
 
 Architecture:
   - Polls ESPN + SofaScore + API-Football + 1xBet concurrently every POLL_INTERVAL seconds
+  - 1xBet covers featured live games only; its events merge into tracked
+    matches like ESPN's, and games no other provider tracks get their own
+    state (see the 1xBet section in _tick)
   - ESPN is fetched first within the merged event list because it bundles events
     with the scoreboard (one HTTP call per league) — no per-fixture follow-up.
     This makes it structurally the fastest source, so it claims fingerprints
     before the slower per-match requests from SofaScore / API-Football arrive.
-  - 1xBet covers featured live games only; its events merge into tracked
-    matches like ESPN's, and games no other provider tracks get their own
-    state (see the 1xBet section in _tick).
   - Only tracks leagues that have at least one subscriber (skips unsubscribed)
   - Always polls events for every tracked fixture (not just on score change)
   - Event fingerprint = SHA-1 of (team_norm + minute + category) — provider-agnostic,
@@ -22,6 +22,7 @@ Architecture:
 """
 import asyncio
 import logging
+from datetime import date
 import time
 from typing import Any
 
@@ -71,6 +72,17 @@ async def _send(bot: discord.Client, channel_ids: list[int], **kwargs) -> None:
                 log.error("[notifier] Send error to %d: %s", cid, exc)
 
 
+def _score_embed(match: dict) -> discord.Embed:
+    home_score = match.get("home_score") if match.get("home_score") is not None else "—"
+    away_score = match.get("away_score") if match.get("away_score") is not None else "—"
+    return discord.Embed(
+        title="⚽ Score update",
+        description=(f"**{match['home']}** {home_score} — {away_score} **{match['away']}**\n"
+                     f"{match.get('league', 'Football')} · {match.get('status', 'Live')}"),
+        color=0x2196F3,
+    )
+
+
 async def poll_loop(bot: discord.Client) -> None:
     await bot.wait_until_ready()
     log.info("[notifier] Poll loop started (interval=%ds)", POLL_INTERVAL)
@@ -86,6 +98,49 @@ async def _tick(bot: discord.Client) -> None:
     active_leagues = _subscribed_apf_leagues()
     if not active_leagues:
         return
+
+    # Public source path: TheSportsDB is reachable from this Azure VM and
+    # requires no user key.  It powers the schedule commands and the alerts.
+    batches = await asyncio.gather(
+        *(prov.sportsdb_day(league_id, date.today().isoformat()) for league_id in active_leagues),
+        return_exceptions=True,
+    )
+    free_matches = [match for batch in batches if isinstance(batch, list) for match in batch]
+    seen_free_ids: set[str] = set()
+    for match in free_matches:
+        if not prov.sportsdb_is_live(match) and not match.get("finished"):
+            continue
+        state_key = str(match["id"])
+        seen_free_ids.add(state_key)
+        channels = _channels_for(match["league_id"])
+        previous = _state.get(state_key)
+        if previous is None:
+            _state[state_key] = {
+                "status": match.get("status"),
+                "home": match.get("home_score"),
+                "away": match.get("away_score"),
+                "match": match,
+            }
+            if prov.sportsdb_is_live(match):
+                await _send(bot, channels, embed=alert_embed("kickoff", match))
+            continue
+
+        score_changed = (
+            previous.get("home") != match.get("home_score")
+            or previous.get("away") != match.get("away_score")
+        )
+        previous.update(status=match.get("status"), home=match.get("home_score"),
+                        away=match.get("away_score"), match=match)
+        if score_changed:
+            await _send(bot, channels, embed=_score_embed(match))
+        if match.get("finished"):
+            await _send(bot, channels, embed=alert_embed("ft", match))
+            _state.pop(state_key, None)
+
+    for state_key in list(_state):
+        if isinstance(state_key, str) and state_key.startswith("sportsdb_") and state_key not in seen_free_ids:
+            _state.pop(state_key, None)
+    return
 
     # ── Build ESPN fetch tasks for every subscribed league that has a slug ──
     espn_slugs: list[tuple[int, str]] = [
@@ -127,6 +182,13 @@ async def _tick(bot: discord.Client) -> None:
             continue
         _espn_matches, events_by_key = result
         espn_events_index.update(events_by_key)
+
+    # ── Index APF matches for cross-linking ────────────────────────────────
+    apf_index: dict[str, dict] = {
+        f"{m['home_norm']}|{m['away_norm']}": m for m in apf_matches
+    }
+
+    seen_sofa_ids: set[int] = set()
 
     # ── Build 1xBet events index (featured games in subscribed leagues) ───────
     # chronoLine is fetched per featured game; featured games are few, so
@@ -343,8 +405,8 @@ async def _tick(bot: discord.Client) -> None:
                      ev["provider"], ev["minute"], ev["player"], ev["detail"])
 
     # ── Cleanup stale state entries ───────────────────────────────────────────
-    seen_apf_ids = {m["apf_id"] for m in apf_matches if m.get("apf_id")}
     now = time.time()
+    seen_apf_ids = {m["apf_id"] for m in apf_matches if m.get("apf_id")}
     for key in list(_state):
         if isinstance(key, int) and key not in seen_sofa_ids:
             if _state[key].get("match", {}).get("finished", False):

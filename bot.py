@@ -9,7 +9,6 @@ import google.generativeai as genai
 
 import db
 import http_client as hc
-import notifier
 import barcelona_reminder
 import scoreboard
 from config import (
@@ -74,17 +73,15 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         await watch.load_watches()
-        notifier.subscriptions = await db.get_all_subscriptions()
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.
         for guild in self.guilds:
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-        asyncio.create_task(notifier.poll_loop(self))
         barcelona_reminder.ensure_running(self)
         scoreboard.ensure_running(self)
-        log.info("[bot] Setup complete. %d channels subscribed.", len(notifier.subscriptions))
+        log.info("[bot] Setup complete.")
 
     async def on_ready(self):
         barcelona_reminder.ensure_running(self)
@@ -169,7 +166,6 @@ async def cmd_help(interaction: discord.Interaction):
         description=(
             "Live scores from **1xBet 🟠** for game search and watches; "
             "**SofaScore 🟡** + **ESPN 🟢** + **TheSportsDB** for fixtures and /live.\n"
-            "League alerts are sent automatically to subscribed channels."
         ),
         color=0x00C851,
     )
@@ -187,11 +183,6 @@ async def cmd_help(interaction: discord.Interaction):
         "`/today` — today's fixtures\n"
         "`/tomorrow` — tomorrow's fixtures\n"
         "`/fixtures` — upcoming games"
-    ), inline=True)
-    embed.add_field(name="🔔 League alerts", value=(
-        "`/subscribe` — live alerts here\n"
-        "`/unsubscribe` — stop alerts\n"
-        "`/subs` — active subscriptions"
     ), inline=True)
     embed.add_field(name="🛠 Tools", value=(
         "`/ping` — bot connection health\n"
@@ -417,61 +408,14 @@ async def cmd_fixtures(interaction: discord.Interaction, league: str):
 
 
 
-# ── /subscribe ─────────────────────────────────────────────────────────────────
-@bot.tree.command(name="subscribe", description="Get live alerts in this channel")
-@app_commands.describe(league="League to subscribe to")
-@app_commands.choices(league=_league_choices())
-async def cmd_subscribe(interaction: discord.Interaction, league: str):
-    lid = int(league)
-    cid = interaction.channel_id
-    gid = interaction.guild_id or 0
-    await db.add_subscription(gid, cid, lid)
-    notifier.subscriptions.setdefault(cid, set()).add(lid)
-    embed = discord.Embed(
-        title="✅ Subscribed!",
-        description=f"This channel will now receive **{TRACKED_LEAGUES[lid]}** live alerts.",
-        color=0x00C851,
-    )
-    await interaction.response.send_message(embed=embed)
-
-
-# ── /unsubscribe ───────────────────────────────────────────────────────────────
-@bot.tree.command(name="unsubscribe", description="Stop all alerts in this channel")
-async def cmd_unsubscribe(interaction: discord.Interaction):
-    cid = interaction.channel_id
-    await db.remove_subscriptions(cid)
-    notifier.subscriptions.pop(cid, None)
-    await interaction.response.send_message(
-        embed=discord.Embed(title="🔕 Unsubscribed", description="No more alerts in this channel.", color=0xFF4444)
-    )
-
-
-# ── /subs ────────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="subs", description="Active subscriptions for this channel")
-async def cmd_subs(interaction: discord.Interaction):
-    leagues = notifier.subscriptions.get(interaction.channel_id, set())
-    if not leagues:
-        await interaction.response.send_message("No active subscriptions. Use `/subscribe`.", ephemeral=True)
-        return
-    embed = discord.Embed(title="📡 Subscriptions", color=0x2196F3)
-    embed.description = "\n".join(f"• **{TRACKED_LEAGUES.get(l, l)}**" for l in leagues)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-
-
-
-
-
-
 # ── /stats (bot performance) ──────────────────────────────────────────────────────
 @bot.tree.command(name="stats", description="Bot performance stats (provider latency)")
 async def cmd_stats(interaction: discord.Interaction):
     from http_client import stats_summary
     embed = discord.Embed(title="📈 Bot Performance Stats", color=0x9C27B0)
     embed.description = f"```\n{stats_summary()}\n```"
-    embed.add_field(name="Live fixtures tracked", value=len(notifier._state),        inline=True)
-    embed.add_field(name="Subscribed channels",   value=len(notifier.subscriptions), inline=True)
+    embed.add_field(name="Games watched", value=len(watch._watches), inline=True)
+    embed.add_field(name="Scoreboard channels", value=len(scoreboard._state), inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

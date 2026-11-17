@@ -725,7 +725,7 @@ _ONEX_GAME_PARAMS: dict[str, Any] = {
 # "England. Premier League" and "Premier League" both hit. Longer aliases
 # are checked first ("UEFA Europa Conference League" must win over
 # "UEFA Europa League"). Leagues that are not tracked keep league_id 0
-# and are ignored by the notifier's league filter.
+# Leagues that are not tracked keep league_id 0.
 _ONEX_LEAGUE_ALIASES: dict[str, int] = {
     "uefa europa conference league": 848,
     "uefa champions league":         2,
@@ -758,8 +758,8 @@ def _onex_league_id(liga_name: str) -> int:
 def _onex_status(scores: dict) -> tuple[str, int | None]:
     """(status, minute) from a 1xBet `scores` object.
 
-    Status strings reuse the bot's vocabulary so the notifier's status
-    map (HT/2H/FT/...) works unchanged. The clock is `timer.timeSec`
+    Status strings reuse the bot's vocabulary (HT/2H/FT/...).
+    The clock is `timer.timeSec`
     (seconds since kick-off); `statusLineStr` ("64 minutes") is the
     fallback. A paused clock in the 2nd half still reports 2H.
     """
@@ -912,7 +912,7 @@ async def onex_live_matches(use_cache: bool = True) -> list[Match]:
 
     One HTTP call. Only the games 1xBet features — not every live match
     (see the section header). Unmapped leagues keep league_id 0 and are
-    ignored by the notifier, but are still returned for /live.
+    but are still returned for /live.
     use_cache=False skips http_client's cache entirely: the scoreboard
     watches 1xBet every second and must reach the server on every poll.
     """
@@ -928,8 +928,7 @@ async def onex_live_matches(use_cache: bool = True) -> list[Match]:
 async def onex_events(game_id: int, home: str, away: str) -> list[Event]:
     """Match timeline (goals, penalty goals, substitutions) from chronoLine.
 
-    Returns the whole timeline every call; the notifier's fingerprint
-    set drops events it already sent.
+    Returns the whole timeline every call.
     """
     params = dict(_ONEX_GAME_PARAMS)
     params["gameId"] = game_id

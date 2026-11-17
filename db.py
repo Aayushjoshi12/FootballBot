@@ -1,6 +1,6 @@
 """
 SQLite persistence via aiosqlite.
-Stores: subscriptions, guild settings, user favorites.
+Stores: guild settings, user favorites, game watches.
 Survives bot restarts.
 """
 import logging
@@ -27,12 +27,6 @@ async def init() -> None:
     _conn = await aiosqlite.connect(_DB)
     _conn.row_factory = aiosqlite.Row
     await _conn.executescript("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            guild_id   INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL,
-            league_id  INTEGER NOT NULL,
-            PRIMARY KEY (channel_id, league_id)
-        );
         CREATE TABLE IF NOT EXISTS guild_settings (
             guild_id INTEGER PRIMARY KEY,
             timezone TEXT    DEFAULT 'UTC',
@@ -65,43 +59,6 @@ async def close() -> None:
     if _conn:
         await _conn.close()
         _conn = None
-
-
-# ── Subscriptions ──────────────────────────────────────────────────────────
-
-async def add_subscription(guild_id: int, channel_id: int, league_id: int) -> None:
-    conn = _require_conn()
-    await conn.execute(
-        "INSERT OR REPLACE INTO subscriptions VALUES (?,?,?)",
-        (guild_id, channel_id, league_id),
-    )
-    await conn.commit()
-
-
-async def remove_subscriptions(channel_id: int) -> None:
-    conn = _require_conn()
-    await conn.execute("DELETE FROM subscriptions WHERE channel_id=?", (channel_id,))
-    await conn.commit()
-
-
-async def get_all_subscriptions() -> dict[int, set[int]]:
-    """Returns {channel_id: set(league_ids)}"""
-    conn = _require_conn()
-    cur = await conn.execute("SELECT channel_id, league_id FROM subscriptions")
-    rows = await cur.fetchall()
-    result: dict[int, set[int]] = {}
-    for row in rows:
-        result.setdefault(row["channel_id"], set()).add(row["league_id"])
-    return result
-
-
-async def get_channel_leagues(channel_id: int) -> set[int]:
-    conn = _require_conn()
-    cur = await conn.execute(
-        "SELECT league_id FROM subscriptions WHERE channel_id=?", (channel_id,)
-    )
-    rows = await cur.fetchall()
-    return {row["league_id"] for row in rows}
 
 
 # ── Guild settings ─────────────────────────────────────────────────────────

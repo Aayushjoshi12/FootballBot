@@ -403,130 +403,28 @@ async def apf_stats(fixture_id: int) -> list:
     return (data or {}).get("response", [])
 
 
-async def apf_lineups(fixture_id: int) -> list:
-    data = await hc.get(f"{_APF}/fixtures/lineups", _APF_HDR,
-                        {"fixture": fixture_id}, provider="apifootball")
-    return (data or {}).get("response", [])
 
 
-async def apf_standings(league_id: int) -> list:
-    from cache import get as cget, set as cset
-    from config import TTL_STANDINGS
-    key = f"apf_stand_{league_id}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/standings", _APF_HDR,
-                        {"league": league_id, "season": CURRENT_SEASON},
-                        provider="apifootball")
-    result = (data or {}).get("response", [])
-    cset(key, result, TTL_STANDINGS)
-    return result
 
 
-async def apf_team_fixtures(team_id: int, last: int = 5) -> list[Match]:
-    data = await hc.get(f"{_APF}/fixtures", _APF_HDR,
-                        {"team": team_id, "last": last}, provider="apifootball")
-    return [_apf_norm(f) for f in (data or {}).get("response", [])]
 
 
-async def apf_search_team(name: str) -> list:
-    from cache import get as cget, set as cset
-    from config import TTL_TEAM
-    key = f"apf_team_{normalize(name)}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/teams", _APF_HDR, {"search": name}, provider="apifootball")
-    result = (data or {}).get("response", [])
-    cset(key, result, TTL_TEAM)
-    return result
 
 
-async def apf_topscorers(league_id: int) -> list:
-    from cache import get as cget, set as cset
-    from config import TTL_TOPSCORER
-    key = f"apf_top_{league_id}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/players/topscorers", _APF_HDR,
-                        {"league": league_id, "season": CURRENT_SEASON}, provider="apifootball")
-    result = (data or {}).get("response", [])
-    cset(key, result, TTL_TOPSCORER)
-    return result
 
 
-async def apf_injuries(team_id: int) -> list:
-    from cache import get as cget, set as cset
-    from config import TTL_INJURIES
-    key = f"apf_inj_{team_id}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/injuries", _APF_HDR,
-                        {"team": team_id, "season": CURRENT_SEASON}, provider="apifootball")
-    result = (data or {}).get("response", [])
-    cset(key, result, TTL_INJURIES)
-    return result
 
 
-async def apf_h2h(t1: int, t2: int) -> list[Match]:
-    from cache import get as cget, set as cset
-    from config import TTL_H2H
-    key = f"apf_h2h_{t1}_{t2}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/fixtures/headtohead", _APF_HDR,
-                        {"h2h": f"{t1}-{t2}", "last": 10}, provider="apifootball")
-    result = [_apf_norm(f) for f in (data or {}).get("response", [])]
-    cset(key, result, TTL_H2H)
-    return result
 
 
-async def apf_prediction(fixture_id: int) -> dict:
-    data = await hc.get(f"{_APF}/predictions", _APF_HDR,
-                        {"fixture": fixture_id}, provider="apifootball")
-    resp = (data or {}).get("response", [])
-    return resp[0] if resp else {}
 
 
-async def apf_transfers(team_id: int) -> list:
-    data = await hc.get(f"{_APF}/transfers", _APF_HDR,
-                        {"team": team_id}, provider="apifootball")
-    return (data or {}).get("response", [])
 
 
-async def apf_player(player_id: int) -> dict:
-    from cache import get as cget, set as cset
-    from config import TTL_PLAYER
-    key = f"apf_plyr_{player_id}"
-    hit = cget(key)
-    if hit is not None:
-        return hit
-    data = await hc.get(f"{_APF}/players", _APF_HDR,
-                        {"id": player_id, "season": CURRENT_SEASON}, provider="apifootball")
-    resp = (data or {}).get("response", [])
-    result = resp[0] if resp else {}
-    cset(key, result, TTL_PLAYER)
-    return result
 
 
-async def apf_today(league_id: int) -> list[Match]:
-    from datetime import date
-    data = await hc.get(f"{_APF}/fixtures", _APF_HDR,
-                        {"league": league_id, "season": CURRENT_SEASON,
-                         "date": date.today().isoformat()}, provider="apifootball")
-    return [_apf_norm(f) for f in (data or {}).get("response", [])]
 
 
-async def apf_tomorrow(league_id: int) -> list[Match]:
-    from datetime import date, timedelta
-    data = await hc.get(f"{_APF}/fixtures", _APF_HDR,
-                        {"league": league_id, "season": CURRENT_SEASON,
-                         "date": (date.today() + timedelta(days=1)).isoformat()}, provider="apifootball")
-    return [_apf_norm(f) for f in (data or {}).get("response", [])]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1089,8 +987,10 @@ def _onex_cricket_clock(scores: dict) -> str | None:
 
 def _onex_cricket_target(home_score: Any, away_score: Any,
                          batting_team: int | None,
-                         over_str: str | None) -> dict:
-    """Chasing target for a T20 game: team 2 needs first-innings + 1."""
+                         over_str: str | None,
+                         total_balls: int = _NPL_TOTAL_BALLS) -> dict:
+    """Chasing target for a limited-overs game: team 2 needs
+    first-innings + 1. total_balls defaults to 120 (T20/NPL)."""
     out: dict[str, Any] = {"target": None, "need": None, "balls_left": None}
     if batting_team != 2:
         return out
@@ -1114,7 +1014,7 @@ def _onex_cricket_target(home_score: Any, away_score: Any,
         try:
             ov, balls = str(over_str).split(".")
             bowled = int(ov) * 6 + int(balls)
-            out["balls_left"] = max(0, _NPL_TOTAL_BALLS - bowled)
+            out["balls_left"] = max(0, total_balls - bowled)
         except ValueError:
             pass
     return out
@@ -1176,3 +1076,520 @@ async def onex_npl_live() -> list[Match]:
         log.warning("[onexbet] NPL games1x2 failed (%s)", type(exc).__name__)
         npl = []
     return npl
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1xBet GAME SEARCH + DETAIL (for /game and /watch)
+#
+# Mirrors the site's Vercel proxy search (api/onexbet.js in
+# aayush-tv-minter): live list (games1x2, 50 max) merged with the
+# featured list (topGamesByStat), alias IDs resolved through
+# gameInfo's mainGameId, detail enriched with live gameInfo
+# (venue, weather, format, constId, line-up flags), stats from
+# scores.tabloStats, cricket target from the scorecard.
+# 1xBet ONLY — no other provider is touched here.
+# ══════════════════════════════════════════════════════════════════════════
+
+_ONEX_LINE_FEED = f"{_ONEX}/service-api/main-line-feed/v3"
+_ONEX_NPL_CHAMP_ID = 2791573
+_ONEX_NPL_MENU_PARAMS: dict[str, Any] = {
+    "country": 130, "fcountry": 130, "gr": 909, "lng": "en", "ref": 1,
+    "selectedMs": "1.66.2791573,2.66.2791573,10.66.2791573",
+}
+_ONEX_UEFA_MAX_CHAMPS = 3
+_ONEX_SEARCH_MAX = 10
+
+_TABLO_ORDER = [
+    "Yellow cards", "Red card", "Corner", "Fouls",
+    "Attacks", "Dangerous attacks", "Possession %",
+    "Shots on target", "Shots off target", "xG", "Saves",
+    "Penalty", "Substitutions", "Key Passes",
+    "Passing Accuracy %", "Crosses",
+]
+
+
+def _onex_tabular_stats(scores: dict) -> list[dict] | None:
+    """1xBet's own stats table (scores.tabloStats['0']).
+
+    Cards, corners, attacks, possession, shots, xG, saves, subs...
+    The list varies by game; fouls are not in it. None when the
+    game carries no table (cricket never does).
+    """
+    t = (scores or {}).get("tabloStats")
+    arr = None
+    if isinstance(t, dict) and isinstance(t.get("0"), list):
+        arr = t["0"]
+    elif isinstance(t, list):
+        arr = t
+    if not arr:
+        return None
+    out = []
+    for x in arr:
+        if not isinstance(x, dict) or x.get("name") is None:
+            continue
+        out.append({
+            "name": str(x["name"]),
+            "home": "" if x.get("s1") is None else str(x["s1"]),
+            "away": "" if x.get("s2") is None else str(x["s2"]),
+        })
+    if not out:
+        return None
+    order = {name: i for i, name in enumerate(_TABLO_ORDER)}
+    out.sort(key=lambda s: order.get(s["name"], 99))
+    return out
+
+
+def _onex_cricket_run_rate(scores: dict) -> str | None:
+    """Current-innings run rate from the scorecard JSON string
+    (scores.statistic.main.InningsStatistic, "13,62" -> "13.62").
+    Player names are NOT in this payload (null, only ids)."""
+    try:
+        main = (scores or {}).get("statistic") or {}
+        main = main.get("main") or {}
+        raw = main.get("InningsStatistic")
+        if not raw:
+            return None
+        import json as _json
+        data = _json.loads(raw)
+        st = data.get("St") or []
+        rr = (st[0].get("RR") if st else None) or ""
+        rr = str(rr).replace(",", ".")
+        return rr or None
+    except Exception:
+        return None
+
+
+def _onex_cricket_raw(scores: dict) -> dict:
+    ext = (scores or {}).get("extendedScore") or {}
+    inns = ext.get("innsStats") or {}
+    return {
+        "is_break": bool((scores or {}).get("isBreak")),
+        "team": inns.get("team") if isinstance(inns.get("team"), int) else None,
+        "over_str": str(inns["overStr"]) if inns.get("overStr") is not None else None,
+        "run_rate": _onex_cricket_run_rate(scores),
+    }
+
+
+def _onex_format_balls(fmt: str) -> int | None:
+    f = str(fmt or "")
+    if "T20" in f:
+        return 120
+    if "T10" in f:
+        return 60
+    if "ODI" in f or "One Day" in f:
+        return 300
+    if "Hundred" in f:
+        return 100
+    return None
+
+
+def _onex_cricket_target_fmt(fmt: str, home_score: Any, away_score: Any,
+                             batting_team: int | None,
+                             over_str: str | None) -> dict:
+    """Chasing target for a limited-overs game, format-aware.
+    Tests have no fixed target this way, so non-limited formats
+    return all-None."""
+    out: dict[str, Any] = {"target": None, "need": None, "balls_left": None}
+    total = _onex_format_balls(fmt)
+    if total is None or batting_team != 2:
+        return out
+    return _onex_cricket_target(home_score, away_score, batting_team,
+                                over_str, total)
+
+
+def _onex_apply_cricket(m: dict, scores: dict) -> None:
+    """Override football scores with the cricket wicketScore and
+    set the overs clock + cricket detail on a normalized match."""
+    ext = (scores or {}).get("extendedScore") or {}
+    wk = (ext.get("cricketScore") or {}).get("wicketScore") or {}
+    if wk.get("opponent1") is not None:
+        m["home_score"] = str(wk["opponent1"])
+    if wk.get("opponent2") is not None:
+        m["away_score"] = str(wk["opponent2"])
+    m["clock"] = _onex_cricket_clock(scores)
+    old = m.get("cricket") or {}
+    m["cricket"] = {**_onex_cricket_raw(scores),
+                    "target": old.get("target"),
+                    "need": old.get("need"),
+                    "balls_left": old.get("balls_left")}
+
+
+def _onex_detail_from_raw(g: dict) -> dict | None:
+    """Rich detail dict from one raw live-list entry (no network).
+    Score, clock/overs, stats table, cricket detail. Venue/format/
+    weather come from gameInfo via onex_game_detail()."""
+    liga_name = ((g.get("liga") or {}).get("name") or "")
+    if "nepal" in normalize(liga_name):
+        m = _onex_norm_npl_match(g)
+    else:
+        m = _onex_norm_match(g)
+    if m is None:
+        return None
+    scores = g.get("scores") or {}
+    ext = scores.get("extendedScore") or {}
+    if (ext.get("cricketScore") or {}).get("wicketScore") is not None:
+        _onex_apply_cricket(m, scores)
+        if "nepal" not in normalize(liga_name):
+            # Non-NPL cricket: target needs the format, which only
+            # gameInfo knows — filled in by onex_game_detail().
+            m["cricket"].update({"target": None, "need": None,
+                                "balls_left": None})
+    m["stats"] = _onex_tabular_stats(scores)
+    timer = scores.get("timer") or {}
+    m["timer_sec"] = timer.get("timeSec") if isinstance(
+        timer.get("timeSec"), (int, float)) else None
+    m["start_ts"] = g.get("startTs") if isinstance(
+        g.get("startTs"), (int, float)) else None
+    info = g.get("matchInfoObj") or {}
+    m["venue"] = info.get("location") or ""
+    m["format"] = info.get("matchFormat") or ""
+    return m
+
+
+async def onex_game_info(game_id: int | str) -> dict:
+    """Live-feed gameInfo: venue, weather, format, constId,
+    line-up/video flags. No scores, no odds — those come from
+    the live list. {} when 1xBet doesn't answer (204/400)."""
+    try:
+        params = dict(_ONEX_GAME_PARAMS)
+        params["gameId"] = game_id
+        data = await hc.get(f"{_ONEX_FEED}/gameInfo", _ONEX_HDR, params,
+                            cache_key="", provider="onexbet")
+    except Exception as exc:
+        log.warning("[onexbet] gameInfo %s failed (%s)", game_id,
+                    type(exc).__name__)
+        return {}
+    if not isinstance(data, dict) or not data.get("id"):
+        return {}
+    mi = data.get("matchInfoObj") or {}
+    weather = None
+    if mi.get("weatherDescription"):
+        weather = mi["weatherDescription"] + (
+            f" · {mi['temperature']}" if mi.get("temperature") else "")
+    return {
+        "const_id": (str(data["constId"]) if data.get("constId") is not None
+                    else str(data["mainConstId"]) if data.get("mainConstId") is not None
+                    else None),
+        "sport": ((data.get("sport") or {}).get("name") or None),
+        "venue": mi.get("location") or None,
+        "format": mi.get("matchFormat") or None,
+        "weather": weather,
+        "has_lineups": bool((data.get("statisticInfo") or {}).get("hasLineUps")),
+        "has_stadium": bool((data.get("statisticInfo") or {}).get("hasStadiumInfo")),
+        "video": bool((data.get("video") or {}).get("enabled")),
+        "main_game_id": (str(data["mainGameId"]) if data.get("mainGameId") is not None
+                        else None),
+        "start_ts": data.get("startTs") if isinstance(
+            data.get("startTs"), (int, float)) else None,
+    }
+
+
+async def onex_game_detail(raw: dict) -> dict | None:
+    """Full detail for one raw live entry: live scores/stats plus
+    gameInfo enrichment. A failed gameInfo never fails the detail."""
+    detail = _onex_detail_from_raw(raw)
+    if detail is None:
+        return None
+    info = await onex_game_info(detail["onex_id"])
+    if info:
+        detail["const_id"] = info.get("const_id")
+        detail["sport"] = info.get("sport") or detail.get("sport")
+        if info.get("venue"):
+            detail["venue"] = info["venue"]
+        if info.get("format"):
+            detail["format"] = info["format"]
+        detail["weather"] = info.get("weather")
+        detail["has_lineups"] = info.get("has_lineups", False)
+        detail["has_stadium"] = info.get("has_stadium", False)
+        detail["video"] = info.get("video", False)
+        if info.get("start_ts"):
+            detail["start_ts"] = info["start_ts"]
+        cricket = detail.get("cricket")
+        if cricket and detail.get("format"):
+            cricket.update(_onex_cricket_target_fmt(
+                detail["format"], detail.get("home_score"),
+                detail.get("away_score"), cricket.get("team"),
+                cricket.get("over_str")))
+    return detail
+
+
+async def onex_live_raw() -> list[dict]:
+    """Merged raw live entries (games1x2 + topGamesByStat, deduped
+    by id), cache bypassed. One tick's worth of live data for the
+    scoreboard and the game watches — a single shared fetch."""
+    try:
+        data1 = await hc.get(f"{_ONEX_FEED}/games1x2", _ONEX_HDR,
+                             dict(_ONEX_GAMES1X2_PARAMS),
+                             cache_key="", provider="onexbet")
+    except Exception as exc:
+        log.warning("[onexbet] games1x2 failed (%s)", type(exc).__name__)
+        data1 = None
+    try:
+        data2 = await hc.get(f"{_ONEX_FEED}/topGamesByStat", _ONEX_HDR,
+                             dict(_ONEX_TOP_PARAMS),
+                             cache_key="", provider="onexbet")
+    except Exception as exc:
+        log.warning("[onexbet] topGamesByStat failed (%s)", type(exc).__name__)
+        data2 = None
+    out: list[dict] = []
+    seen: set[str] = set()
+    for data in (data1, data2):
+        if not isinstance(data, list):
+            continue
+        for g in data:
+            gid = str(g.get("id") or g.get("mainGameId") or "")
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            out.append(g)
+    return out
+
+
+async def onex_fetch_tick() -> tuple[list[dict], list[dict], list[dict]]:
+    """One watch tick's data, from exactly two 1xBet calls:
+    (npl_matches, featured_matches, raw_live_entries). The
+    scoreboard and the game watches share this tick — no second
+    1-second poller."""
+    raw = await onex_live_raw()
+    npl = _onex_npl_from_games1x2(raw)
+    featured: list[dict] = []
+    for g in raw:
+        if not isinstance(g, dict):
+            continue
+        m = _onex_norm_match(g)
+        if m is not None:
+            featured.append(m)
+    return npl, featured, raw
+
+
+# --- line feed: fixtures (upcoming games, 1xBet only) ---------------
+
+async def _onex_line_menu(selected_ms: str, referer: str) -> list | None:
+    params = {"country": 130, "fcountry": 130, "gr": 909, "lng": "en",
+              "ref": 1, "selectedMs": selected_ms}
+    try:
+        data = await hc.get(f"{_ONEX_LINE_FEED}/leftMenuSports", _ONEX_HDR,
+                            params, cache_key="", provider="onexbet")
+    except Exception as exc:
+        log.warning("[onexbet] leftMenuSports failed (%s)", type(exc).__name__)
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _onex_find_liga_games(menu: list | None, champ_id: int) -> dict | None:
+    if not isinstance(menu, list):
+        return None
+    for section in menu:
+        for sport in (section or {}).get("sports") or []:
+            for liga in (sport or {}).get("ligas") or []:
+                if liga and liga.get("id") == champ_id:
+                    games = liga.get("games")
+                    return {"name": liga.get("name") or "Unknown",
+                            "games": games if isinstance(games, list) else []}
+    return None
+
+
+def _onex_norm_line_game(g: dict, league: str, default_format: str = "") -> dict | None:
+    """A line-feed game (fixture, or a live game still listed):
+    status upcoming/live/FT from its scores or kickoff time."""
+    o1, o2 = g.get("opponent1") or {}, g.get("opponent2") or {}
+    home, away = o1.get("fullName") or "", o2.get("fullName") or ""
+    gid = g.get("id") or g.get("mainGameId")
+    if not home or not away or not gid:
+        return None
+    scores = g.get("scores") or None
+    start_ts = g.get("startTs") if isinstance(g.get("startTs"), (int, float)) else None
+    import time as _time
+    now_sec = int(_time.time())
+    status, clock, minute = "upcoming", "", None
+    if scores:
+        st, minute = _onex_status(scores)
+        clock = scores.get("statusLineStr") or ""
+        status = "FT" if st == "FT" else "live"
+    elif start_ts and start_ts <= now_sec:
+        status, clock = "live", "Live"
+    ck = _onex_cricket_clock(scores) if scores else None
+    if ck:
+        clock = ck
+    info = g.get("matchInfoObj") or {}
+    hs = scores.get("scoreOpp1") if scores else None
+    aws = scores.get("scoreOpp2") if scores else None
+    detail: dict[str, Any] = {
+        "id": f"onex_{gid}", "onex_id": gid,
+        "home": home, "away": away,
+        "home_norm": normalize(home), "away_norm": normalize(away),
+        "home_score": hs, "away_score": aws,
+        "status": status, "status_code": 0, "minute": minute,
+        "league": league, "league_id": 0, "sofa_lid": 0,
+        "date": "", "stadium": info.get("location") or "",
+        "referee": "", "provider": "onexbet",
+        "finished": status == "FT",
+        "clock": clock, "start_ts": start_ts,
+        "format": info.get("matchFormat") or default_format,
+        "stats": _onex_tabular_stats(scores) if scores else None,
+        "timer_sec": None,
+        "cricket": None,
+    }
+    if scores and (scores.get("extendedScore") or {}).get("cricketScore"):
+        _onex_apply_cricket(detail, scores)
+        detail["cricket"].update({"target": None, "need": None,
+                                 "balls_left": None})
+    return detail
+
+
+async def onex_npl_fixtures() -> list[dict]:
+    """NPL fixtures from the 1xBet line feed (champ 2791573).
+    1xBet only — no official-API merge here."""
+    menu = await _onex_line_menu("1.66.2791573,2.66.2791573,10.66.2791573",
+                                 "/en/line/cricket/2791573-nepal-premier-league")
+    found = _onex_find_liga_games(menu, _ONEX_NPL_CHAMP_ID)
+    if not found:
+        return []
+    out = []
+    for g in found["games"]:
+        if (m := _onex_norm_line_game(g, "Nepal Premier League", "T20")) is not None:
+            out.append(m)
+    return out
+
+
+async def onex_uefa_fixtures() -> list[dict]:
+    """UEFA fixtures from the line feed, for the champs that have
+    live games right now (champ ids discovered from games1x2).
+    The line feed has no general search, so upcoming coverage is
+    NPL + UEFA only."""
+    try:
+        data = await hc.get(f"{_ONEX_FEED}/games1x2", _ONEX_HDR,
+                            dict(_ONEX_GAMES1X2_PARAMS),
+                            cache_key="", provider="onexbet")
+    except Exception:
+        return []
+    champ_ids: list[int] = []
+    if isinstance(data, list):
+        for g in data:
+            liga = g.get("liga") or {}
+            if "uefa" in str(liga.get("name") or "").lower():
+                cid = liga.get("id")
+                if isinstance(cid, int) and cid not in champ_ids:
+                    champ_ids.append(cid)
+    out: list[dict] = []
+    for cid in champ_ids[:_ONEX_UEFA_MAX_CHAMPS]:
+        menu = await _onex_line_menu(f"1.1.{cid},2.1.{cid},10.1.{cid}",
+                                     "/en/line/football")
+        found = _onex_find_liga_games(menu, cid)
+        if not found:
+            continue
+        for g in found["games"]:
+            if (m := _onex_norm_line_game(g, found["name"])) is not None:
+                if not any(x["onex_id"] == m["onex_id"] for x in out):
+                    out.append(m)
+    return out
+
+
+async def onex_search(query: str) -> dict:
+    """Find a game by 1xBet ID or by team/league name (1xBet only).
+    Returns {"games": [...], "detail": {...} | None}.
+    Numeric q: live list by id, alias resolved via gameInfo
+    mainGameId, else a score-less gameInfo detail. Text q: live
+    games plus NPL + UEFA fixtures, cap 10, deduped."""
+    q = str(query or "").strip()
+    if not q:
+        return {"games": [], "detail": None}
+    raw = await onex_live_raw()
+    is_id = q.isdigit() and len(q) >= 5
+    if is_id:
+        for g in raw:
+            if str(g.get("id") or g.get("mainGameId") or "") == q:
+                return {"games": [], "detail": await onex_game_detail(g)}
+        info = await onex_game_info(q)
+        if info:
+            main_id = info.get("main_game_id")
+            if main_id and main_id != q:
+                for g in raw:
+                    if str(g.get("id") or g.get("mainGameId") or "") == main_id:
+                        return {"games": [], "detail": await onex_game_detail(g)}
+            detail: dict[str, Any] = {
+                "id": f"onex_{q}", "onex_id": int(q),
+                "home": "", "away": "", "home_norm": "", "away_norm": "",
+                "home_score": None, "away_score": None,
+                "status": "?", "status_code": 0, "minute": None,
+                "league": "Unknown", "league_id": 0, "sofa_lid": 0,
+                "date": "", "stadium": "", "referee": "",
+                "provider": "onexbet", "finished": False,
+                "clock": "Score not available right now",
+                "start_ts": info.get("start_ts"),
+                "format": info.get("format") or "",
+                "venue": info.get("venue") or "",
+                "weather": info.get("weather"),
+                "const_id": info.get("const_id"),
+                "sport": info.get("sport"),
+                "has_lineups": info.get("has_lineups", False),
+                "has_stadium": info.get("has_stadium", False),
+                "video": info.get("video", False),
+                "stats": None, "timer_sec": None, "cricket": None,
+            }
+            return {"games": [], "detail": detail}
+        return {"games": [], "detail": None}
+    needle = normalize(q)
+    out: list[dict] = []
+
+    def _push(m: dict | None) -> None:
+        if m is None:
+            return
+        hay = " ".join([m.get("home") or "", m.get("away") or "",
+                        m.get("league") or ""])
+        if needle not in normalize(hay):
+            return
+        if any(x["onex_id"] == m["onex_id"] for x in out):
+            return
+        out.append(m)
+
+    for g in raw:
+        _push(_onex_detail_from_raw(g))
+    if len(out) < _ONEX_SEARCH_MAX:
+        try:
+            for m in await onex_npl_fixtures():
+                _push(m)
+        except Exception as exc:
+            log.warning("[onexbet] NPL fixtures failed (%s)", type(exc).__name__)
+    if len(out) < _ONEX_SEARCH_MAX:
+        try:
+            for m in await onex_uefa_fixtures():
+                _push(m)
+        except Exception as exc:
+            log.warning("[onexbet] UEFA fixtures failed (%s)", type(exc).__name__)
+    return {"games": out[:_ONEX_SEARCH_MAX], "detail": None}
+
+
+async def onex_grounding() -> list[dict]:
+    """Compact list of games the AI may resolve a watch to:
+    live games + NPL/UEFA fixtures. The AI must pick an id from
+    this list — never invent one."""
+    raw = await onex_live_raw()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for g in raw:
+        m = _onex_detail_from_raw(g)
+        if m is None:
+            continue
+        gid = str(m["onex_id"])
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append({"id": gid, "home": m["home"], "away": m["away"],
+                    "league": m["league"], "status": m["status"]})
+    try:
+        fixtures = await onex_npl_fixtures()
+    except Exception:
+        fixtures = []
+    try:
+        fixtures += await onex_uefa_fixtures()
+    except Exception:
+        pass
+    for m in fixtures:
+        gid = str(m["onex_id"])
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append({"id": gid, "home": m["home"], "away": m["away"],
+                    "league": m["league"], "status": m["status"]})
+    return out[:40]

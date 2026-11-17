@@ -1,0 +1,265 @@
+[
+  {
+    "id": 771747666,
+    "mainGameId": 771747666,
+    "liga": {
+      "id": 2304860,
+      "name": "Africa Cup of Nations"
+    },
+    "opponent1": {
+      "fullName": "Republic of the Gambia"
+    },
+    "opponent2": {
+      "fullName": "Ivory Coast"
+    },
+    "startTs": 1794931200,
+    "matchInfoObj": {
+      "location": "Stade de Marrakech",
+      "matchFormat": "",
+      "weatherDescription": "Clear skies",
+      "temperature": "+22\u00b0C"
+    },
+    "scores": {
+      "scoreOpp1": 0,
+      "scoreOpp2": 1,
+      "timer": {
+        "timeSec": 4020
+      },
+      "statusLineStr": "67 minutes",
+      "currentPeriod": 2,
+      "currentPeriodName": "2nd half",
+      "tabloStats": {
+        "0": [
+          {
+            "id": 1,
+            "s1": "3",
+            "s2": "1",
+            "name": "Yellow cards"
+          },
+          {
+            "id": 2,
+            "s1": "0",
+            "s2": "0",
+            "name": "Red card"
+          },
+          {
+            "id": 3,
+            "s1": "3",
+            "s2": "0",
+            "name": "Corner"
+          },
+          {
+            "id": 4,
+            "s1": "47",
+            "s2": "36",
+            "name": "Attacks"
+          },
+          {
+            "id": 5,
+            "s1": "40",
+            "s2": "60",
+            "name": "Possession %"
+          },
+          {
+            "id": 6,
+            "s1": "1",
+            "s2": "1",
+            "name": "Shots on target"
+          },
+          {
+            "id": 7,
+            "s1": "0.15",
+            "s2": "0.71",
+            "name": "xG"
+          },
+          {
+            "id": 8,
+            "s1": "0",
+            "s2": "1",
+            "name": "Saves"
+          },
+          {
+            "id": 9,
+            "s1": "2",
+            "s2": "1",
+            "name": "Substitutions"
+          },
+          {
+            "id": 10,
+            "s1": "0",
+            "s2": "0",
+            "name": "Penalty"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 771739998,
+    "mainGameId": 771739998,
+    "liga": {
+      "id": 2791573,
+      "name": "India. Jain Premier League"
+    },
+    "opponent1": {
+      "fullName": "JYC"
+    },
+    "opponent2": {
+      "fullName": "Rockstar XI Bikaner"
+    },
+    "startTs": 1794931200,
+    "scores": {
+      "scoreOpp1": 157,
+      "scoreOpp2": 0,
+      "isBreak": true,
+      "currentPeriodName": "Half-time",
+      "statusLineStr": "Event in progress",
+      "extendedScore": {
+        "innsStats": {
+          "team": 2,
+          "overStr": "0.0"
+        },
+        "cricketScore": {
+          "wicketScore": {
+            "opponent1": "157",
+            "opponent2": "0/0"
+          }
+        }
+      },
+      "statistic": {
+        "main": {
+          "Team1Scores": "157",
+          "Team2Scores": "0/0",
+          "InnsStats": "2;0;0.0",
+          "InningsStatistic": "{\"St\":[{\"B\":[{\"B\":null,\"N\":\"1001\",\"R\":\"0\",\"R4s\":\"\",\"R6s\":\"\",\"S\":{\"BN\":null,\"M\":0,\"PN\":\"0;1.1\"},\"SR\":null}],\"H\":[],\"N\":\"Rockstar XI Bikaner\",\"O\":[],\"P\":0,\"RR\":\"\",\"W\":[]}]}"
+        }
+      }
+    }
+  },
+  {
+    "id": 771750037,
+    "mainGameId": 771750037,
+    "liga": {
+      "id": 4521,
+      "name": "UAE. T10 League"
+    },
+    "opponent1": {
+      "fullName": "UAE Bulls"
+    },
+    "opponent2": {
+      "fullName": "Royal Desert Champions"
+    },
+    "startTs": 1794931200,
+    "scores": {
+      "scoreOpp1": 0,
+      "scoreOpp2": 131,
+      "currentPeriodName": "1st innings",
+      "statusLineStr": "Event in progress",
+      "extendedScore": {
+        "innsStats": {
+          "team": 1,
+          "overStr": "0.0"
+        },
+        "cricketScore": {
+          "wicketScore": {
+            "opponent1": "0/0",
+            "opponent2": "131/1"
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": 771750038,
+    "mainGameId": 771750038,
+    "liga": {
+      "id": 4521,
+      "name": "UAE. T10 League"
+    },
+    "opponent1": {
+      "fullName": "Farah Fighters"
+    },
+    "opponent2": {
+      "fullName": "Rohtak Bulls"
+    },
+    "startTs": 1794931200,
+    "scores": {
+      "scoreOpp1": 152,
+      "scoreOpp2": 84,
+      "currentPeriodName": "2nd innings",
+      "statusLineStr": "Event in progress",
+      "extendedScore": {
+        "innsStats": {
+          "team": 2,
+          "wickets": 2,
+          "over": 6,
+          "overStr": "6.1"
+        },
+        "cricketScore": {
+          "wicketScore": {
+            "opponent1": "152",
+            "opponent2": "84/2"
+          }
+        }
+      },
+      "statistic": {
+        "main": {
+          "Team1Scores": "152",
+          "Team2Scores": "84/2",
+          "InnsStats": "2;2;6.1",
+          "InningsStatistic": "{\"St\":[{\"B\":[{\"B\":null,\"N\":\"1001\",\"R\":\"84\",\"R4s\":\"\",\"R6s\":\"\",\"S\":{\"BN\":null,\"M\":0,\"PN\":\"2;7.2\"},\"SR\":null}],\"H\":[],\"N\":\"Rohtak Bulls\",\"O\":[],\"P\":0,\"RR\":\"13,62\",\"W\":[{\"B\":null,\"N\":\"1\",\"R\":\"55\"},{\"B\":null,\"N\":\"2\",\"R\":\"79\"}]}]}"
+        }
+      }
+    }
+  },
+  {
+    "id": 771747706,
+    "mainGameId": 771747706,
+    "liga": {
+      "id": 2304860,
+      "name": "Africa Cup of Nations"
+    },
+    "opponent1": {
+      "fullName": "Sierra Leone"
+    },
+    "opponent2": {
+      "fullName": "DR Congo"
+    },
+    "startTs": 1794931200,
+    "matchInfoObj": {
+      "location": "Larbi Zaouli"
+    },
+    "scores": {
+      "scoreOpp1": 0,
+      "scoreOpp2": 1,
+      "timer": {
+        "timeSec": 2700
+      },
+      "statusLineStr": "45 minutes",
+      "currentPeriod": 1,
+      "currentPeriodName": "1st half",
+      "tabloStats": {
+        "0": [
+          {
+            "id": 1,
+            "s1": "1",
+            "s2": "1",
+            "name": "Yellow cards"
+          },
+          {
+            "id": 2,
+            "s1": "0",
+            "s2": "0",
+            "name": "Red card"
+          },
+          {
+            "id": 3,
+            "s1": "1",
+            "s2": "2",
+            "name": "Corner"
+          }
+        ]
+      }
+    }
+  }
+]

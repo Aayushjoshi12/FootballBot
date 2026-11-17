@@ -146,131 +146,30 @@ def fixtures_embed(fixtures: list[dict], league_id: int, title: str) -> list[dis
 
 # ── Standings ──────────────────────────────────────────────────────────────────────
 
-def standings_embed(data: list, league_id: int) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"📊 {TRACKED_LEAGUES.get(league_id, 'Standings')}",
-        color=_color(league_id),
-    )
-    embed.set_author(name=TRACKED_LEAGUES.get(league_id, ""), icon_url=_logo(league_id))
-    if not data:
-        embed.description = "No data."
-        return embed
-    try:
-        table = data[0]["league"]["standings"][0]
-    except (KeyError, IndexError):
-        embed.description = "Standings data unavailable."
-        return embed
-    rows  = ["`# ·  Team                 · P · W · D · L · GD· Pts`"]
-    for r in table[:20]:
-        rows.append(
-            f"`{str(r['rank']).ljust(2)}·  "
-            f"{r['team']['name'][:19].ljust(20)}· "
-            f"{str(r['all']['played']).ljust(2)}· "
-            f"{str(r['all']['win']).ljust(2)}· "
-            f"{str(r['all']['draw']).ljust(2)}· "
-            f"{str(r['all']['lose']).ljust(2)}· "
-            f"{str(r['goalsDiff']).ljust(3)}· "
-            f"{r['points']}`"
-        )
-    embed.description = "\n".join(rows)
-    return embed
 
 
 # ── Top scorers ────────────────────────────────────────────────────────────────────
 
-def topscorers_embed(data: list, league_id: int) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"⚽ Top Scorers — {TRACKED_LEAGUES.get(league_id, '')}",
-        color=_color(league_id),
-    )
-    embed.set_author(name=TRACKED_LEAGUES.get(league_id, ""), icon_url=_logo(league_id))
-    lines = []
-    for i, item in enumerate(data[:15], 1):
-        p    = item.get("player", {})
-        stat = (item.get("statistics") or [{}])[0]
-        goals = stat.get("goals", {}).get("total", 0) or 0
-        team  = stat.get("team", {}).get("name", "")
-        lines.append(f"`{str(i).ljust(2)}.` **{p.get('name','')}**  ({team})  — **{goals}** goals")
-    embed.description = "\n".join(lines) or "No data."
-    return embed
 
 
 # ── Team last N ────────────────────────────────────────────────────────────────────
 
-def team_embed(team_name: str, fixtures: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"🏙 {team_name} — Last {len(fixtures)}", color=0x2B2D31)
-    lines = []
-    for f in fixtures:
-        sh, sa = f["home_score"], f["away_score"]
-        if sh is not None and sa is not None:
-            won  = (f["home"] == team_name and sh > sa) or (f["away"] == team_name and sa > sh)
-            draw = sh == sa
-            ind  = "✅" if won else ("🤝" if draw else "❌")
-        else:
-            ind = "🔜"
-        lines.append(f"`{f['date']}`  {f['home']} **{sh}–{sa}** {f['away']}  {ind}")
-    embed.description = "\n".join(lines) or "No fixtures."
-    return embed
 
 
 # ── Injuries ───────────────────────────────────────────────────────────────────────
 
-def injuries_embed(team_name: str, injuries: list) -> discord.Embed:
-    embed = discord.Embed(title=f"🏥 {team_name} — Injuries", color=0xE53935)
-    lines = []
-    for item in injuries[:15]:
-        p      = item.get("player", {})
-        inj    = item.get("injury") or {}
-        reason = inj.get("type") or inj.get("reason") or "Injury"
-        lines.append(f"• **{p.get('name', '')}** — {reason}")
-    embed.description = "\n".join(lines) or "No injury data."
-    return embed
 
 
 # ── H2H ─────────────────────────────────────────────────────────────────────────────
 
-def h2h_embed(team1: str, team2: str, fixtures: list[dict]) -> discord.Embed:
-    embed = discord.Embed(title=f"⚔️ H2H: {team1} vs {team2}", color=0x7B68EE)
-    lines = []
-    for f in fixtures:
-        sh, sa = f["home_score"], f["away_score"]
-        lines.append(f"`{f['date']}`  **{f['home']}** {sh}–{sa} **{f['away']}**")
-    embed.description = "\n".join(lines) or "No H2H data."
-    return embed
 
 
 # ── Lineups ────────────────────────────────────────────────────────────────────────
 
-def lineups_embed(match: dict, lineups: list) -> discord.Embed:
-    lid   = match.get("league_id", 0)
-    embed = discord.Embed(
-        title=f"📋 Lineups — {match['home']} vs {match['away']}",
-        color=_color(lid),
-    )
-    for team_block in lineups[:2]:
-        team_name = (team_block.get("team") or {}).get("name", "?")
-        formation = team_block.get("formation", "?")
-        starters  = team_block.get("startXI", [])
-        names     = [p["player"].get("name", "?") for p in starters if p.get("player")]
-        embed.add_field(
-            name=f"{team_name} ({formation})",
-            value="\n".join(f"{i+1}. {n}" for i, n in enumerate(names)) or "N/A",
-            inline=True,
-        )
-    return embed
 
 
 # ── Prediction ─────────────────────────────────────────────────────────────────────
 
-def prediction_embed(match: dict, pred: dict) -> discord.Embed:
-    lid    = match.get("league_id", 0)
-    embed  = discord.Embed(title=f"🔮 Prediction — {match['home']} vs {match['away']}", color=_color(lid))
-    p      = pred.get("predictions", {})
-    winner = pred.get("winner", {})
-    embed.add_field(name="Winner", value=winner.get("name", "?"), inline=True)
-    embed.add_field(name="Win%",   value=p.get("percent", {}).get("home", "?"), inline=True)
-    embed.add_field(name="Advice", value=p.get("advice", "N/A"), inline=False)
-    return embed
 
 
 # ══════════════════════════════════════════════════════════════════════════

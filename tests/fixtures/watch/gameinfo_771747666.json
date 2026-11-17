@@ -1,0 +1,11 @@
+{
+  "id": 771747666, "mainGameId": 771747666, "constId": 387423700, "mainConstId": 387423700,
+  "sport": {"name": "Football"},
+  "liga": {"id": 2304860, "name": "Africa Cup of Nations"},
+  "opponent1": {"fullName": "Republic of the Gambia"},
+  "opponent2": {"fullName": "Ivory Coast"},
+  "startTs": 1794931200,
+  "matchInfoObj": {"location": "Stade de Marrakech", "matchFormat": "", "weatherDescription": "Clear skies", "temperature": "+22°C", "locationCountry": "Morocco"},
+  "statisticInfo": {"gameId": "uuid-1", "hasLineUps": true, "hasStadiumInfo": true},
+  "video": {"enabled": true, "id": 123}
+}

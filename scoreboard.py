@@ -37,7 +37,8 @@ from zoneinfo import ZoneInfo
 
 import discord
 
-from providers import onex_live_matches, onex_npl_live
+from providers import onex_fetch_tick
+import watch
 
 log = logging.getLogger("scoreboard")
 NEPAL = ZoneInfo("Asia/Kathmandu")
@@ -282,21 +283,18 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
     return True
 
 
-async def _fetch_all() -> tuple[list[dict], list[dict]]:
-    """One watch tick: NPL + featured games, cache bypassed.
-    A failed fetch is [] — the loop never dies on provider errors."""
+async def _fetch_all() -> tuple[list[dict], list[dict], list[dict]]:
+    """One watch tick: NPL + featured games + the raw live entries,
+    cache bypassed, from exactly two 1xBet calls (onex_fetch_tick).
+    A failed fetch is [] — the loop never dies on provider errors.
+    The raw entries are shared with the game watches (watch.on_tick)
+    so there is no second 1-second poller."""
     try:
-        npl = await onex_npl_live()
+        npl, games, raw = await onex_fetch_tick()
     except Exception as exc:
-        log.warning("[scoreboard] NPL fetch failed (%s)", type(exc).__name__)
-        npl = []
-    try:
-        games = await onex_live_matches(use_cache=False)
-    except Exception as exc:
-        log.warning("[scoreboard] featured fetch failed (%s)",
-                    type(exc).__name__)
-        games = []
-    return npl, games
+        log.warning("[scoreboard] tick fetch failed (%s)", type(exc).__name__)
+        npl, games, raw = [], [], []
+    return npl, games, raw
 
 
 async def scoreboard_loop(bot: discord.Client) -> None:
@@ -307,8 +305,10 @@ async def scoreboard_loop(bot: discord.Client) -> None:
     empty_ticks = 0
     while not bot.is_closed():
         try:
-            npl, games = await _fetch_all()
+            npl, games, raw = await _fetch_all()
             text = render_scoreboard(npl, games)
+            # Game watches share this tick's raw data.
+            await watch.on_tick(bot, raw)
             if not npl and not games:
                 empty_ticks += 1
                 if (empty_ticks >= EMPTY_TICKS_BEFORE_BACKOFF

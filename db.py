@@ -44,6 +44,17 @@ async def init() -> None:
             team_name TEXT  NOT NULL,
             PRIMARY KEY (user_id, team_id)
         );
+        CREATE TABLE IF NOT EXISTS watches (
+            channel_id INTEGER NOT NULL,
+            game_id    TEXT    NOT NULL,
+            home       TEXT    NOT NULL,
+            away       TEXT    NOT NULL,
+            league     TEXT    NOT NULL DEFAULT '',
+            detail     TEXT    NOT NULL DEFAULT 'simple',
+            fmt        TEXT    NOT NULL DEFAULT '',
+            snapshot   TEXT    NOT NULL DEFAULT '{}',
+            PRIMARY KEY (channel_id, game_id)
+        );
     """)
     await _conn.commit()
     log.info("[db] Initialized.")
@@ -145,3 +156,64 @@ async def get_favorites(user_id: int) -> list[dict]:
     )
     rows = await cur.fetchall()
     return [{"team_id": r["team_id"], "team_name": r["team_name"]} for r in rows]
+
+
+# ── Game watches ─────────────────────────────────────────────────────────
+# One row per (channel, 1xBet game). snapshot is the last alerted
+# score/stats state as JSON, so a restart resumes diffing instead
+# of re-alerting everything.
+
+async def add_watch(channel_id: int, game_id: str, home: str, away: str,
+                    league: str, detail: str, fmt: str,
+                    snapshot: dict) -> None:
+    import json as _json
+    conn = _require_conn()
+    await conn.execute(
+        "INSERT OR REPLACE INTO watches "
+        "(channel_id, game_id, home, away, league, detail, fmt, snapshot) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (channel_id, str(game_id), home, away, league, detail, fmt,
+         _json.dumps(snapshot)),
+    )
+    await conn.commit()
+
+
+async def remove_watch(channel_id: int, game_id: str) -> None:
+    conn = _require_conn()
+    await conn.execute(
+        "DELETE FROM watches WHERE channel_id=? AND game_id=?",
+        (channel_id, str(game_id)),
+    )
+    await conn.commit()
+
+
+async def list_watches(channel_id: int) -> list[dict]:
+    conn = _require_conn()
+    cur = await conn.execute(
+        "SELECT channel_id, game_id, home, away, league, detail, fmt, snapshot "
+        "FROM watches WHERE channel_id=?",
+        (channel_id,),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_watches() -> list[dict]:
+    conn = _require_conn()
+    cur = await conn.execute(
+        "SELECT channel_id, game_id, home, away, league, detail, fmt, snapshot "
+        "FROM watches",
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_watch_snapshot(channel_id: int, game_id: str,
+                                snapshot: dict) -> None:
+    import json as _json
+    conn = _require_conn()
+    await conn.execute(
+        "UPDATE watches SET snapshot=? WHERE channel_id=? AND game_id=?",
+        (_json.dumps(snapshot), channel_id, str(game_id)),
+    )
+    await conn.commit()

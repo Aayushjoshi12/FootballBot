@@ -1,0 +1,11 @@
+{
+  "id": 771747795, "mainGameId": 771747706, "constId": 387423750, "mainConstId": 387423748,
+  "sport": {"name": "Football"},
+  "liga": {"id": 2304860, "name": "Africa Cup of Nations"},
+  "opponent1": {"fullName": "Sierra Leone"},
+  "opponent2": {"fullName": "DR Congo"},
+  "startTs": 1794931200,
+  "matchInfoObj": {"location": "Larbi Zaouli", "matchFormat": ""},
+  "statisticInfo": {"gameId": "uuid-2", "hasLineUps": true, "hasStadiumInfo": false},
+  "video": {"enabled": false}
+}

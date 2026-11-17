@@ -17,17 +17,15 @@ from config import (
     GEMINI_API_KEY, GEMINI_MODEL, SPORTSDB_LEAGUE_MAP, ESPN_LEAGUE_MAP,
 )
 from embeds import (
-    match_embed, fixtures_embed, standings_embed, team_embed,
-    injuries_embed, h2h_embed, lineups_embed, topscorers_embed,
-    prediction_embed, MatchView,
+    match_embed, fixtures_embed, MatchView,
 )
 from providers import (
-    apf_upcoming, apf_stats, apf_events, apf_standings, apf_team_fixtures,
-    apf_search_team, apf_topscorers, apf_injuries, apf_h2h, apf_prediction,
-    apf_lineups, apf_transfers, apf_player, free_fixtures_for_day,
+    apf_upcoming, free_fixtures_for_day,
     sportsdb_day, sportsdb_live_matches,
     sofa_live_matches, apf_live, espn_live, onex_live_matches,
+    onex_search,
 )
+import watch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,14 +73,8 @@ class FootballBot(discord.Client):
 
     async def setup_hook(self):
         await db.init()
+        await watch.load_watches()
         notifier.subscriptions = await db.get_all_subscriptions()
-        # These need API-Football endpoints that are unavailable with the
-        # rejected key.  Do not publish commands that cannot return data.
-        for name in (
-            "match", "team", "form", "standings", "topscorers", "injuries",
-            "h2h", "lineups", "prediction", "player", "transfers", "favorites",
-        ):
-            self.tree.remove_command(name)
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.
@@ -164,11 +156,6 @@ async def _defer(interaction: discord.Interaction) -> bool:
         return False
 
 
-async def _find_team(name: str) -> tuple[dict | None, list]:
-    results = await apf_search_team(name)
-    if not results:
-        return None, []
-    return results[0]["team"], results
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -180,25 +167,28 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Five providers: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢** + **1xBet 🟠** + **TheSportsDB**\n"
-            "Live alerts are sent automatically to subscribed channels."
+            "Live scores from **1xBet 🟠** for game search and watches; "
+            "**SofaScore 🟡** + **ESPN 🟢** + **TheSportsDB** for fixtures and /live.\n"
+            "League alerts are sent automatically to subscribed channels."
         ),
         color=0x00C851,
     )
     embed.add_field(name="📡 Live", value=(
         "`/live` — all live matches\n"
         "`/scoreboard` — live scoreboard in this channel\n"
-        "`/today` — today's fixtures\n"
-        "`/tomorrow` — tomorrow's fixtures\n"
-        "`/live` shows an empty result when no supported match is live"
+        "`/game` — detail for one game (ID or team name)"
+    ), inline=True)
+    embed.add_field(name="🔍 Follow a game", value=(
+        "`/watch` — follow one game, alerts on goals/wickets/cards\n"
+        "`/unwatch` — stop following a game\n"
+        "`/watching` — games this channel follows"
     ), inline=True)
     embed.add_field(name="📅 Fixtures", value=(
         "`/today` — today's fixtures\n"
         "`/tomorrow` — tomorrow's fixtures\n"
-        "`/fixtures` — upcoming games\n"
-        "`/live` — live scores"
+        "`/fixtures` — upcoming games"
     ), inline=True)
-    embed.add_field(name="🔔 Alerts", value=(
+    embed.add_field(name="🔔 League alerts", value=(
         "`/subscribe` — live alerts here\n"
         "`/unsubscribe` — stop alerts\n"
         "`/subs` — active subscriptions"
@@ -405,185 +395,26 @@ async def cmd_fixtures(interaction: discord.Interaction, league: str):
     await _send_paginated(interaction, embeds)
 
 
-# ── /match ────────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="match", description="Events and stats for a fixture")
-@app_commands.describe(fixture_id="APF Fixture ID (from /live or /fixtures)")
-async def cmd_match(interaction: discord.Interaction, fixture_id: int):
-    await interaction.response.defer()
-    events, stats = await asyncio.gather(apf_events(fixture_id), apf_stats(fixture_id))
-    if not events and not stats:
-        await interaction.followup.send("No data found. Check the fixture ID.")
-        return
-
-    ev_lines = [f"{e['icon']} **{e['minute']}'** {e['player']} ({e['team']})" for e in events]
-    msg = "📋 **Events**\n\n" + ("\n".join(ev_lines) if ev_lines else "No events yet.")
-    if stats:
-        msg += "\n\n📊 **Stats**\n"
-        for block in stats:
-            msg += f"\n**{block['team']['name']}**\n"
-            for s in block["statistics"][:10]:
-                msg += f"  {s['type']}: {s['value'] or '—'}\n"
-    for chunk in [msg[i:i+2000] for i in range(0, len(msg), 2000)]:
-        await interaction.followup.send(chunk)
 
 
-# ── /team ────────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="team", description="Last 5 results for a team")
-@app_commands.describe(name="Team name")
-async def cmd_team(interaction: discord.Interaction, name: str):
-    await interaction.response.defer()
-    team, _ = await _find_team(name)
-    if not team:
-        await interaction.followup.send("Team not found.")
-        return
-    fixtures = await apf_team_fixtures(team["id"], last=5)
-    await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /form ────────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="form", description="Recent form for a team (last 10)")
-@app_commands.describe(name="Team name")
-async def cmd_form(interaction: discord.Interaction, name: str):
-    await interaction.response.defer()
-    team, _ = await _find_team(name)
-    if not team:
-        await interaction.followup.send("Team not found.")
-        return
-    fixtures = await apf_team_fixtures(team["id"], last=10)
-    await interaction.followup.send(embed=team_embed(team["name"], fixtures))
 
 
-# ── /standings ───────────────────────────────────────────────────────────────────
-@bot.tree.command(name="standings", description="League table")
-@app_commands.describe(league="Pick a league")
-@app_commands.choices(league=_league_choices())
-async def cmd_standings(interaction: discord.Interaction, league: str):
-    await interaction.response.defer()
-    lid  = int(league)
-    data = await apf_standings(lid)
-    await interaction.followup.send(embed=standings_embed(data, lid))
 
 
-# ── /topscorers ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="topscorers", description="Top scorers for a league")
-@app_commands.describe(league="Pick a league")
-@app_commands.choices(league=_league_choices())
-async def cmd_topscorers(interaction: discord.Interaction, league: str):
-    await interaction.response.defer()
-    lid  = int(league)
-    data = await apf_topscorers(lid)
-    await interaction.followup.send(embed=topscorers_embed(data, lid))
 
 
-# ── /injuries ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="injuries", description="Team injury list")
-@app_commands.describe(name="Team name")
-async def cmd_injuries(interaction: discord.Interaction, name: str):
-    await interaction.response.defer()
-    team, _ = await _find_team(name)
-    if not team:
-        await interaction.followup.send("Team not found.")
-        return
-    injuries = await apf_injuries(team["id"])
-    await interaction.followup.send(embed=injuries_embed(team["name"], injuries))
 
 
-# ── /h2h ────────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="h2h", description="Head to head between two teams")
-@app_commands.describe(team1="First team", team2="Second team")
-async def cmd_h2h(interaction: discord.Interaction, team1: str, team2: str):
-    await interaction.response.defer()
-    t1, _ = await _find_team(team1)
-    t2, _ = await _find_team(team2)
-    if not t1 or not t2:
-        await interaction.followup.send("One or both teams not found.")
-        return
-    fixtures = await apf_h2h(t1["id"], t2["id"])
-    await interaction.followup.send(embed=h2h_embed(t1["name"], t2["name"], fixtures))
 
 
-# ── /lineups ───────────────────────────────────────────────────────────────────
-@bot.tree.command(name="lineups", description="Match lineups (APF fixture ID)")
-@app_commands.describe(fixture_id="APF Fixture ID")
-async def cmd_lineups(interaction: discord.Interaction, fixture_id: int):
-    await interaction.response.defer()
-    lineups = await apf_lineups(fixture_id)
-    if not lineups:
-        await interaction.followup.send("No lineup data yet.")
-        return
-    m = {
-        "home": (lineups[0].get("team") or {}).get("name", "?"),
-        "away": (lineups[1].get("team") or {}).get("name", "?") if len(lineups) > 1 else "?",
-        "league_id": 0,
-    }
-    await interaction.followup.send(embed=lineups_embed(m, lineups))
 
 
-# ── /prediction ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="prediction", description="AI match prediction (APF fixture ID)")
-@app_commands.describe(fixture_id="APF Fixture ID")
-async def cmd_prediction(interaction: discord.Interaction, fixture_id: int):
-    await interaction.response.defer()
-    pred = await apf_prediction(fixture_id)
-    if not pred:
-        await interaction.followup.send("No prediction available.")
-        return
-    m = {"home": pred.get("teams", {}).get("home", {}).get("name", "?"),
-         "away": pred.get("teams", {}).get("away", {}).get("name", "?"),
-         "league_id": 0}
-    await interaction.followup.send(embed=prediction_embed(m, pred))
 
 
-# ── /player ───────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="player", description="Player stats by ID")
-@app_commands.describe(player_id="Player ID from API-Football")
-async def cmd_player(interaction: discord.Interaction, player_id: int):
-    await interaction.response.defer()
-    data = await apf_player(player_id)
-    if not data:
-        await interaction.followup.send("Player not found.")
-        return
-    p    = data.get("player", {})
-    stat = (data.get("statistics") or [{}])[0]
-    embed = discord.Embed(title=f"👤 {p.get('name','?')}", color=0x2196F3)
-    embed.set_thumbnail(url=p.get("photo", ""))
-    embed.add_field(name="Age",         value=p.get("age", "?"),                             inline=True)
-    embed.add_field(name="Nationality", value=p.get("nationality", "?"),                      inline=True)
-    embed.add_field(name="Team",        value=stat.get("team", {}).get("name", "?"),         inline=True)
-    embed.add_field(name="Goals",       value=stat.get("goals", {}).get("total", 0),         inline=True)
-    embed.add_field(name="Assists",     value=stat.get("goals", {}).get("assists", 0),       inline=True)
-    embed.add_field(name="Apps",        value=stat.get("games", {}).get("appearences", 0),   inline=True)
-    embed.add_field(name="Rating",      value=stat.get("games", {}).get("rating") or "N/A",  inline=True)
-    embed.add_field(name="Yellow",      value=stat.get("cards", {}).get("yellow", 0),        inline=True)
-    embed.add_field(name="Red",         value=stat.get("cards", {}).get("red", 0),           inline=True)
-    await interaction.followup.send(embed=embed)
 
 
-# ── /transfers ─────────────────────────────────────────────────────────────────
-@bot.tree.command(name="transfers", description="Recent transfers for a team")
-@app_commands.describe(name="Team name")
-async def cmd_transfers(interaction: discord.Interaction, name: str):
-    await interaction.response.defer()
-    team, _ = await _find_team(name)
-    if not team:
-        await interaction.followup.send("Team not found.")
-        return
-    transfers = await apf_transfers(team["id"])
-    if not transfers:
-        await interaction.followup.send("No transfer data found.")
-        return
-    embed = discord.Embed(title=f"💰 {team['name']} — Transfers", color=0xFFD700)
-    lines = []
-    for item in transfers[:15]:
-        p = item.get("player", {})
-        for t in (item.get("transfers") or [])[:1]:
-            date = t.get("date", "")[:10]
-            tin  = t.get("teams", {}).get("in",  {}).get("name", "?")
-            tout = t.get("teams", {}).get("out", {}).get("name", "?")
-            fee  = t.get("type", "?")
-            lines.append(f"`{date}` **{p.get('name','')}** {tout} → {tin}  `{fee}`")
-    embed.description = "\n".join(lines) or "No transfers."
-    await interaction.followup.send(embed=embed)
 
 
 # ── /subscribe ─────────────────────────────────────────────────────────────────
@@ -627,39 +458,10 @@ async def cmd_subs(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── /favorites ─────────────────────────────────────────────────────────────────
-favorites_group = app_commands.Group(name="favorites", description="Manage your favorite teams")
-bot.tree.add_command(favorites_group)
 
 
-@favorites_group.command(name="list", description="List your favorite teams")
-async def fav_list(interaction: discord.Interaction):
-    favs = await db.get_favorites(interaction.user.id)
-    if not favs:
-        await interaction.response.send_message("No favorites yet. Use `/favorites add`.", ephemeral=True)
-        return
-    embed = discord.Embed(title="⭐ Your Favorite Teams", color=0xFFD700)
-    embed.description = "\n".join(f"• **{f['team_name']}** (ID: {f['team_id']})" for f in favs)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@favorites_group.command(name="add", description="Add a team to favorites")
-@app_commands.describe(name="Team name to search and add")
-async def fav_add(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
-    team, _ = await _find_team(name)
-    if not team:
-        await interaction.followup.send("Team not found.", ephemeral=True)
-        return
-    await db.add_favorite(interaction.user.id, team["id"], team["name"])
-    await interaction.followup.send(f"⭐ **{team['name']}** added to favorites!", ephemeral=True)
-
-
-@favorites_group.command(name="remove", description="Remove a team from favorites")
-@app_commands.describe(team_id="Team ID to remove")
-async def fav_remove(interaction: discord.Interaction, team_id: int):
-    await db.remove_favorite(interaction.user.id, team_id)
-    await interaction.response.send_message(f"Removed team `{team_id}` from favorites.", ephemeral=True)
 
 
 # ── /stats (bot performance) ──────────────────────────────────────────────────────
@@ -671,6 +473,186 @@ async def cmd_stats(interaction: discord.Interaction):
     embed.add_field(name="Live fixtures tracked", value=len(notifier._state),        inline=True)
     embed.add_field(name="Subscribed channels",   value=len(notifier.subscriptions), inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── /game ─────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="game", description="Detail for one game — by ID or team name (1xBet)")
+@app_commands.describe(query="Team, league or 1xBet game ID", detail="Simple or advanced detail")
+@app_commands.choices(detail=[
+    app_commands.Choice(name="Simple", value="simple"),
+    app_commands.Choice(name="Advanced", value="advanced"),
+])
+async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "simple"):
+    if not await _defer(interaction):
+        return
+    try:
+        result = await onex_search(query)
+    except Exception:
+        log.exception("[game] search failed")
+        await interaction.followup.send(
+            "Could not reach 1xBet right now. Please try again shortly.")
+        return
+    if result.get("detail"):
+        await interaction.followup.send(
+            watch.render_detail(result["detail"], detail))
+        return
+    games = result.get("games") or []
+    if len(games) == 1:
+        try:
+            again = await onex_search(str(games[0]["onex_id"]))
+        except Exception:
+            again = {"detail": None}
+        if again.get("detail"):
+            await interaction.followup.send(
+                watch.render_detail(again["detail"], detail))
+            return
+        await interaction.followup.send(watch.render_detail(games[0], detail))
+        return
+    if games:
+        await interaction.followup.send(watch.render_match_list(games))
+        return
+    await interaction.followup.send(
+        f"No game found for '{query}' on 1xBet. Try a team name, a league, "
+        "or the game ID from the match page.")
+
+
+# ── /watch ────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="watch", description="Follow one game — alerts here when it changes (1xBet)")
+@app_commands.describe(
+    what="Game ID, team/league name, or plain words like 'tell me when Lumbini scores'",
+    detail="Simple or advanced alerts",
+    channel="Channel for the alerts (default: this channel)",
+)
+@app_commands.choices(detail=[
+    app_commands.Choice(name="Simple", value="simple"),
+    app_commands.Choice(name="Advanced", value="advanced"),
+])
+async def cmd_watch(interaction: discord.Interaction, what: str,
+                    detail: str = "simple",
+                    channel: discord.TextChannel | None = None):
+    await interaction.response.defer(ephemeral=True)
+    target = channel or interaction.channel
+    if target is None:
+        await interaction.followup.send(
+            "Could not tell which channel to watch in.", ephemeral=True)
+        return
+    try:
+        resolved = await watch.resolve_watch(what, ai_model)
+    except Exception:
+        log.exception("[watch] resolve failed")
+        await interaction.followup.send(
+            "Could not work out which game that is. Try a game ID or a team name.",
+            ephemeral=True)
+        return
+    if resolved.get("action") == "detail" and resolved.get("game_id"):
+        try:
+            result = await onex_search(str(resolved["game_id"]))
+        except Exception:
+            result = {"detail": None}
+        if result.get("detail"):
+            await interaction.followup.send(
+                watch.render_detail(result["detail"], resolved.get("detail") or detail),
+                ephemeral=True)
+            return
+    if resolved.get("action") == "unfollow" and resolved.get("game_id"):
+        removed = await watch.remove_watch(target.id, str(resolved["game_id"]))
+        if removed:
+            await interaction.followup.send(
+                f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
+                ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "That game is not watched in this channel.", ephemeral=True)
+        return
+    if not resolved.get("game_id"):
+        candidates = resolved.get("candidates") or []
+        if candidates:
+            await interaction.followup.send(
+                "I could not tell exactly which game — did you mean one of these?\n"
+                + watch.render_match_list(candidates), ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"Could not find a game for '{what}' on 1xBet. Try a game ID "
+                "or a team name.", ephemeral=True)
+        return
+    entry = resolved.get("entry") or {"id": resolved["game_id"], "home": "",
+                                      "away": "", "league": "", "status": ""}
+    try:
+        started = await watch.start_watch(target.id, entry,
+                                          resolved.get("detail") or detail)
+    except Exception:
+        log.exception("[watch] start failed")
+        await interaction.followup.send(
+            "Could not start watching that game. Please try again shortly.",
+            ephemeral=True)
+        return
+    if not started:
+        await interaction.followup.send(
+            "Could not find that game on 1xBet right now.", ephemeral=True)
+        return
+    level = started["detail"]
+    await interaction.followup.send(
+        f"👀 Watching **{started['home']} vs {started['away']}** "
+        f"({started['league']}) in <#{target.id}> — {level} alerts, "
+        "only when the game changes.", ephemeral=True)
+
+
+# ── /unwatch ──────────────────────────────────────────────────────────────────
+@bot.tree.command(name="unwatch", description="Stop following a game in this channel")
+@app_commands.describe(game="Game ID or team name")
+async def cmd_unwatch(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(ephemeral=True)
+    rows = await watch.list_channel_watches(interaction.channel_id)
+    q = (game or "").strip()
+    picked = None
+    if q.isdigit():
+        picked = next((r for r in rows if r["game_id"] == q), None)
+    if picked is None:
+        needle = watch._norm(q)
+        matches = [r for r in rows
+                   if needle and needle in watch._norm(f"{r['home']} {r['away']}")]
+        if len(matches) == 1:
+            picked = matches[0]
+        elif len(matches) > 1:
+            await interaction.followup.send(
+                "More than one watched game matches — be specific:\n"
+                + "\n".join(f"• **{r['home']} vs {r['away']}** (ID `{r['game_id']}`)"
+                             for r in matches), ephemeral=True)
+            return
+    if picked is None:
+        await interaction.followup.send(
+            f"No watched game matches '{game}' in this channel. "
+            "Use `/watching` to see what is watched here.", ephemeral=True)
+        return
+    removed = await watch.remove_watch(interaction.channel_id, picked["game_id"])
+    if removed:
+        await interaction.followup.send(
+            f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
+            ephemeral=True)
+    else:
+        await interaction.followup.send("That watch is already gone.", ephemeral=True)
+
+
+# ── /watching ─────────────────────────────────────────────────────────────────
+@bot.tree.command(name="watching", description="Games this channel is following")
+async def cmd_watching(interaction: discord.Interaction):
+    rows = await watch.list_channel_watches(interaction.channel_id)
+    if not rows:
+        await interaction.response.send_message(
+            "No games watched in this channel. Use `/watch <game>` to follow one.",
+            ephemeral=True)
+        return
+    lines = ["👀 **Watched games in this channel**\n"]
+    for r in rows:
+        snap = r.get("snapshot") or {}
+        score = ""
+        hs, aws = snap.get("home_score"), snap.get("away_score")
+        if hs not in (None, "") or aws not in (None, ""):
+            score = f" — {hs or '?'}–{aws or '?'}"
+        clock = f" · {snap.get('clock')}" if snap.get("clock") else ""
+        lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} "
+                     f"({r['detail']}, ID `{r['game_id']}`)")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════

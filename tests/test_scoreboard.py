@@ -349,7 +349,7 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
         orig_fetch = sb._fetch_all
         orig_watch = sb.WATCH_SECONDS
         sb.WATCH_SECONDS = 0.05
-        sb._fetch_all = lambda: asyncio.sleep(0, result=([], [_foot_match()]))
+        sb._fetch_all = lambda: asyncio.sleep(0, result=([], [_foot_match()], []))
         try:
             task = asyncio.create_task(sb.scoreboard_loop(self.bot))
             await asyncio.sleep(0.35)

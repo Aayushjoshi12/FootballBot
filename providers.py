@@ -1,8 +1,10 @@
 """
-Three free data providers, polled concurrently:
+Four free data providers, polled concurrently:
   - SofaScore    (unofficial — mobile app User-Agent bypasses Cloudflare)
   - API-Football (official, needs APIFOOTBALL_API_KEY)
   - ESPN         (unofficial, no key, bundles events with the scoreboard)
+  - 1xBet        (unofficial — lite-mirror service-api, no key; featured
+                  live games only, see the 1XBET section below)
 All public functions return normalized dicts with consistent field names.
 Event fingerprinting uses a cross-provider semantic key (team + minute +
 category) so the same real event from multiple providers collapses to one
@@ -15,7 +17,7 @@ from typing import Any
 
 import http_client as hc
 import sofa_session
-from config import APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV, TRACKED_LEAGUES
+from config import APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV, TRACKED_LEAGUES, ONEXBET_BASE_URL
 from normalizer import normalize
 
 log = logging.getLogger("providers")
@@ -589,3 +591,268 @@ async def espn_live(espn_slug: str, apf_lid: int) -> tuple[list[Match], dict[str
         matches.append(m)
         events_by_key[f"{m['home_norm']}|{m['away_norm']}"] = evs
     return matches, events_by_key
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 1XBET ("onexbet")
+#
+# Unofficial: the lite mirror's service-api (main-live-feed/v3), captured
+# from the user's Chrome via the Muse Network Inspector, 17 Nov 2026.
+# No key, no login — the API answers a plain GET with browser-like headers.
+# The dynamic `x-hd` header the browser sends is NOT needed (verified:
+# the endpoint answers 200 without it) and is never reproduced here.
+#
+# Coverage limit (read this before expecting every match): topGamesByStat
+# returns only the games 1xBet features (~5 at capture time while 41
+# football games were live). There is no verified "all live games" list
+# call yet — per-champ games can be expanded via leftMenuSports with a
+# `selectedMs` value for that champ, but the 1xBet champ IDs for the
+# tracked leagues are not known yet. Until that is captured, 1xBet covers
+# featured games (usually the big matches) and merges its events into
+# matches the other providers already track.
+# ══════════════════════════════════════════════════════════════════════════
+
+_ONEX = ONEXBET_BASE_URL.rstrip("/")
+_ONEX_FEED = f"{_ONEX}/service-api/main-live-feed/v3"
+
+# Headers reproduced from the captured browser request. Referer is the
+# live-football index page (the browser's Referer was the match page it
+# happened to be on — the index page answers the same way).
+_ONEX_HDR: dict[str, str] = {
+    "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "en-US,en;q=0.9",
+    "Referer":          f"{_ONEX}/en/live/football",
+    "x-app-n":          "__BETTING_APP__",
+    "x-svc-source":     "__BETTING_APP__",
+    "x-requested-with": "XMLHttpRequest",
+}
+
+# Query params as captured. country/fcountry 130 = Nepal (the user's
+# locale); gr is 1xBet's internal group id — keep as captured.
+_ONEX_TOP_PARAMS: dict[str, Any] = {
+    "cfView": 3, "country": 130, "fcountry": 130, "gr": 909, "lng": "en", "ref": 1,
+}
+_ONEX_GAME_PARAMS: dict[str, Any] = {
+    "fcountry": 130, "gr": 909, "lng": "en", "ref": 1,
+}
+
+# 1xBet liga name (normalised) -> APF league id. Matched by substring so
+# "England. Premier League" and "Premier League" both hit. Longer aliases
+# are checked first ("UEFA Europa Conference League" must win over
+# "UEFA Europa League"). Leagues that are not tracked keep league_id 0
+# and are ignored by the notifier's league filter.
+_ONEX_LEAGUE_ALIASES: dict[str, int] = {
+    "uefa europa conference league": 848,
+    "uefa champions league":         2,
+    "uefa europa league":            3,
+    "fifa club world cup":           15,
+    "premier league":                39,
+    "la liga":                       140,
+    "serie a":                       135,
+    "bundesliga":                    78,
+    "ligue 1":                       61,
+}
+# Substrings that disqualify a liga even if an alias matches — second
+# divisions, women's and youth competitions share the base name.
+_ONEX_LEAGUE_EXCLUDE = (
+    "women", "u21", "u19", "u17", "youth", "reserve", "amateur",
+    "la liga 2", "segunda", "2. bundesliga", "bundesliga 2", "serie b", "ligue 2",
+)
+
+
+def _onex_league_id(liga_name: str) -> int:
+    n = normalize(liga_name or "")
+    if any(x in n for x in _ONEX_LEAGUE_EXCLUDE):
+        return 0
+    for alias in sorted(_ONEX_LEAGUE_ALIASES, key=len, reverse=True):
+        if alias in n:
+            return _ONEX_LEAGUE_ALIASES[alias]
+    return 0
+
+
+def _onex_status(scores: dict) -> tuple[str, int | None]:
+    """(status, minute) from a 1xBet `scores` object.
+
+    Status strings reuse the bot's vocabulary so the notifier's status
+    map (HT/2H/FT/...) works unchanged. The clock is `timer.timeSec`
+    (seconds since kick-off); `statusLineStr` ("64 minutes") is the
+    fallback. A paused clock in the 2nd half still reports 2H.
+    """
+    if not scores:
+        return "?", None
+    timer = scores.get("timer") or {}
+    time_sec = timer.get("timeSec")
+    minute = None
+    if isinstance(time_sec, (int, float)):
+        minute = min(int(time_sec // 60), 120)
+    if minute is None:
+        line = (scores.get("statusLineStr") or "").split()
+        try:
+            minute = int(line[0]) if line else None
+        except ValueError:
+            minute = None
+    line = (scores.get("statusLineStr") or "").lower()
+    if "half time" in line or "half-time" in line or "break" in line:
+        return "HT", minute
+    if "full time" in line or "finished" in line:
+        return "FT", minute
+    period = scores.get("currentPeriod")
+    pname = (scores.get("currentPeriodName") or "").lower()
+    if period == 1 or "1st half" in pname:
+        return "1H", minute
+    if period == 2 or "2nd half" in pname:
+        return "2H", minute
+    if period in (3, 4) or "extra" in pname:
+        return "ET", minute
+    if "penalt" in pname:
+        return "PEN", minute
+    return scores.get("currentPeriodName") or "?", minute
+
+
+def _onex_parse_minute(raw: str) -> tuple[int | None, int | None]:
+    """"53'" -> (53, None); "45+2'" -> (45, 2)."""
+    s = (raw or "").strip().rstrip("'")
+    try:
+        if "+" in s:
+            base, extra = s.split("+", 1)
+            return int(base), int(extra)
+        return int(s), None
+    except ValueError:
+        return None, None
+
+
+def _onex_norm_match(g: dict, liga: dict | None = None) -> Match | None:
+    o1 = g.get("opponent1") or {}
+    o2 = g.get("opponent2") or {}
+    home = o1.get("fullName") or ""
+    away = o2.get("fullName") or ""
+    gid = g.get("id") or g.get("mainGameId")
+    if not home or not away or not gid:
+        return None
+
+    scores = g.get("scores") or {}
+    status, minute = _onex_status(scores)
+    liga = liga or g.get("liga") or {}
+    liga_name = liga.get("name") or "Unknown"
+
+    def _logo(opp: dict) -> str:
+        opps = opp.get("opps") or []
+        img = (opps[0].get("image") if opps else "") or ""
+        return f"{_ONEX}{img}" if img.startswith("/") else img
+
+    date = ""
+    ts = g.get("startTs")
+    if ts:
+        try:
+            from datetime import datetime, timezone
+            date = datetime.fromtimestamp(int(ts), timezone.utc).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            date = ""
+
+    return {
+        "id":          f"onex_{gid}",
+        "sofa_id":     None,
+        "apf_id":      None,
+        "onex_id":     gid,
+        "home":        home,
+        "away":        away,
+        "home_norm":   normalize(home),
+        "away_norm":   normalize(away),
+        "home_score":  scores.get("scoreOpp1"),
+        "away_score":  scores.get("scoreOpp2"),
+        "home_logo":   _logo(o1),
+        "away_logo":   _logo(o2),
+        "status":      status,
+        "status_code": 0,
+        "minute":      minute,
+        "league":      liga_name,
+        "league_id":   _onex_league_id(liga_name),
+        "sofa_lid":    0,
+        "date":        date,
+        "stadium":     ((g.get("matchInfoObj") or {}).get("location") or ""),
+        "referee":     "",
+        "provider":    "onexbet",
+        "finished":    status == "FT",
+    }
+
+
+# chronoLine eventType -> (category, icon, detail). Verified from the
+# Iceland-Luxembourg fixture: 200 Goal, 218 Penalty (= penalty scored —
+# it accounts for the 37' goal in the 2-0 half-time scoreline), 204
+# Substitution. Corners (201) and other stat events are not bot alerts.
+# Card event types were NOT in the captured fixtures — add them here once
+# one is observed (yellow/red card in a chronoLine response).
+_ONEX_EVENT_MAP: dict[int, tuple[str, str, str]] = {
+    200: ("goal", "⚽",   "Goal"),
+    218: ("goal", "⚽🎯", "Penalty Goal"),
+    204: ("sub",  "🔄",   "Substitution"),
+}
+
+
+def _onex_norm_event(ev: dict, home: str, away: str) -> Event | None:
+    etype = ev.get("eventType")
+    if etype not in _ONEX_EVENT_MAP:
+        return None
+    category, icon, label = _ONEX_EVENT_MAP[etype]
+    minute_int, added = _onex_parse_minute(ev.get("minute", ""))
+    team_name = home if ev.get("side") == 1 else away
+    player = (ev.get("player") or {}).get("fullName") or "Unknown"
+    second = (ev.get("secondPlayer") or {}).get("fullName") or ""
+
+    if category == "sub":
+        # chronoLine lists the INCOMING player as `player` and the
+        # OUTGOING one as `secondPlayer` — verified: Andri Gudjohnsen
+        # scored at 37' yet is `secondPlayer` of the 46' sub, so he was
+        # already on the pitch and must be the outgoing one.
+        player = f"{player} on, {second} off" if second else player
+        second = ""
+
+    fp = canonical_fingerprint(normalize(team_name), minute_int or 0, category)
+    return {
+        "type":        category,
+        "detail":      label,
+        "minute":      f"{minute_int}+{added}" if added else str(minute_int),
+        "minute_int":  minute_int,
+        "player":      player,
+        "assist":      second,
+        "team":        team_name,
+        "icon":        icon,
+        "provider":    "onexbet",
+        "fingerprint": fp,
+    }
+
+
+async def onex_live_matches() -> list[Match]:
+    """Featured live football games from 1xBet (topGamesByStat).
+
+    One HTTP call. Only the games 1xBet features — not every live match
+    (see the section header). Unmapped leagues keep league_id 0 and are
+    ignored by the notifier, but are still returned for /live.
+    """
+    data = await hc.get(f"{_ONEX_FEED}/topGamesByStat", _ONEX_HDR,
+                        dict(_ONEX_TOP_PARAMS),
+                        cache_key="onex_live", provider="onexbet")
+    if not isinstance(data, list):
+        return []
+    return [m for g in data if (m := _onex_norm_match(g)) is not None]
+
+
+async def onex_events(game_id: int, home: str, away: str) -> list[Event]:
+    """Match timeline (goals, penalty goals, substitutions) from chronoLine.
+
+    Returns the whole timeline every call; the notifier's fingerprint
+    set drops events it already sent.
+    """
+    params = dict(_ONEX_GAME_PARAMS)
+    params["gameId"] = game_id
+    data = await hc.get(f"{_ONEX_FEED}/chronoLine", _ONEX_HDR, params,
+                        cache_key=f"onex_chrono_{game_id}", provider="onexbet")
+    if not isinstance(data, dict):
+        return []
+    events: list[Event] = []
+    for period in data.get("chronoLine", []):
+        for ev in period.get("events", []):
+            if (n := _onex_norm_event(ev, home, away)) is not None:
+                events.append(n)
+    return events

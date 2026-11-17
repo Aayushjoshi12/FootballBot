@@ -7,6 +7,11 @@ load_dotenv()
 DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
 APIFOOTBALL_API_KEY = os.getenv("APIFOOTBALL_API_KEY", "")
 
+# 1xBet live scores (unofficial service-api on the lite mirror, no key).
+# The lite mirror domain rotates (1xlite-6229051.com, 1xlite-6428119.com,
+# ...), so override this when the default mirror stops answering.
+ONEXBET_BASE_URL = os.getenv("ONEXBET_BASE_URL", "https://1xlite-6229051.com")
+
 
 def _current_season() -> int:
     """

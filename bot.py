@@ -20,7 +20,7 @@ from embeds import (
     prediction_embed, MatchView,
 )
 from providers import (
-    sofa_live_matches, apf_live, espn_live, apf_upcoming, apf_stats, apf_events,
+    sofa_live_matches, apf_live, espn_live, onex_live_matches, apf_upcoming, apf_stats, apf_events,
     apf_standings, apf_team_fixtures, apf_search_team, apf_topscorers,
     apf_injuries, apf_h2h, apf_prediction, apf_lineups, apf_transfers,
     apf_player, apf_today, apf_tomorrow,
@@ -106,7 +106,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Tri-provider: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢**\n"
+            "Four providers: **SofaScore 🟡** + **API-Football 🔵** + **ESPN 🟢** + **1xBet 🟠**\n"
             "Live alerts sent to subscribed channels automatically.\n​"
         ),
         color=0x00C851,
@@ -153,20 +153,26 @@ async def cmd_live(interaction: discord.Interaction):
     await interaction.response.defer()
     espn_tasks = [espn_live(slug, lid) for lid, slug in ESPN_LEAGUE_MAP.items()]
     results = await asyncio.gather(
-        sofa_live_matches(), apf_live(), *espn_tasks, return_exceptions=True
+        sofa_live_matches(), apf_live(), onex_live_matches(), *espn_tasks, return_exceptions=True
     )
-    sofa, apf, *espn_results = results
+    sofa, apf, onex, *espn_results = results
     sofa = sofa if isinstance(sofa, list) else []
     apf  = apf  if isinstance(apf,  list) else []
+    onex = onex if isinstance(onex, list) else []
     espn: list = []
     for r in espn_results:
         if isinstance(r, tuple):
             espn.extend(r[0])
 
-    # Deduplicate: APF/SofaScore take priority over ESPN
+    # Deduplicate: APF/SofaScore take priority over ESPN and 1xBet
     seen_pairs = {(m["home"], m["away"]) for m in sofa} | {(m["home"], m["away"]) for m in apf}
     combined   = sofa + apf
     for m in espn:
+        pair = (m["home"], m["away"])
+        if pair not in seen_pairs:
+            combined.append(m)
+            seen_pairs.add(pair)
+    for m in onex:
         pair = (m["home"], m["away"])
         if pair not in seen_pairs:
             combined.append(m)

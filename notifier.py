@@ -1,12 +1,15 @@
 """
-Production-grade tri-provider live poller.
+Production-grade quad-provider live poller.
 
 Architecture:
-  - Polls ESPN + SofaScore + API-Football concurrently every POLL_INTERVAL seconds
+  - Polls ESPN + SofaScore + API-Football + 1xBet concurrently every POLL_INTERVAL seconds
   - ESPN is fetched first within the merged event list because it bundles events
     with the scoreboard (one HTTP call per league) — no per-fixture follow-up.
     This makes it structurally the fastest source, so it claims fingerprints
     before the slower per-match requests from SofaScore / API-Football arrive.
+  - 1xBet covers featured live games only; its events merge into tracked
+    matches like ESPN's, and games no other provider tracks get their own
+    state (see the 1xBet section in _tick).
   - Only tracks leagues that have at least one subscriber (skips unsubscribed)
   - Always polls events for every tracked fixture (not just on score change)
   - Event fingerprint = SHA-1 of (team_norm + minute + category) — provider-agnostic,
@@ -19,6 +22,7 @@ Architecture:
 """
 import asyncio
 import logging
+import time
 from typing import Any
 
 import discord
@@ -90,17 +94,19 @@ async def _tick(bot: discord.Client) -> None:
         if apf_lid in active_leagues
     ]
 
-    # ── Fetch all three providers concurrently ────────────────────────────────
+    # ── Fetch all four providers concurrently ────────────────────────────────
     results = await asyncio.gather(
         prov.sofa_live_matches(),
         prov.apf_live(),
+        prov.onex_live_matches(),
         *[prov.espn_live(slug, apf_lid) for apf_lid, slug in espn_slugs],
         return_exceptions=True,
     )
 
     sofa_matches = results[0]
     apf_matches  = results[1]
-    espn_results = results[2:]
+    onex_matches = results[2]
+    espn_results = results[3:]
 
     if isinstance(sofa_matches, Exception):
         log.warning("[notifier] SofaScore fetch failed: %s", sofa_matches)
@@ -108,6 +114,9 @@ async def _tick(bot: discord.Client) -> None:
     if isinstance(apf_matches, Exception):
         log.warning("[notifier] API-Football fetch failed: %s", apf_matches)
         apf_matches = []
+    if isinstance(onex_matches, Exception):
+        log.warning("[notifier] 1xBet fetch failed: %s", onex_matches)
+        onex_matches = []
 
     # ── Build ESPN events index keyed by "home_norm|away_norm" ─────────────────
     espn_events_index: dict[str, list[dict]] = {}
@@ -118,6 +127,26 @@ async def _tick(bot: discord.Client) -> None:
             continue
         _espn_matches, events_by_key = result
         espn_events_index.update(events_by_key)
+
+    # ── Build 1xBet events index (featured games in subscribed leagues) ───────
+    # chronoLine is fetched per featured game; featured games are few, so
+    # this is a handful of calls per tick at most. A failed fetch just
+    # means no 1xBet events for that game this tick.
+    onex_events_index: dict[str, list[dict]] = {}
+    onex_tasks: list = []
+    onex_keys: list[str] = []
+    for om in onex_matches:
+        if om["league_id"] in active_leagues:
+            key = f"{om['home_norm']}|{om['away_norm']}"
+            onex_keys.append(key)
+            onex_tasks.append(prov.onex_events(om["onex_id"], om["home"], om["away"]))
+    if onex_tasks:
+        onex_results = await asyncio.gather(*onex_tasks, return_exceptions=True)
+        for key, res in zip(onex_keys, onex_results):
+            if isinstance(res, Exception):
+                log.warning("[notifier] 1xBet events failed for %s: %s", key, res)
+                continue
+            onex_events_index[key] = res or []
 
     # ── Index APF matches for cross-linking ────────────────────────────────
     apf_index: dict[str, dict] = {
@@ -186,9 +215,10 @@ async def _tick(bot: discord.Client) -> None:
             apf_events = []
 
         espn_evs = espn_events_index.get(f"{sm['home_norm']}|{sm['away_norm']}", [])
+        onex_evs = onex_events_index.get(f"{sm['home_norm']}|{sm['away_norm']}", [])
 
         fps = prev["fingerprints"]
-        for ev in list(espn_evs) + list(sofa_events) + list(apf_events):
+        for ev in list(espn_evs) + list(onex_evs) + list(sofa_events) + list(apf_events):
             fp = ev.get("fingerprint", "")
             if not fp or fp in fps:
                 continue
@@ -235,6 +265,7 @@ async def _tick(bot: discord.Client) -> None:
                 continue
 
         espn_evs = espn_events_index.get(f"{am['home_norm']}|{am['away_norm']}", [])
+        onex_evs = onex_events_index.get(f"{am['home_norm']}|{am['away_norm']}", [])
         try:
             apf_events_list = await prov.apf_events(apf_fid)
         except Exception as exc:
@@ -242,20 +273,90 @@ async def _tick(bot: discord.Client) -> None:
             apf_events_list = []
 
         fps = prev["fingerprints"]
-        for ev in list(espn_evs) + list(apf_events_list):
+        for ev in list(espn_evs) + list(onex_evs) + list(apf_events_list):
             fp = ev.get("fingerprint", "")
             if not fp or fp in fps:
                 continue
             fps.add(fp)
             await _send(bot, channels, embed=event_embed(ev, am))
 
+    # ── Process 1xBet-only matches (featured games no other provider tracks) ──
+    # Same shape as the APF-only section: kickoff alert on first sighting,
+    # status alerts on transitions, events from the 1xBet + ESPN indexes.
+    # A game that stops being featured keeps its state (it may still be
+    # live) — stale onex entries are pruned by age in the cleanup below.
+    for om in onex_matches:
+        apf_lid = om["league_id"]
+        if apf_lid not in active_leagues:
+            continue
+        if any(
+            names_match(s["match"]["home"], om["home"]) and
+            names_match(s["match"]["away"], om["away"])
+            for s in _state.values() if "match" in s
+        ):
+            continue
+
+        onex_id   = om["onex_id"]
+        state_key = f"onex_{onex_id}"
+        channels  = _channels_for(apf_lid)
+
+        if state_key not in _state:
+            _state[state_key] = {"fingerprints": set(), "status": om["status"],
+                                 "apf_id": None, "match": om,
+                                 "last_seen": time.time()}
+            await _send(bot, channels, embed=alert_embed("kickoff", om))
+            log.info("[notifier] Kickoff [1xBet]: %s vs %s", om["home"], om["away"])
+            continue
+
+        prev = _state[state_key]
+        prev["match"] = om
+        prev["last_seen"] = time.time()
+
+        old_status, new_status = prev["status"], om["status"]
+        if new_status != old_status:
+            prev["status"] = new_status
+            status_map = {
+                "HT": "ht",  "2H": "2h",    "ET":   "et",
+                "PEN": "pens", "FT": "ft",  "AET":  "ft",
+                "PST": "pst", "CANC": "canc", "ABD": "abd",
+                "INT": "int",
+            }
+            alert_type = status_map.get(new_status)
+            if alert_type:
+                await _send(bot, channels, embed=alert_embed(alert_type, om))
+                log.info("[notifier] Status %s→%s [1xBet]: %s vs %s",
+                         old_status, new_status, om["home"], om["away"])
+            if om.get("finished"):
+                _state.pop(state_key, None)
+                continue
+
+        espn_evs = espn_events_index.get(f"{om['home_norm']}|{om['away_norm']}", [])
+        onex_evs = onex_events_index.get(f"{om['home_norm']}|{om['away_norm']}", [])
+        fps = prev["fingerprints"]
+        for ev in list(espn_evs) + list(onex_evs):
+            fp = ev.get("fingerprint", "")
+            if not fp or fp in fps:
+                continue
+            fps.add(fp)
+            await _send(bot, channels, embed=event_embed(ev, om))
+            log.info("[notifier] Event [%s] %s' %s (%s)",
+                     ev["provider"], ev["minute"], ev["player"], ev["detail"])
+
     # ── Cleanup stale state entries ───────────────────────────────────────────
     seen_apf_ids = {m["apf_id"] for m in apf_matches if m.get("apf_id")}
+    now = time.time()
     for key in list(_state):
         if isinstance(key, int) and key not in seen_sofa_ids:
             if _state[key].get("match", {}).get("finished", False):
                 _state.pop(key, None)
         elif isinstance(key, str):
+            if key.startswith("onex_"):
+                # A featured game can vanish from 1xBet's list while still
+                # live (it just stopped being featured), so never drop it
+                # for absence alone — prune only after 3h unseen.
+                if now - _state[key].get("last_seen", 0) > 3 * 3600:
+                    _state.pop(key, None)
+                continue
             apf_fid = _state[key].get("apf_id")
             if apf_fid and apf_fid not in seen_apf_ids:
                 if _state[key].get("match", {}).get("finished", False):

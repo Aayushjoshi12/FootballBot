@@ -17,8 +17,9 @@ _SOURCE_BADGES = {
     "sofascore":   "🟡 SofaScore",
     "apifootball": "🔵 API-Football",
     "espn":        "🟢 ESPN",
+    "onexbet":     "🟠 1xBet",
 }
-_SOURCE_DOTS = {"sofascore": "🟡", "apifootball": "🔵", "espn": "🟢"}
+_SOURCE_DOTS = {"sofascore": "🟡", "apifootball": "🔵", "espn": "🟢", "onexbet": "🟠"}
 
 
 def _source_badge(provider: str) -> str:

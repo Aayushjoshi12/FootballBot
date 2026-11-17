@@ -525,12 +525,27 @@ class FakeFollowup:
         self.sent.append(content)
 
 
+class FakeGuild:
+    """Stand-in for a Discord guild with two text channels."""
+
+    def __init__(self, channels):
+        self.text_channels = [SimpleNamespace(id=cid, name=name)
+                              for cid, name in channels]
+
+    def get_channel(self, cid):
+        for ch in self.text_channels:
+            if ch.id == cid:
+                return ch
+        return None
+
+
 class FakeInteraction:
     """Stand-in for a /watch slash-command interaction."""
 
-    def __init__(self, channel_id=777):
+    def __init__(self, channel_id=777, guild=None):
         self.channel_id = channel_id
         self.channel = SimpleNamespace(id=channel_id)
+        self.guild = guild
         self.response = FakeResponse()
         self.followup = FakeFollowup()
 
@@ -649,6 +664,214 @@ class TestLatencyFixes(unittest.IsolatedAsyncioTestCase):
             elapsed = time.monotonic() - start
         self.assertIsNone(out)
         self.assertLess(elapsed, 0.4)
+
+
+class TestAiWatchAll(unittest.IsolatedAsyncioTestCase):
+    """One plain sentence does everything: the AI/words pick the
+    game, the channel and the detail level — while the user's own
+    dropdown picks always win."""
+
+    CHANNELS = [{"id": 111, "name": "general"},
+                {"id": 222, "name": "test"}]
+    GUILD = FakeGuild([(111, "general"), (222, "test")])
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {}
+        prov.hc.get = StubHttp(self).get
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+
+    async def test_ai_channel_id_from_list_is_used(self):
+        model = FakeModel('{"game_id": "771800001", "action": "follow", '
+                          '"detail": "simple", "channel_id": "111", '
+                          '"note": "Lumbini to general"}')
+        out = await wmod.resolve_watch(
+            "the lions game tomorrow, send alerts to the chat",
+            model, self.CHANNELS)
+        self.assertEqual(out["game_id"], "771800001")
+        self.assertEqual(out["channel_id"], "111")
+        self.assertEqual(out["channel"]["name"], "general")
+        self.assertIn("111 | #general", model.prompts[0])
+
+    async def test_ai_invented_channel_id_rejected(self):
+        model = FakeModel('{"game_id": "771800001", "action": "follow", '
+                          '"detail": "simple", "channel_id": "999999999", '
+                          '"note": "x"}')
+        out = await wmod.resolve_watch("the lions game tomorrow",
+                                       model, self.CHANNELS)
+        self.assertEqual(out["game_id"], "771800001")
+        self.assertIsNone(out["channel_id"])
+        self.assertIsNone(out["channel"])
+
+    async def test_hash_channel_matches_deterministically(self):
+        channel, named = wmod._channel_from_words(
+            "follow Lumbini, send to #general", self.CHANNELS)
+        self.assertEqual(channel["name"], "general")
+        self.assertIsNone(named)
+        # And through resolve_watch with the game coming from the AI.
+        model = FakeModel('{"game_id": "771800001", "action": "follow", '
+                          '"detail": "simple", "channel_id": null, '
+                          '"note": "Lumbini"}')
+        out = await wmod.resolve_watch(
+            "the lions game tomorrow in #general", model, self.CHANNELS)
+        self.assertEqual(out["channel_id"], "111")
+        self.assertEqual(out["channel"]["name"], "general")
+
+    def test_detail_keywords_from_words(self):
+        self.assertEqual(
+            wmod._detail_from_words("send advanced alerts"), "advanced")
+        self.assertEqual(
+            wmod._detail_from_words("full stats please"), "advanced")
+        self.assertEqual(
+            wmod._detail_from_words("just goals please"), "simple")
+        self.assertIsNone(wmod._detail_from_words("follow lumbini"))
+
+    async def test_words_advanced_beats_ai_simple(self):
+        model = FakeModel('{"game_id": "771800001", "action": "follow", '
+                          '"detail": "simple", "channel_id": null, '
+                          '"note": "Lumbini"}')
+        out = await wmod.resolve_watch(
+            "the lions game tomorrow, full stats please",
+            model, self.CHANNELS)
+        self.assertEqual(out["detail"], "advanced")
+
+    async def test_dropdown_advanced_beats_ai_simple(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771800001", "action": "follow",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771800001", "home": "Lumbini Lions",
+                              "away": "Sudurpaschim Royals",
+                              "league": "Nepal Premier League",
+                              "status": "upcoming"},
+                    "source": "ai", "channel": None, "channel_id": None,
+                    "channel_named": None, "note": ""}
+        started = {"game_id": "771800001", "home": "Lumbini Lions",
+                   "away": "Sudurpaschim Royals",
+                   "league": "Nepal Premier League",
+                   "status": "upcoming", "detail": "advanced"}
+        interaction = FakeInteraction(guild=self.GUILD)
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)),              patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(interaction, "Lumbini",
+                                            detail="advanced")
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[2], "advanced")
+
+    async def test_dropdown_unset_words_advanced_is_used(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771800001", "action": "follow",
+                    "detail": "advanced", "candidates": [],
+                    "entry": {"id": "771800001", "home": "Lumbini Lions",
+                              "away": "Sudurpaschim Royals",
+                              "league": "Nepal Premier League",
+                              "status": "upcoming"},
+                    "source": "ai", "channel": None, "channel_id": None,
+                    "channel_named": None, "note": ""}
+        started = {"game_id": "771800001", "home": "Lumbini Lions",
+                   "away": "Sudurpaschim Royals",
+                   "league": "Nepal Premier League",
+                   "status": "upcoming", "detail": "advanced"}
+        interaction = FakeInteraction(guild=self.GUILD)
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)),              patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(
+                interaction, "follow Lumbini, advanced stats")
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[2], "advanced")
+        self.assertTrue(any("advanced alerts" in s
+                            for s in interaction.followup.sent))
+
+    async def test_ai_channel_used_at_command_level(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771800001", "action": "follow",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771800001", "home": "Lumbini Lions",
+                              "away": "Sudurpaschim Royals",
+                              "league": "Nepal Premier League",
+                              "status": "upcoming"},
+                    "source": "ai",
+                    "channel": {"id": 111, "name": "general"},
+                    "channel_id": "111", "channel_named": None, "note": ""}
+        started = {"game_id": "771800001", "home": "Lumbini Lions",
+                   "away": "Sudurpaschim Royals",
+                   "league": "Nepal Premier League",
+                   "status": "upcoming", "detail": "simple"}
+        interaction = FakeInteraction(channel_id=777, guild=self.GUILD)
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)),              patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(
+                interaction, "the lions game tomorrow")
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[0], 111)
+        self.assertTrue(any("<#111>" in s
+                            for s in interaction.followup.sent))
+
+    async def test_nonexistent_channel_falls_back_and_says_so(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771800001", "action": "follow",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771800001", "home": "Lumbini Lions",
+                              "away": "Sudurpaschim Royals",
+                              "league": "Nepal Premier League",
+                              "status": "upcoming"},
+                    "source": "ai", "channel": None, "channel_id": None,
+                    "channel_named": "random", "note": ""}
+        started = {"game_id": "771800001", "home": "Lumbini Lions",
+                   "away": "Sudurpaschim Royals",
+                   "league": "Nepal Premier League",
+                   "status": "upcoming", "detail": "simple"}
+        interaction = FakeInteraction(channel_id=777, guild=self.GUILD)
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)),              patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(
+                interaction, "follow Lumbini, send to #random")
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[0], 777)
+        self.assertTrue(any("could not find a channel called 'random'" in s
+                            for s in interaction.followup.sent))
+
+    async def test_dropdown_channel_beats_ai_channel(self):
+        import bot as botmod
+
+        resolved = {"game_id": "771800001", "action": "follow",
+                    "detail": "simple", "candidates": [],
+                    "entry": {"id": "771800001", "home": "Lumbini Lions",
+                              "away": "Sudurpaschim Royals",
+                              "league": "Nepal Premier League",
+                              "status": "upcoming"},
+                    "source": "ai",
+                    "channel": {"id": 111, "name": "general"},
+                    "channel_id": "111", "channel_named": None, "note": ""}
+        started = {"game_id": "771800001", "home": "Lumbini Lions",
+                   "away": "Sudurpaschim Royals",
+                   "league": "Nepal Premier League",
+                   "status": "upcoming", "detail": "simple"}
+        interaction = FakeInteraction(channel_id=777, guild=self.GUILD)
+        picked = SimpleNamespace(id=222, name="test")
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)),              patch.object(wmod, "start_watch",
+                          new=AsyncMock(return_value=started)) as mock_start:
+            await botmod.cmd_watch.callback(
+                interaction, "the lions game tomorrow", channel=picked)
+        args, _kwargs = mock_start.call_args
+        self.assertEqual(args[0], 222)
+        self.assertTrue(any("<#222>" in s
+                            for s in interaction.followup.sent))
 
 
 if __name__ == "__main__":

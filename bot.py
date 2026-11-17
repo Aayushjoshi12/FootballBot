@@ -463,8 +463,8 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
 # ── /watch ────────────────────────────────────────────────────────────────────
 @bot.tree.command(name="watch", description="Follow one game — alerts here when it changes (1xBet)")
 @app_commands.describe(
-    what="Game ID, team/league name, or plain words like 'tell me when Lumbini scores'",
-    detail="Simple or advanced alerts",
+    what="Game ID, team/league name, or plain words like 'follow Lumbini, send advanced alerts to #general'",
+    detail="Simple or advanced alerts (leave blank and the words decide)",
     channel="Channel for the alerts (default: this channel)",
 )
 @app_commands.choices(detail=[
@@ -472,32 +472,55 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
     app_commands.Choice(name="Advanced", value="advanced"),
 ])
 async def cmd_watch(interaction: discord.Interaction, what: str,
-                    detail: str = "simple",
+                    detail: str | None = None,
                     channel: discord.TextChannel | None = None):
     await interaction.response.defer(ephemeral=True)
-    target = channel or interaction.channel
-    if target is None:
-        await interaction.followup.send(
-            "Could not tell which channel to watch in.", ephemeral=True)
-        return
+    guild = getattr(interaction, "guild", None)
+    guild_channels: list[dict] = []
+    if guild is not None:
+        for ch in getattr(guild, "text_channels", []) or []:
+            guild_channels.append({"id": ch.id,
+                                   "name": getattr(ch, "name", "")})
     try:
-        resolved = await watch.resolve_watch(what, ai_model)
+        resolved = await watch.resolve_watch(what, ai_model, guild_channels)
     except Exception:
         log.exception("[watch] resolve failed")
         await interaction.followup.send(
             "Could not work out which game that is. Try a game ID or a team name.",
             ephemeral=True)
         return
+    # Precedence: the dropdowns always win. Only when the user
+    # leaves them blank do the words/AI decide; otherwise the
+    # current channel and simple alerts.
+    level = (detail if detail is not None
+             else resolved.get("detail") or watch.DETAIL_SIMPLE)
+    target = channel
+    if target is None and resolved.get("channel_id") is not None:
+        try:
+            cid = int(resolved["channel_id"])
+        except (TypeError, ValueError):
+            cid = None
+        if cid is not None and guild is not None:
+            target = guild.get_channel(cid)
+    if target is None:
+        target = interaction.channel
+    if target is None:
+        await interaction.followup.send(
+            "Could not tell which channel to watch in.", ephemeral=True)
+        return
+    channel_note = ""
+    if resolved.get("channel_named") and not resolved.get("channel_id"):
+        channel_note = (f" (I could not find a channel called "
+                        f"'{resolved['channel_named']}' — using this "
+                        f"channel instead)")
     if resolved.get("action") == "detail" and resolved.get("game_id"):
         try:
             result = await onex_search(str(resolved["game_id"]))
         except Exception:
             result = {"detail": None}
         if result.get("detail"):
-            # The detail dropdown always wins: the resolver's
-            # "detail" is advisory only (None for id/name matches).
             await interaction.followup.send(
-                watch.render_detail(result["detail"], detail),
+                watch.render_detail(result["detail"], level),
                 ephemeral=True)
             return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
@@ -524,9 +547,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
     entry = resolved.get("entry") or {"id": resolved["game_id"], "home": "",
                                       "away": "", "league": "", "status": ""}
     try:
-        # The detail dropdown always wins — the resolver's "detail"
-        # (None for id/name matches) must never override it.
-        started = await watch.start_watch(target.id, entry, detail)
+        started = await watch.start_watch(target.id, entry, level)
     except Exception:
         log.exception("[watch] start failed")
         await interaction.followup.send(
@@ -537,11 +558,10 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         await interaction.followup.send(
             "Could not find that game on 1xBet right now.", ephemeral=True)
         return
-    level = started["detail"]
     await interaction.followup.send(
         f"👀 Watching **{started['home']} vs {started['away']}** "
         f"({started['league']}) in <#{target.id}> — {level} alerts, "
-        "only when the game changes.", ephemeral=True)
+        f"only when the game changes.{channel_note}", ephemeral=True)
 
 
 # ── /unwatch ──────────────────────────────────────────────────────────────────

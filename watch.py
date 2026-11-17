@@ -287,31 +287,43 @@ def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str
 
 _AI_PROMPT = """You resolve a Discord user's request about a live sports game to ONE game from the list below.
 Reply with STRICT JSON only — no other text, no markdown, no explanation:
-{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail", "detail": "simple|advanced", "note": "<one short line>"}
+{"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "note": "<one short line>"}
 Rules:
 - game_id MUST be one of the ids in the games list. If no game matches the request, use null.
 - action is "follow" when the user wants alerts/updates for a game, "unfollow" when they want to stop following it, "detail" when they only want to see it now.
 - detail is "advanced" only when the user asks for full/advanced/detailed stats; otherwise "simple".
-- note is one short line saying what you understood, e.g. "Lumbini vs Sudurpaschim, NPL".
+- channel_id MUST be one of the ids in the channels list, or null when the user does not name a channel. If the user names a channel that is not in the list, use null.
+- note is one short line saying what you understood, e.g. "Lumbini vs Sudurpaschim, NPL, alerts to #general".
 
 Games (id | home vs away | league | status):
 __GAMES__
+
+Channels (id | #name):
+__CHANNELS__
 
 User request: "__TEXT__"
 """
 
 
 async def parse_watch_ai(text: str, grounding: list[dict],
-                         model) -> dict | None:
-    """Ask Gemini to resolve free text to a game. model is the
-    configured Gemini model (or None). Returns the validated dict
-    or None — a game_id outside the grounding list is rejected."""
+                         model, channels: list[dict] | None = None) -> dict | None:
+    """Ask Gemini to resolve free text to a game (and, when the
+    user names one, a channel). model is the configured Gemini
+    model (or None). Returns the validated dict or None — a
+    game_id outside the grounding list, or a channel_id outside
+    the channel list, is rejected."""
     if model is None:
         return None
     games = "\n".join(
         f"{g['id']} | {g['home']} vs {g['away']} | {g['league']} | {g['status']}"
         for g in grounding)
-    prompt = _AI_PROMPT.replace("__GAMES__", games).replace("__TEXT__", text)
+    if channels:
+        chans = "\n".join(
+            f"{c['id']} | #{c.get('name', '')}" for c in channels)
+    else:
+        chans = "(none — use null)"
+    prompt = (_AI_PROMPT.replace("__GAMES__", games)
+              .replace("__CHANNELS__", chans).replace("__TEXT__", text))
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(model.generate_content, prompt),
@@ -345,7 +357,17 @@ async def parse_watch_ai(text: str, grounding: list[dict],
     detail = data.get("detail")
     if detail not in (DETAIL_SIMPLE, DETAIL_ADVANCED):
         detail = DETAIL_SIMPLE
+    cid = data.get("channel_id")
+    channel_id = None
+    if cid is not None:
+        cid = str(cid)
+        if cid in {str(c["id"]) for c in (channels or [])}:
+            channel_id = cid
+        else:
+            log.warning("[watch] Gemini returned a channel id "
+                        "outside the channel list")
     return {"game_id": gid, "action": action, "detail": detail,
+            "channel_id": channel_id,
             "note": str(data.get("note") or "")}
 
 
@@ -366,44 +388,108 @@ def _match_entries(text: str, grounding: list[dict]) -> list[dict]:
     return out
 
 
-async def resolve_watch(text: str, model) -> dict:
-    """Resolve free text to a game: game ID first, then exact/
-    unique team-name match, then Gemini on the grounding list.
-    Returns {"game_id"|None, "action", "detail", "candidates",
-    "entry"|None, "source"}. Never invents an id.
-    "detail" is None for the deterministic paths — the /watch
-    dropdown always wins, and a hardcoded "simple" here used to
-    discard the user's Advanced choice. The AI path keeps the
-    AI's parsed detail as advisory only; the command still
-    prefers the dropdown."""
+# Words that pick the detail level without the AI — checked
+# before Gemini, so "advanced stats" never waits on a model call.
+_ADVANCED_WORDS = ("advanced", "detailed", "full stats", "all stats",
+                   "everything", "full detail", "detailed stats")
+_SIMPLE_WORDS = ("simple", "basic", "just goals", "only goals",
+                 "just the goals", "goals only")
+
+
+def _detail_from_words(text: str) -> str | None:
+    """Detail level the user's own words ask for, or None."""
+    n = _norm(text or "")
+    if any(w in n for w in _ADVANCED_WORDS):
+        return DETAIL_ADVANCED
+    if any(w in n for w in _SIMPLE_WORDS):
+        return DETAIL_SIMPLE
+    return None
+
+
+def _channel_mentions(text: str) -> list[str]:
+    """Channel names the user typed: #name tokens and
+    "in/to/for <name> channel" phrases."""
+    mentions: list[str] = []
+    for m in re.finditer(r"#([\w-]+)", text or ""):
+        mentions.append(m.group(1))
+    for m in re.finditer(r"\b(?:in|to|for)\s+([\w-]+)\s+channel\b",
+                         text or "", re.I):
+        mentions.append(m.group(1))
+    return mentions
+
+
+def _channel_from_words(text: str,
+                        channels: list[dict] | None) -> tuple[dict | None,
+                                                              str | None]:
+    """Deterministic channel match: a #name or "in <name> channel"
+    that equals a real channel name (case-insensitive).
+    Returns (channel|None, named|None) — named is the name the
+    user typed when it matches NO channel, so the caller can say
+    so instead of silently watching elsewhere."""
+    mentions = _channel_mentions(text)
+    named = mentions[0] if mentions else None
+    for name in mentions:
+        for ch in channels or []:
+            if _norm(name) == _norm(str(ch.get("name", ""))):
+                return ch, None
+    return None, named
+
+
+async def resolve_watch(text: str, model, channels: list[dict] | None = None) -> dict:
+    """Resolve free text to a game — and, when the words name
+    one, to a channel and a detail level. Game: game ID first,
+    then exact/unique team-name match, then Gemini on the
+    grounding list. Channel: #name / "in <name> channel" first,
+    then Gemini on the channel list. Detail: the words' own
+    keywords first, then Gemini's parsed detail.
+    Returns {"game_id"|None, "action", "detail"|None,
+    "channel"|None, "channel_id"|None, "channel_named"|None,
+    "candidates", "entry"|None, "source"}. Never invents an id
+    or a channel id. "detail" is None when the words say nothing
+    about it — the /watch dropdown always wins, and a hardcoded
+    "simple" here used to discard the user's Advanced choice."""
     q = (text or "").strip()
+    words_detail = _detail_from_words(q)
+    word_channel, channel_named = _channel_from_words(q, channels)
+
+    def _out(game_id, action, detail, candidates, entry, source,
+             channel=None, note=""):
+        channel = channel if channel is not None else word_channel
+        return {"game_id": game_id, "action": action, "detail": detail,
+                "candidates": candidates, "entry": entry, "source": source,
+                "note": note, "channel": channel,
+                "channel_id": (str(channel["id"]) if channel else None),
+                "channel_named": channel_named}
+
     if not q:
-        return {"game_id": None, "action": "follow", "detail": None,
-                "candidates": [], "entry": None, "source": "none"}
+        return _out(None, "follow", words_detail, [], None, "none")
     if q.isdigit() and len(q) >= 5:
-        return {"game_id": q, "action": "follow", "detail": None,
-                "candidates": [], "entry": None, "source": "id"}
+        return _out(q, "follow", words_detail, [], None, "id")
     grounding = await prov.onex_grounding()
     exact = [g for g in grounding
              if _norm(g["home"]) == _norm(q) or _norm(g["away"]) == _norm(q)]
     if len(exact) == 1:
-        return {"game_id": str(exact[0]["id"]), "action": "follow",
-                "detail": None, "candidates": [], "entry": exact[0],
-                "source": "name"}
+        return _out(str(exact[0]["id"]), "follow", words_detail, [],
+                    exact[0], "name")
     matches = _match_entries(q, grounding)
     if len(matches) == 1:
-        return {"game_id": str(matches[0]["id"]), "action": "follow",
-                "detail": None, "candidates": [], "entry": matches[0],
-                "source": "name"}
-    ai = await parse_watch_ai(q, grounding, model)
+        return _out(str(matches[0]["id"]), "follow", words_detail, [],
+                    matches[0], "name")
+    ai = await parse_watch_ai(q, grounding, model, channels)
     if ai and ai.get("game_id"):
         entry = next((g for g in grounding
                       if str(g["id"]) == str(ai["game_id"])), None)
-        return {"game_id": str(ai["game_id"]), "action": ai["action"],
-                "detail": ai["detail"], "candidates": [],
-                "entry": entry, "source": "ai", "note": ai.get("note", "")}
-    return {"game_id": None, "action": "follow", "detail": None,
-            "candidates": matches[:5], "entry": None, "source": "none"}
+        ai_channel = None
+        if word_channel is None and ai.get("channel_id"):
+            ai_channel = next(
+                (c for c in (channels or [])
+                 if str(c["id"]) == str(ai["channel_id"])), None)
+        detail = (words_detail if words_detail is not None
+                  else ai["detail"])
+        return _out(str(ai["game_id"]), ai["action"], detail, [],
+                    entry, "ai", channel=ai_channel,
+                    note=ai.get("note", ""))
+    return _out(None, "follow", words_detail, matches[:5], None, "none")
 
 
 # ══════════════════════════════════════════════════════════════════════════

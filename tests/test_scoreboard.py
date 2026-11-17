@@ -2,8 +2,7 @@
 
 Pure rendering/edit-rule tests need no network. Provider tests stub
 hc.get with the fixtures in tests/fixtures/scoreboard/ (modelled on
-the real 1xBet games1x2 shape and the NPL official API shape the
-site's Vercel proxy parses). Delivery tests use fake channel/message
+the real 1xBet games1x2 shape. Delivery tests use fake channel/message
 objects — no Discord token, no network.
 
 Run:  python3 -m pytest tests/test_scoreboard.py -q
@@ -178,35 +177,19 @@ class TestNplParsing(unittest.TestCase):
         self.assertEqual(m["cricket"]["need"], 158)
         self.assertEqual(m["cricket"]["balls_left"], 120)
 
-    def test_official_norm(self):
-        data = _load("official_npl.json")
-        matches = [prov._npl_official_norm(m) for m in data["matches"]]
-        matches = [m for m in matches if m is not None]
-        self.assertEqual(len(matches), 1)  # the upcoming match is dropped
-        m = matches[0]
-        self.assertEqual(m["home_score"], "157")
-        self.assertEqual(m["away_score"], "76/2")
-        self.assertEqual(m["clock"], "10.5 ov")  # last scorecard innings
-        self.assertEqual(m["provider"], "npl-official")
-
-
 class TestNplLiveFetch(unittest.IsolatedAsyncioTestCase):
-    """onex_npl_live with hc.get stubbed: 1xBet first, official fallback."""
+    """onex_npl_live with hc.get stubbed: 1xBet only, no other source."""
 
     def setUp(self):
         self._orig_get = prov.hc.get
         self.calls: list[str] = []
         self.games1x2 = _load("games1x2_npl.json")
-        self.official = _load("official_npl.json")
 
         async def fake_get(url, headers, params=None, cache_key="",
                            provider="x", refresh_fn=None):
             if "games1x2" in url:
                 self.calls.append("games1x2")
                 return self.games1x2
-            if "live-scores.php" in url:
-                self.calls.append("official")
-                return self.official
             raise AssertionError(f"unexpected URL in test: {url}")
 
         prov.hc.get = fake_get
@@ -219,25 +202,25 @@ class TestNplLiveFetch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["provider"], "onexbet")
         self.assertEqual(matches[0]["home_score"], "157")
-        self.assertEqual(self.calls, ["games1x2"])  # official never fetched
+        self.assertEqual(self.calls, ["games1x2"])  # no other source fetched
 
-    async def test_official_fallback_when_onexbet_empty(self):
+    async def test_empty_when_onexbet_has_no_npl(self):
+        # 1xBet only: no second source is fetched, the NPL section
+        # simply stays empty.
         self.games1x2 = []
         matches = await prov.onex_npl_live()
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["provider"], "npl-official")
-        self.assertEqual(matches[0]["home_score"], "157")
-        self.assertEqual(self.calls, ["games1x2", "official"])
+        self.assertEqual(matches, [])
+        self.assertEqual(self.calls, ["games1x2"])
 
-    async def test_official_fills_scoreless_onexbet_game(self):
+    async def test_scoreless_onexbet_game_returned_as_is(self):
         g = json.loads(json.dumps(self.games1x2[0]))
         g["scores"] = {"scoreOpp1": None, "scoreOpp2": None}
         self.games1x2 = [g]
         matches = await prov.onex_npl_live()
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["home_score"], "157")
-        self.assertEqual(matches[0]["away_score"], "76/2")
-        self.assertEqual(matches[0]["provider"], "npl-official")
+        self.assertEqual(matches[0]["provider"], "onexbet")
+        self.assertIsNone(matches[0]["home_score"])
+        self.assertEqual(self.calls, ["games1x2"])
 
 
 class FakeMessage:

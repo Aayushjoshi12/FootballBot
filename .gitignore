@@ -1,6 +1,20 @@
+# Secrets and local state — never commit these.
 .env
 *.db
+*.db-journal
 *.log
+
+# Python bytecode and caches.
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Virtual environment.
+venv/
+.venv/
+
+# Runtime files created by the bot.
+scoreboard.json
+scoreboard.json.bak
 barcelona_reminders.json
+*.bak

@@ -997,11 +997,37 @@ class TestRenderAnalytics(unittest.TestCase):
     (one long line per stat) wrapped mid-row on narrow screens.
     The stats now render as TWO short lines per stat in a
     monospace block — label, then home value + bar + away value
-    — with the teams named in a Home/Away header above it."""
+    — with the teams named in a header row INSIDE the block
+    (home left, away right) as well as in the Home/Away line
+    above it. Each sport gets its own stat order from the stats
+    its feed actually carries; cricket has no stats table in the
+    feed, so it gets Score / Wickets / Overs / Run rate from the
+    cricket score data."""
 
     def setUp(self):
         g = _load("games1x2.json")[0]
         self.detail = prov._onex_detail_from_raw(g)
+
+    def _detail_for(self, sport, stats):
+        """A bare detail dict for one sport, stats in the order
+        given — no fixture needed, the order is the test."""
+        return {
+            "home": "Home Team", "away": "Away Team",
+            "home_score": "0", "away_score": "0",
+            "league": "Test League", "clock": "12:00",
+            "sport": sport, "stats": stats, "cricket": {},
+            "onex_id": "1",
+        }
+
+    def _block_lines(self, text):
+        block = text.split("```")[1]
+        return [r for r in block.strip().split("\n") if r.strip()]
+
+    def _stat_labels(self, text):
+        """The label lines of the block, in order (every other
+        line after the team header row)."""
+        lines = self._block_lines(text)
+        return lines[1::2]
 
     def test_keeps_every_stat_row_and_momentum(self):
         momentum = ("Momentum (estimate, last ~3 min): away side +7 "
@@ -1035,14 +1061,17 @@ class TestRenderAnalytics(unittest.TestCase):
         self.assertIn("░", text)
         # Possession 40/60: 4 of 10 blocks filled.
         self.assertIn("████░░░░░░", text)
-        # Two lines per stat: a label line, then a value line
-        # carrying home value, the 10-block bar and away value
-        # together — the one-long-line layout wrapped mid-row on
-        # narrow screens and split the numbers from their bar.
-        block = text.split("```")[1]
-        lines = [r for r in block.strip().split("\n") if r.strip()]
-        self.assertEqual(len(lines), 20)  # 10 stats x 2 lines
-        for i in range(0, len(lines), 2):
+        # A team header row inside the block, then two lines per
+        # stat: a label line, then a value line carrying home
+        # value, the 10-block bar and away value together — the
+        # one-long-line layout wrapped mid-row on narrow screens
+        # and split the numbers from their bar.
+        lines = self._block_lines(text)
+        self.assertEqual(len(lines), 21)  # header + 10 stats x 2 lines
+        header = lines[0]
+        self.assertNotIn("█", header)
+        self.assertNotIn("░", header)
+        for i in range(1, len(lines), 2):
             label, values = lines[i], lines[i + 1]
             self.assertNotIn("█", label)
             self.assertNotIn("░", label)
@@ -1053,6 +1082,145 @@ class TestRenderAnalytics(unittest.TestCase):
         self.assertIn("40%", lines[idx + 1])
         self.assertIn("████░░░░░░", lines[idx + 1])
         self.assertIn("60%", lines[idx + 1])
+
+    def test_team_names_inside_the_block(self):
+        # The columns are labelled with the actual teams right
+        # where the numbers are — the reader never has to look
+        # outside the box. Home on the left, away on the right.
+        text = wmod.render_analytics(self.detail)
+        lines = self._block_lines(text)
+        header = lines[0]
+        self.assertLessEqual(len(header), 32, header)
+        self.assertTrue(header.startswith("Republic of th…"),
+                        header)
+        self.assertTrue(header.rstrip().endswith("Ivory Coast"),
+                        header)
+        # Long names are shortened with … so the row stays short.
+        self.assertIn("…", header)
+
+    def test_basketball_order_and_percent(self):
+        # Basketball gets its own stats, in its own order —
+        # shooting first — even when the feed sends them scrambled.
+        detail = self._detail_for("Basketball", [
+            {"name": "Fouls", "home": "12", "away": "11"},
+            {"name": "Free throws scored %", "home": "100", "away": "69"},
+            {"name": "3-pointers", "home": "5", "away": "4"},
+            {"name": "2-pointers", "home": "12", "away": "9"},
+            {"name": "Timeouts remaining", "home": "3", "away": "3"},
+            {"name": "Free throws", "home": "8", "away": "9"},
+        ])
+        text = wmod.render_analytics(detail)
+        self.assertEqual(
+            self._stat_labels(text),
+            ["2-pointers", "3-pointers", "Free throws",
+             "Free throws scored", "Fouls", "Timeouts remaining"])
+        self.assertIn("100%", text)
+        self.assertIn("69%", text)
+        self.assertNotIn("Possession", text)
+
+    def test_tennis_order_and_mid_name_percent(self):
+        # Tennis serve/break stats in tennis order; a % in the
+        # middle of a stat name ("Win % 1st Serve") still shows
+        # its % on the values.
+        detail = self._detail_for("Tennis", [
+            {"name": "Breaks", "home": "0", "away": "0"},
+            {"name": "Win % 2nd Serve", "home": "50", "away": "67"},
+            {"name": "Aces", "home": "1", "away": "3"},
+            {"name": "1st Serve %", "home": "64", "away": "62"},
+            {"name": "Win % 1st Serve", "home": "86", "away": "80"},
+            {"name": "Double faults", "home": "1", "away": "0"},
+            {"name": "Break point %", "home": "0", "away": "0"},
+            {"name": "Points on own serve", "home": "8", "away": "6"},
+        ])
+        text = wmod.render_analytics(detail)
+        self.assertEqual(
+            self._stat_labels(text),
+            ["Aces", "Double faults", "1st Serve",
+             "Win % 1st Serve", "Win % 2nd Serve", "Breaks",
+             "Break point", "Points on own serve"])
+        self.assertIn("86%", text)
+        self.assertIn("80%", text)
+        self.assertNotIn("Possession", text)
+
+    def test_volleyball_and_ice_hockey_orders(self):
+        detail = self._detail_for("Volleyball", [
+            {"name": "Timeouts", "home": "2", "away": "2"},
+            {"name": "Points on opponent's serve", "home": "23",
+             "away": "23"},
+            {"name": "Max pts in a row", "home": "3", "away": "3"},
+            {"name": "Points on own serve", "home": "13", "away": "11"},
+        ])
+        self.assertEqual(
+            self._stat_labels(wmod.render_analytics(detail)),
+            ["Points on own serve", "Points on opponent's serve",
+             "Max pts in a row", "Timeouts"])
+        detail = self._detail_for("Ice Hockey", [
+            {"name": "Penalties", "home": "3", "away": "1"},
+            {"name": "Possession %", "home": "47", "away": "53"},
+            {"name": "Attacks", "home": "80", "away": "81"},
+            {"name": "2-min penalties", "home": "3", "away": "1"},
+            {"name": "Goals during powerplay", "home": "1",
+             "away": "0"},
+        ])
+        self.assertEqual(
+            self._stat_labels(wmod.render_analytics(detail)),
+            ["Possession", "Attacks", "Goals during powerplay",
+             "Penalties", "2-min penalties"])
+
+    def test_unknown_sport_keeps_feed_order(self):
+        # A sport with no preferred order renders its stats in
+        # the order the feed sent them — never invented, never
+        # re-sorted into a football shape.
+        detail = self._detail_for("Handball", [
+            {"name": "7m throws", "home": "4", "away": "2"},
+            {"name": "Fast breaks", "home": "6", "away": "5"},
+        ])
+        self.assertEqual(
+            self._stat_labels(wmod.render_analytics(detail)),
+            ["7m throws", "Fast breaks"])
+
+    def test_cricket_shows_cricket_rows_not_football(self):
+        # Real live cricket (Australia vs England): no tabloStats
+        # in the feed, so the block shows Score, Wickets and
+        # Overs from the cricket score data — and no football
+        # rows at all.
+        g = _load("games1x2_cricket.json")[0]
+        detail = prov._onex_detail_from_raw(g)
+        text = wmod.render_analytics(detail, updated="16:38:00")
+        self.assertEqual(self._stat_labels(text),
+                         ["Score", "Wickets", "Overs"])
+        self.assertIn("222/9", text)
+        self.assertIn("328/10", text)
+        self.assertIn("45.0 ov", text)
+        for name in ("Possession", "Shots on target", "Corners",
+                     "Attacks", "Yellow cards"):
+            self.assertNotIn(name, text)
+        # The teams are named inside the block too.
+        header = self._block_lines(text)[0]
+        self.assertIn("Australia", header)
+        self.assertIn("England", header)
+        self.assertIn("Game ID: 771890070", text)
+        self.assertIn("-# Updated 16:38:00 NPT", text)
+
+    def test_cricket_momentum_never_shown(self):
+        # The momentum estimate comes from football stat
+        # snapshots — it never belongs on a cricket game.
+        g = _load("games1x2_cricket.json")[0]
+        detail = prov._onex_detail_from_raw(g)
+        text = wmod.render_analytics(
+            detail, "Momentum (estimate, last ~3 min): home side +5")
+        self.assertNotIn("Momentum", text)
+
+    def test_cricket_no_data_honest_line(self):
+        # A cricket game with no score data yet gets the honest
+        # line, not an empty box.
+        detail = self._detail_for("Cricket", [])
+        detail["cricket"] = {}
+        detail["home_score"] = None
+        detail["away_score"] = None
+        text = wmod.render_analytics(detail)
+        self.assertIn("No match statistics available yet.", text)
+        self.assertNotIn("```", text)
 
     def test_no_line_in_the_block_can_wrap(self):
         # Narrow phone screens wrap long lines mid-row; every

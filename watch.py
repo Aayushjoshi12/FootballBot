@@ -209,17 +209,51 @@ def render_detail(d: dict, level: str = DETAIL_SIMPLE,
     return "\n".join(lines) + _updated_footer(updated)
 
 
-# Preferred stat order for the analytics table (Feature 4);
-# any stat the feed sends that is not listed here is appended
-# after these, in the order it arrived. "Fouls" is not in the
-# feed's stats, so it never appears — nothing is invented.
-_ANALYTICS_ORDER = (
-    "Possession %", "Shots on target", "Shots off target", "Corner",
-    "Yellow cards", "Red card", "Attacks", "Dangerous attacks",
-    "xG", "Saves", "Penalty", "Substitutions", "Key Passes",
-    "Passing Accuracy %", "Crosses",
-)
+# Preferred stat order per sport (Feature 4); any stat the
+# feed sends that is not listed for its sport is appended
+# after these, in the order it arrived. The orders below come
+# from a real live-feed snapshot (18 Nov 2026): football
+# carries Possession/Shots/Corners/Cards/Attacks/xG/Saves/...,
+# basketball 2-/3-pointers and free throws, tennis serve and
+# break stats, volleyball serve points, ice hockey powerplay
+# stats. Cricket carries NO tabloStats at all — its rows come
+# from the cricket score data instead (see
+# format_cricket_stats). "Fouls" is not in football's stats,
+# so it never appears for football — nothing is invented.
+_ANALYTICS_ORDERS = {
+    "football": (
+        "Possession %", "Shots on target", "Shots off target",
+        "Corner", "Yellow cards", "Red card", "Attacks",
+        "Dangerous attacks", "xG", "Saves", "Penalty",
+        "Substitutions", "Key Passes", "Passing Accuracy %",
+        "Crosses",
+    ),
+    "basketball": (
+        "2-pointers", "3-pointers", "Free throws",
+        "Free throws scored %", "Fouls", "Timeouts remaining",
+    ),
+    "tennis": (
+        "Aces", "Double faults", "1st Serve %",
+        "Win % 1st Serve", "Win % 2nd Serve", "Breaks",
+        "Break point %", "Points on own serve",
+    ),
+    "volleyball": (
+        "Points on own serve", "Points on opponent's serve",
+        "Max pts in a row", "Timeouts",
+    ),
+    "ice hockey": (
+        "Possession %", "Attacks", "Goals during powerplay",
+        "Penalties", "2-min penalties",
+    ),
+}
 _ANALYTICS_LABELS = {"Possession %": "Possession", "Corner": "Corners"}
+
+
+def _analytics_order_for(sport: str | None) -> tuple[str, ...]:
+    """The preferred stat order for this sport, from the feed's
+    own sport name. An unknown sport gets no preferred order —
+    its stats render in the order the feed sent them."""
+    return _ANALYTICS_ORDERS.get(str(sport or "").strip().lower(), ())
 
 # One stat row's split bar: 10 blocks, home share filled.
 # Discord does not render markdown tables, so the old pipe
@@ -252,23 +286,36 @@ def _stat_bar(home, away) -> str | None:
 def _stat_display_value(name: str, value) -> str:
     """Values for %-stats carry the % the stat name declares
     (the feed sends bare numbers); every other value is shown
-    exactly as the feed sent it — nothing is invented."""
+    exactly as the feed sent it — nothing is invented. The %
+    can sit anywhere in the name ("Win % 1st Serve"), not just
+    at the end, so any % in the name counts."""
     value = str(value)
-    if name.endswith(" %") and not value.endswith("%"):
+    if "%" in name and not value.endswith("%"):
         return value + "%"
     return value
 
 
-def format_analytics_stats(stats: list[dict] | None) -> list[str]:
-    """The analytics stat block, in display order: TWO lines per
-    stat inside a monospace block — the label on its own line,
-    then home value, a 10-block split bar, away value on the
-    next line. One long line per stat (label + values + bar)
-    wrapped mid-row on narrow phone screens, so the home value
-    landed on the label line and the bar + away value dropped
-    below it — the numbers no longer sat with their bar and
-    nobody could tell which side they belonged to. Two short
-    lines cannot wrap into nonsense: every value line is ~22
+def _short_team(name: str, width: int = 15) -> str:
+    """A team name shortened to fit one side of the block's
+    header row: cut with … when it would overflow."""
+    name = str(name or "").strip()
+    return name if len(name) <= width else name[:width - 1] + "…"
+
+
+def format_analytics_stats(stats: list[dict] | None,
+                           home: str = "", away: str = "") -> list[str]:
+    """The analytics stat block, in display order: a team header
+    row INSIDE the monospace block (home team left, away team
+    right, shortened so the row stays 32 chars), then TWO lines
+    per stat — the label on its own line, then home value, a
+    10-block split bar, away value on the next line. The header
+    above the block names the sides in full, but on a narrow
+    phone screen the reader never has to look outside the box:
+    the columns are labelled with the actual teams right where
+    the numbers are. One long line per stat wrapped mid-row on
+    narrow screens, so the home value landed on the label line
+    and the bar + away value dropped below it — two short lines
+    cannot wrap into nonsense: every value line is ~22
     characters. Stats the feed sends that are not numbers get a
     plain value line with no bar. Returns [] when there are no
     stats."""
@@ -278,19 +325,73 @@ def format_analytics_stats(stats: list[dict] | None) -> list[str]:
         label = _ANALYTICS_LABELS.get(name, name)
         if label.endswith(" %"):
             label = label[:-2]
-        home = _stat_display_value(name, s.get("home", ""))
-        away = _stat_display_value(name, s.get("away", ""))
+        home_v = _stat_display_value(name, s.get("home", ""))
+        away_v = _stat_display_value(name, s.get("away", ""))
         bar = _stat_bar(s.get("home", ""), s.get("away", ""))
-        rows.append((label, home, away, bar))
+        rows.append((label, home_v, away_v, bar))
     if not rows:
         return []
     lines = ["```"]
-    for label, home, away, bar in rows:
+    lines.append(f"{_short_team(home):<15}  {_short_team(away):>15}")
+    for label, home_v, away_v, bar in rows:
         lines.append(label)
         if bar is None:
-            lines.append(f"{home} — {away}")
+            lines.append(f"{home_v} — {away_v}")
         else:
-            lines.append(f"{home:>4}  {bar}  {away:<4}".rstrip())
+            lines.append(f"{home_v:>4}  {bar}  {away_v:<4}".rstrip())
+    lines.append("```")
+    return lines
+
+
+def _cricket_wickets(score: object) -> str | None:
+    """Wickets fallen out of a wicketScore string ("222/9" -> "9").
+    None when the score carries no wickets (not started yet)."""
+    try:
+        parts = str(score).split("/")
+        return parts[1] if len(parts) == 2 and parts[1].isdigit() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def format_cricket_stats(d: dict) -> list[str]:
+    """The analytics stat block for a cricket game, in the same
+    two-line shape as the other sports: a team header row inside
+    the block, then Score (runs/wickets per side), Wickets
+    fallen, Overs and Run rate. Cricket carries NO tabloStats in
+    the feed — these rows come from the cricket score data the
+    bot already has (wicketScore, overStr, run rate). Overs and
+    run rate describe the innings in progress only, so they
+    render as single-value lines rather than a home/away pair.
+    Returns [] when the game carries no cricket data at all."""
+    cricket = d.get("cricket") or {}
+    home_score = d.get("home_score")
+    away_score = d.get("away_score")
+    rows: list[tuple[str, str, str | None, str | None]] = []
+    if home_score is not None and away_score is not None:
+        rows.append(("Score", str(home_score), str(away_score), None))
+        hw, aw = _cricket_wickets(home_score), _cricket_wickets(away_score)
+        if hw is not None and aw is not None:
+            rows.append(("Wickets", hw, aw,
+                         _stat_bar(hw, aw)))
+    over = cricket.get("over_str")
+    if over is not None:
+        rows.append(("Overs", f"{over} ov", None, None))
+    run_rate = cricket.get("run_rate")
+    if run_rate:
+        rows.append(("Run rate", str(run_rate), None, None))
+    if not rows:
+        return []
+    home, away = str(d.get("home", "")), str(d.get("away", ""))
+    lines = ["```"]
+    lines.append(f"{_short_team(home):<15}  {_short_team(away):>15}")
+    for label, home_v, away_v, bar in rows:
+        lines.append(label)
+        if away_v is None:
+            lines.append(home_v)
+        elif bar is None:
+            lines.append(f"{home_v} — {away_v}")
+        else:
+            lines.append(f"{home_v:>4}  {bar}  {away_v:<4}".rstrip())
     lines.append("```")
     return lines
 
@@ -298,29 +399,48 @@ def format_analytics_stats(stats: list[dict] | None) -> list[str]:
 def render_analytics(d: dict, momentum: str | None = None,
                      updated: str | None = None) -> str:
     """Advanced analytics view: home/away comparison from the
-    stats the feed actually carries, plus cricket target/
-    need/run-rate when present and a momentum estimate when one
-    was computed from real snapshots. Ends with the Game ID line
-    so the panel buttons on this message keep resolving."""
+    stats the game actually carries, in that sport's own order —
+    football gets its Possession/Shots/Corners table, basketball
+    its shooting stats, tennis its serve stats, volleyball its
+    serve points, ice hockey its powerplay stats — plus cricket
+    target/need when present and a momentum estimate (football
+    only) when one was computed from real snapshots. Cricket
+    carries no stats table in the feed, so it gets its own
+    block: Score, Wickets, Overs, Run rate, from the cricket
+    score data. A game with no stat data at all says so plainly
+    instead of showing an empty table. Ends with the Game ID
+    line so the panel buttons on this message keep resolving."""
     lines = [f"**{d.get('home', '?')} {_score_str(d)} {d.get('away', '?')}**"]
     if d.get("league"):
         lines.append(str(d["league"]))
     lines.append("")
     lines.append(_clock_str(d))
+    sport = str(d.get("sport") or "").strip().lower()
     stats = d.get("stats") or []
     by_name = {str(s.get("name")): s for s in stats}
-    ordered = [n for n in _ANALYTICS_ORDER if n in by_name]
-    ordered += [n for n in by_name if n not in _ANALYTICS_ORDER]
-    if ordered:
+    order = _analytics_order_for(d.get("sport"))
+    ordered = [n for n in order if n in by_name]
+    ordered += [n for n in by_name if n not in order]
+    home, away = str(d.get("home", "?")), str(d.get("away", "?"))
+    if sport == "cricket":
+        block = format_cricket_stats(d)
+        if not block and ordered:
+            block = format_analytics_stats(
+                [by_name[n] for n in ordered], home, away)
+    else:
+        block = (format_analytics_stats(
+            [by_name[n] for n in ordered], home, away)
+            if ordered else [])
+    if block:
         lines.append("")
         lines.append("**📊 Match statistics**")
         # Name the sides once, right above the block: the left
         # number on every value line is the home team, the right
-        # one the away team. Without this, two bare numbers
-        # under a bar say nothing about which side they belong to.
-        lines.append(
-            f"Home: {d.get('home', '?')} · Away: {d.get('away', '?')}")
-        lines.extend(format_analytics_stats([by_name[n] for n in ordered]))
+        # one the away team. The block also carries a team header
+        # row inside it, so the columns stay labelled with the
+        # actual teams even on a narrow screen.
+        lines.append(f"Home: {home} · Away: {away}")
+        lines.extend(block)
     else:
         lines.append("")
         lines.append("No match statistics available yet.")
@@ -332,9 +452,9 @@ def render_analytics(d: dict, momentum: str | None = None,
         if need is not None:
             lines.append(f"Need: {need} off {balls} balls" if balls is not None
                          else f"Need: {need} runs")
-    if cricket.get("run_rate"):
-        lines.append(f"Run rate: {cricket['run_rate']}")
-    if momentum:
+    # The momentum estimate comes from football stat snapshots
+    # only — it never applies to cricket or any other sport.
+    if momentum and sport == "football":
         lines.append("")
         lines.append(momentum)
     gid = str(d.get("onex_id") or d.get("id") or "?")

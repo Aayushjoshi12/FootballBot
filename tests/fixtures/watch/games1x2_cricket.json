@@ -1,0 +1,119 @@
+[
+ {
+  "zonePlay": 771888753,
+  "sport": {
+   "timeName": "innings",
+   "timesName": "innings",
+   "id": 66,
+   "name": "Cricket"
+  },
+  "liga": {
+   "countryName": "World",
+   "isTop": true,
+   "countryImage": "/sfiles/logo-flag/a09c04e45bfb1f2440d5185d9c5753ec.png",
+   "image": "/sfiles/logo-champ/b5cfefb75797d1a88edb553c114eef8d.png",
+   "id": 2448323,
+   "name": "Australia vs England"
+  },
+  "opponent1": {
+   "fullName": "Australia",
+   "countryId": 4,
+   "opps": [
+    {
+     "id": 19787,
+     "name": "Australia",
+     "image": "/sfiles/logo_teams/19787.png"
+    }
+   ]
+  },
+  "opponent2": {
+   "fullName": "England",
+   "countryId": 231,
+   "opps": [
+    {
+     "id": 17995,
+     "name": "England",
+     "image": "/sfiles/logo_teams/17995.png"
+    }
+   ]
+  },
+  "matchInfo": {
+   "tournamentStage": "Third Match",
+   "location": "Ninja (Bellerive)",
+   "matchFormat": "ODI",
+   "locationCity": "Bellerive",
+   "temperature": "+13\u00b0C",
+   "locationCountry": "Australia",
+   "weatherCode": "15",
+   "weatherDescription": "Clear skies",
+   "weatherWindCode": "9",
+   "weatherWindParam": "3.1",
+   "weatherWindDescription": "S wind, m/s",
+   "weatherPressure": "768",
+   "weatherPressureDescription": "Pressure, mmHg",
+   "weatherHumidity": "67",
+   "weatherHumidityDescription": "Humidity, %"
+  },
+  "eventGroups": [],
+  "statisticInfo": {
+   "gameId": "6a1696415e99bd05c62f4a35",
+   "stageId": "6959884a6d807ed026d9171c",
+   "stageType": 3,
+   "status": 3,
+   "hasLineUps": true,
+   "hasStadiumInfo": true
+  },
+  "scores": {
+   "fullScore": "222-328",
+   "periodScores": [],
+   "extendedScore": {
+    "innsStats": {
+     "team": 1,
+     "wickets": 9,
+     "over": 45,
+     "overStr": "45.0"
+    },
+    "cricketScore": {
+     "wicketScore": {
+      "opponent1": "222/9",
+      "opponent2": "328/10"
+     }
+    }
+   },
+   "currentPeriodName": "",
+   "scoreOpp1": 222,
+   "scoreOpp2": 328,
+   "serve": 1,
+   "fullScoreDetail": {
+    "scoreOpp1": 222,
+    "scoreOpp2": 328
+   },
+   "statistic": {
+    "main": {
+     "Team1Scores": "222/9",
+     "Team2Scores": "328/10",
+     "InnsStats": "1;9;45.0"
+    }
+   },
+   "statusLineStr": "Event in progress",
+   "inningsStat": []
+  },
+  "centralBlockEventGroups": [],
+  "subGamesCount": 2,
+  "hasGraph": true,
+  "id": 771890070,
+  "num": 215252,
+  "mainGameId": 771890070,
+  "constId": 395972895,
+  "startTs": 1794972600,
+  "countryId": 225,
+  "gameTypeName": "",
+  "periodName": "",
+  "menuSection": 2,
+  "mainConstId": 395972895,
+  "kind": 1,
+  "hasHeadToHead": true,
+  "subscriptionAvailable": true,
+  "isFavoriteAvailable": true
+ }
+]

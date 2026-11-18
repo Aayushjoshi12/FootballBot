@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-import google.generativeai as genai
 
+import ai_client
 import assistant
 import db
 import health
@@ -19,7 +19,7 @@ import notify_manager
 import scoreboard
 from config import (
     DISCORD_BOT_TOKEN,
-    GEMINI_API_KEY, GEMINI_MODEL, ESPN_LEAGUE_MAP,
+    ESPN_LEAGUE_MAP,
 )
 from embeds import (
     match_embed, MatchView,
@@ -40,13 +40,10 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 
-ai_model = None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    ai_model = genai.GenerativeModel(GEMINI_MODEL)
-    log.info("[ai] Gemini enabled with model %s", GEMINI_MODEL)
-else:
-    log.warning("[ai] Gemini disabled: GEMINI_API_KEY is not set")
+# Groq primary, Gemini fallback (ai_client.build_ai_model) —
+# None when neither key is set; /ask and /watch already answer
+# plainly without a model.
+ai_model = ai_client.build_ai_model()
 
 
 def _crosslink_apf(matches: list[dict], apf_matches: list[dict]) -> None:
@@ -153,6 +150,12 @@ class FootballBot(discord.Client):
         # the message each button sits on, so old buttons keep
         # working after a restart.
         self.add_view(watch.WatchAlertView())
+        # ❌ Remove buttons on watching-list messages are dynamic
+        # items (template "panel:remove:<game_id>"): discord.py
+        # only dispatches a tap after a restart when the
+        # custom_id matches a registered template, so the
+        # template itself must be registered here.
+        self.add_dynamic_items(watch.RemoveWatchButton)
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.

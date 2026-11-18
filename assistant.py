@@ -43,7 +43,7 @@ INTENTS = (
     "HELP",
 )
 
-# Gemini gets this long to parse one /ask sentence; on timeout the
+# The AI model gets this long to parse one /ask sentence; on timeout the
 # caller gets an error dict instead of a hanging reply. (wait_for
 # cancels the wait, not the model call — the thread finishes on
 # its own in the background.) Shorter than watch's 15s because
@@ -105,7 +105,7 @@ _MASS_WORDS = ("every live match", "all live matches",
 
 def _precheck(text: str) -> dict | None:
     """Deterministic answers that need no model call. None when
-    the sentence needs Gemini."""
+    the sentence needs the AI model."""
     n = _norm(text or "")
     if not n:
         return _blank_parsed("Tell me what you want — a team, a game, "
@@ -122,6 +122,16 @@ def _precheck(text: str) -> dict | None:
         return {**_blank_parsed(), "intent": "MATCH_DETAILS",
                 "pick": "highest_scoring",
                 "note": "Highest scoring live game."}
+    # A bare sport word ("football match", "cricket match",
+    # "football") is a browse request, not a question needing a
+    # team: list that sport's live games. 18 Nov 2026: /ask
+    # "football match" went to the model, failed, and dead-ended
+    # with "Tell me which game". _is_sport_only_query only
+    # matches when nothing but the sport + filler words is left,
+    # so "follow the football game" still goes to the model.
+    sport = wmod._sport_from_words(n)
+    if sport and wmod._is_sport_only_query(n, sport):
+        return {**_blank_parsed(), "intent": "LIVE_MATCHES"}
     if not any(w in n for w in ("follow", "watch", "unfollow", "alert",
                                 "detail", "timeline", "fixture")):
         if any(w in n for w in _LIVE_WORDS):
@@ -150,10 +160,11 @@ User request: "__TEXT__"
 async def parse_intent(text: str, model, channels: list[dict] | None = None) -> dict:
     """Parse one /ask sentence. Deterministic pre-checks first
     (HELP, live list, highest-scoring pick, mass-follow) — those
-    never call the model. Everything else goes to Gemini as
-    STRICT JSON with a 3s timeout, same style as
-    watch.resolve_watch. Never raises for bad input: an
-    unparseable request returns a dict with an "error" key."""
+    never call the model. Everything else goes to the AI model
+    (Groq first, Gemini fallback) as STRICT JSON with a 3s
+    timeout, same style as watch.resolve_watch. Never raises for
+    bad input: an unparseable request returns a dict with an
+    "error" key."""
     pre = _precheck(text)
     if pre is not None:
         return pre
@@ -172,12 +183,12 @@ async def parse_intent(text: str, model, channels: list[dict] | None = None) -> 
             timeout=AI_TIMEOUT_S)
         raw = (getattr(response, "text", "") or "").strip()
     except asyncio.TimeoutError:
-        log.warning("[assistant] Gemini parse timed out (%ss)", AI_TIMEOUT_S)
+        log.warning("[assistant] AI parse timed out (%ss)", AI_TIMEOUT_S)
         return _blank_parsed(
             "That took too long to understand — please try again, "
             "or use /game <team> instead.")
     except Exception as exc:
-        log.warning("[assistant] Gemini parse failed (%s)", type(exc).__name__)
+        log.warning("[assistant] AI parse failed (%s)", type(exc).__name__)
         return _blank_parsed(
             "I couldn't understand that right now — please try again, "
             "or use /game <team> instead.")
@@ -488,6 +499,18 @@ async def _validate_intent(parsed: dict, live_games: list[dict],
             raw = (entry.get("onex_id") or entry.get("id") or "")
             game_id = str(raw).replace("onex_", "")
     else:
+        # MATCH_DETAILS / SEARCH_MATCH with no team and no id:
+        # not an error — the handler answers with the top live
+        # games as a pick list instead of the bare dead end
+        # ("Tell me which game", 18 Nov 2026: /ask "football
+        # match" failed twice on exactly this). Never invents a
+        # game id — the list only shows games that are live.
+        if intent in ("MATCH_DETAILS", "SEARCH_MATCH"):
+            return {"ok": True, "intent": intent, "game_id": None,
+                    "team": None, "events": events, "detail": detail,
+                    "channel": channel,
+                    "note": parsed.get("note") or "", "pick": None,
+                    "mass": False, "entry": None}
         return {"ok": False,
                 "error": "Tell me which game — a team name or a game ID."}
 
@@ -571,6 +594,27 @@ def _live_line_list(games: list[dict], limit: int = 15,
     if rest > 0:
         lines.append(f"…and {rest} more live games.")
     return "\n".join(lines)
+
+
+def _top_pick(live_now: list[dict], limit: int = 5) -> list[dict]:
+    """Top live games for a question that names no game:
+    football first, then the rest, feed order inside each
+    sport. Stable sort — nothing is invented, only ordered."""
+    return sorted(
+        live_now,
+        key=lambda g: (0 if str(g.get("sport") or "").strip().lower()
+                       == "football" else 1))[:limit]
+
+
+def _no_game_pick_text(live_now: list[dict]) -> str | None:
+    """The pick-list reply for a MATCH_DETAILS / SEARCH_MATCH
+    question with no team and no game id, or None when nothing
+    is live."""
+    if not live_now:
+        return None
+    return ("I don't know which game you mean — here are the top "
+            "live games right now, pick one:\n"
+            + _live_line_list(_top_pick(live_now), 5))
 
 
 def _pick_list(games: list[dict], header: str) -> str:
@@ -739,6 +783,13 @@ async def _handle_ask(interaction, text: str, model,
         return
 
     if intent == "SEARCH_MATCH":
+        if not game_id and not valid.get("team"):
+            pick = _no_game_pick_text(live_now)
+            if pick:
+                await _send(interaction, pick)
+            else:
+                await _send(interaction, "No games are live right now.")
+            return
         if valid.get("matches") is not None:
             matches = valid["matches"]
             if matches:
@@ -798,6 +849,10 @@ async def _handle_ask(interaction, text: str, model,
         if not game_id:
             if _is_barca_team(valid.get("team")):
                 await _send(interaction, "Barcelona are not live right now.")
+                return
+            pick = _no_game_pick_text(live_now)
+            if pick:
+                await _send(interaction, pick)
                 return
             await _send(interaction, "I couldn't find a live game for that.")
             return

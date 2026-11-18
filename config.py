@@ -8,6 +8,12 @@ DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
 APIFOOTBALL_API_KEY = os.getenv("APIFOOTBALL_API_KEY", "")
 GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Groq (free tier, no card — key from console.groq.com): the
+# primary /ask parser, Gemini is the fallback. Free chat models
+# (Nov 2026) are openai/gpt-oss-120b / 20b and qwen3.8-27b; the
+# old Llama 3.1 8B / 3.3 70B moved to Enterprise in Aug 2026.
+GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL           = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 # 1xBet live scores (unofficial service-api on the lite mirror, no key).
 # The lite mirror domain rotates (1xlite-6229051.com, 1xlite-6428119.com,
 # ...), so override this when the default mirror stops answering.

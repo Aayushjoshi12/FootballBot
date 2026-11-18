@@ -190,6 +190,29 @@ class TestParsePrechecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["intent"], "LIVE_MATCHES")
         self.assertEqual(model.calls, 0)
 
+    async def test_bare_sport_match_precheck(self):
+        # 18 Nov 2026: /ask "football match" went to Gemini, failed,
+        # and dead-ended with "Tell me which game". A bare sport
+        # word + "match"/"game" is a live list, no model needed.
+        model = NeverCallModel()
+        for text in ("football match", "cricket match", "football",
+                     "soccer game", "show me a cricket match"):
+            out = await amod.parse_intent(text, model, CHANNELS)
+            self.assertEqual(out["intent"], "LIVE_MATCHES", text)
+        self.assertEqual(model.calls, 0)
+
+    async def test_sport_plus_team_still_needs_model(self):
+        # "football" alone is a list; "football Gambia game" names
+        # a team, so it must still reach the model.
+        model = FakeModel('{"intent": "MATCH_DETAILS", "game_id": null, '
+                          '"team": "Gambia", "events": null, '
+                          '"detail": null, "channel": null, "note": ""}')
+        out = await amod.parse_intent("show the Gambia football game",
+                                      model, CHANNELS)
+        self.assertEqual(out["intent"], "MATCH_DETAILS")
+        self.assertEqual(out["team"], "Gambia")
+        self.assertEqual(model.calls, 1)
+
     async def test_highest_scoring_precheck(self):
         model = NeverCallModel()
         out = await amod.parse_intent(
@@ -333,6 +356,31 @@ class TestValidate(unittest.IsolatedAsyncioTestCase):
         # football games are 0–1, so the first listed wins.
         self.assertEqual(out["game_id"], "771747666")
 
+    async def test_no_team_no_id_match_details_passes_for_pick_list(self):
+        # 18 Nov 2026: "football match" parsed to MATCH_DETAILS
+        # with no team and no id, and validation dead-ended with
+        # "Tell me which game". Now it passes so the handler can
+        # answer with the top live games as a pick list.
+        out = await amod.validate_intent(_parsed("MATCH_DETAILS"),
+                                         self.live, CHANNELS)
+        self.assertTrue(out["ok"], out)
+        self.assertIsNone(out["game_id"])
+        self.assertIsNone(out["team"])
+
+    async def test_no_team_no_id_search_match_passes_for_pick_list(self):
+        out = await amod.validate_intent(_parsed("SEARCH_MATCH"),
+                                         self.live, CHANNELS)
+        self.assertTrue(out["ok"], out)
+        self.assertIsNone(out["game_id"])
+
+    async def test_no_team_no_id_follow_still_errors(self):
+        # Only MATCH_DETAILS / SEARCH_MATCH get the pick list;
+        # follow/unfollow still need a game.
+        out = await amod.validate_intent(_parsed("FOLLOW_MATCH"),
+                                         self.live, CHANNELS)
+        self.assertFalse(out["ok"])
+        self.assertIn("which game", out["error"])
+
     async def test_barca_team_allowed_for_fixtures(self):
         out = await amod.validate_intent(
             _parsed("TEAM_FIXTURES", team="FC Barcelona"), self.live,
@@ -438,6 +486,54 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         text = interaction.followup.sent[0]
         self.assertIn("Gambia", text)
         self.assertIn("771747666", text)
+
+    async def test_football_match_lists_live_games(self):
+        # 18 Nov 2026: /ask "football match" failed twice
+        # ("I couldn't understand that right now", then
+        # "Tell me which game"). The pre-check answers it
+        # with the live list — football first — no model call.
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "football match",
+                              None, CHANNELS)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Gambia", text)
+        self.assertNotIn("Tell me which game", text)
+        self.assertNotIn("couldn't understand", text)
+        # Football only: the cricket games are not in this list.
+        self.assertNotIn("JYC", text)
+
+    async def test_match_details_no_game_shows_top5_pick_list(self):
+        # A parsed MATCH_DETAILS with no team and no id gets
+        # the top 5 live games (football first), not the bare
+        # "Tell me which game" dead end. Nothing is invented:
+        # every listed game is live, with its real id.
+        model = FakeModel('{"intent": "MATCH_DETAILS", "game_id": null, '
+                          '"team": null, "events": null, "detail": null, '
+                          '"channel": null, "note": ""}')
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "show me a match",
+                              model, CHANNELS)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("pick one", text)
+        self.assertIn("Gambia", text)
+        self.assertIn("Sierra Leone", text)
+        self.assertIn("771747666", text)
+        self.assertNotIn("Tell me which game", text)
+        self.assertLess(text.index("Gambia"), text.index("JYC"))
+
+    async def test_search_match_no_game_shows_top5_pick_list(self):
+        model = FakeModel('{"intent": "SEARCH_MATCH", "game_id": null, '
+                          '"team": null, "events": null, "detail": null, '
+                          '"channel": null, "note": ""}')
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "find a game", model, CHANNELS)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("pick one", text)
+        self.assertIn("Gambia", text)
+        self.assertNotIn("Tell me which game", text)
 
     async def test_live_football_lists_football_only(self):
         # 18 Nov 2026: /ask "show me all live football" failed

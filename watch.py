@@ -40,7 +40,7 @@ tick, one edit discipline for every panel.
 
 AI resolution: /watch takes free text. The text is resolved
 deterministically first (game ID, exact team name, unique partial
-name); only if that fails does Gemini see it — grounded on the
+name); only if that fails does the AI model see it — grounded on the
 live + upcoming games list, asked for STRICT JSON, and the game_id
 it returns MUST be one from that list. A made-up id is never used.
 """
@@ -100,7 +100,7 @@ TERMINAL_STATUSES: dict[str, tuple[str, str, str]] = {
 # on_tick: it arrives as raw_games=None).
 MISSING_END_AFTER_S = 300.0
 
-# Gemini gets this long to resolve free text; on timeout the
+# The AI model gets this long to resolve free text; on timeout the
 # caller falls back to the candidate list instead of hanging the
 # /watch reply. (wait_for cancels the wait, not the model call —
 # the thread finishes on its own in the background.)
@@ -751,11 +751,12 @@ User request: "__TEXT__"
 
 async def parse_watch_ai(text: str, grounding: list[dict],
                          model, channels: list[dict] | None = None) -> dict | None:
-    """Ask Gemini to resolve free text to a game (and, when the
-    user names one, a channel). model is the configured Gemini
-    model (or None). Returns the validated dict or None — a
-    game_id outside the grounding list, or a channel_id outside
-    the channel list, is rejected."""
+    """Ask the AI model (Groq first, Gemini fallback) to resolve
+    free text to a game (and, when the user names one, a
+    channel). model is the configured AI model (or None).
+    Returns the validated dict or None — a game_id outside the
+    grounding list, or a channel_id outside the channel list,
+    is rejected."""
     if model is None:
         return None
     games = "\n".join(
@@ -775,11 +776,11 @@ async def parse_watch_ai(text: str, grounding: list[dict],
             timeout=AI_TIMEOUT_S)
         raw = (getattr(response, "text", "") or "").strip()
     except asyncio.TimeoutError:
-        log.warning("[watch] Gemini resolve timed out (%ss) — using candidates",
+        log.warning("[watch] AI resolve timed out (%ss) — using candidates",
                     AI_TIMEOUT_S)
         return None
     except Exception as exc:
-        log.warning("[watch] Gemini resolve failed (%s)", type(exc).__name__)
+        log.warning("[watch] AI resolve failed (%s)", type(exc).__name__)
         return None
     match = re.search(r"\{.*\}", raw, re.S)
     if not match:
@@ -794,7 +795,7 @@ async def parse_watch_ai(text: str, grounding: list[dict],
     if gid is not None:
         gid = str(gid)
         if gid not in {str(g["id"]) for g in grounding}:
-            log.warning("[watch] Gemini returned an id outside the grounding list")
+            log.warning("[watch] AI returned an id outside the grounding list")
             return None
     action = data.get("action")
     if action not in ("follow", "unfollow", "detail", "list"):
@@ -809,7 +810,7 @@ async def parse_watch_ai(text: str, grounding: list[dict],
         if cid in {str(c["id"]) for c in (channels or [])}:
             channel_id = cid
         else:
-            log.warning("[watch] Gemini returned a channel id "
+            log.warning("[watch] AI returned a channel id "
                         "outside the channel list")
     return {"game_id": gid, "action": action, "detail": detail,
             "channel_id": channel_id,
@@ -835,7 +836,7 @@ def _match_entries(text: str, grounding: list[dict]) -> list[dict]:
 
 
 # Words that pick the detail level without the AI — checked
-# before Gemini, so "advanced stats" never waits on a model call.
+# before the model call, so "advanced stats" never waits on a model call.
 _ADVANCED_WORDS = ("advanced", "detailed", "full stats", "all stats",
                    "everything", "full detail", "detailed stats")
 _SIMPLE_WORDS = ("simple", "basic", "just goals", "only goals",
@@ -946,8 +947,8 @@ def no_live_sport_message(sport: str) -> str:
 
 
 _SPORT_QUERY_FILLER = {"live", "games", "game", "matches", "match",
-                       "any", "show", "list", "me", "the", "please",
-                       "right", "now", "on", "today", "tonight"}
+                       "any", "show", "list", "me", "the", "a", "an",
+                       "please", "right", "now", "on", "today", "tonight"}
 
 
 def _is_sport_only_query(text: str, sport: str) -> bool:
@@ -1017,10 +1018,10 @@ def _wants_list(text: str) -> bool:
 async def resolve_watch(text: str, model, channels: list[dict] | None = None) -> dict:
     """Resolve free text to a game — and, when the words name
     one, to a channel and a detail level. Game: game ID first,
-    then exact/unique team-name match, then Gemini on the
+    then exact/unique team-name match, then the AI model on the
     grounding list. Channel: #name / "in <name> channel" first,
-    then Gemini on the channel list. Detail: the words' own
-    keywords first, then Gemini's parsed detail.
+    then the AI model on the channel list. Detail: the words' own
+    keywords first, then the AI model's parsed detail.
     Returns {"game_id"|None, "action", "detail"|None,
     "channel"|None, "channel_id"|None, "channel_named"|None,
     "candidates", "entry"|None, "source", "games", "suggestions",

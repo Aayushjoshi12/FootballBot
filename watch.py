@@ -223,9 +223,11 @@ _ANALYTICS_LABELS = {"Possession %": "Possession", "Corner": "Corners"}
 
 # One stat row's split bar: 10 blocks, home share filled.
 # Discord does not render markdown tables, so the old pipe
-# table showed up as raw text — the analytics stats now render
-# as aligned rows in a monospace block instead: label, home
-# value, a bar showing who is on top, away value.
+# table showed up as raw text. The first bar layout (one long
+# line per stat: label + values + bar) wrapped mid-row on
+# narrow phone screens, splitting the numbers from their bar —
+# so each stat now gets TWO short lines: the label, then home
+# value, bar, away value.
 _STAT_BAR_LEN = 10
 _STAT_BAR_FULL = "█"
 _STAT_BAR_EMPTY = "░"
@@ -258,10 +260,18 @@ def _stat_display_value(name: str, value) -> str:
 
 
 def format_analytics_stats(stats: list[dict] | None) -> list[str]:
-    """The analytics stat block, in display order: one aligned
-    row per stat inside a monospace block, so the columns hold
-    in Discord. Stats the feed sends that are not numbers get a
-    plain row with no bar. Returns [] when there are no stats."""
+    """The analytics stat block, in display order: TWO lines per
+    stat inside a monospace block — the label on its own line,
+    then home value, a 10-block split bar, away value on the
+    next line. One long line per stat (label + values + bar)
+    wrapped mid-row on narrow phone screens, so the home value
+    landed on the label line and the bar + away value dropped
+    below it — the numbers no longer sat with their bar and
+    nobody could tell which side they belonged to. Two short
+    lines cannot wrap into nonsense: every value line is ~22
+    characters. Stats the feed sends that are not numbers get a
+    plain value line with no bar. Returns [] when there are no
+    stats."""
     rows = []
     for s in stats or []:
         name = str(s.get("name", ""))
@@ -274,14 +284,13 @@ def format_analytics_stats(stats: list[dict] | None) -> list[str]:
         rows.append((label, home, away, bar))
     if not rows:
         return []
-    lw = max(len(r[0]) for r in rows)
     lines = ["```"]
     for label, home, away, bar in rows:
+        lines.append(label)
         if bar is None:
-            lines.append(f"{label:<{lw}}  {home} — {away}")
+            lines.append(f"{home} — {away}")
         else:
-            lines.append(
-                f"{label:<{lw}}  {home:>5}  {bar}  {away:<5}".rstrip())
+            lines.append(f"{home:>4}  {bar}  {away:<4}".rstrip())
     lines.append("```")
     return lines
 
@@ -305,6 +314,12 @@ def render_analytics(d: dict, momentum: str | None = None,
     if ordered:
         lines.append("")
         lines.append("**📊 Match statistics**")
+        # Name the sides once, right above the block: the left
+        # number on every value line is the home team, the right
+        # one the away team. Without this, two bare numbers
+        # under a bar say nothing about which side they belong to.
+        lines.append(
+            f"Home: {d.get('home', '?')} · Away: {d.get('away', '?')}")
         lines.extend(format_analytics_stats([by_name[n] for n in ordered]))
     else:
         lines.append("")

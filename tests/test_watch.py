@@ -993,8 +993,11 @@ class TestAiWatchAll(unittest.IsolatedAsyncioTestCase):
 
 class TestRenderAnalytics(unittest.TestCase):
     """The Advanced analytics view: the old markdown pipe table
-    rendered as raw text in Discord — the stats now render as
-    aligned rows with a split bar in a monospace block."""
+    rendered as raw text in Discord, and the first bar layout
+    (one long line per stat) wrapped mid-row on narrow screens.
+    The stats now render as TWO short lines per stat in a
+    monospace block — label, then home value + bar + away value
+    — with the teams named in a Home/Away header above it."""
 
     def setUp(self):
         g = _load("games1x2.json")[0]
@@ -1025,20 +1028,48 @@ class TestRenderAnalytics(unittest.TestCase):
         self.assertNotIn("|---|", text)
         self.assertNotIn("| Possession", text)
 
-    def test_stat_block_is_aligned_with_bars(self):
+    def test_stat_block_is_two_lines_per_stat(self):
         text = wmod.render_analytics(self.detail)
         self.assertIn("```", text)
         self.assertIn("█", text)
         self.assertIn("░", text)
         # Possession 40/60: 4 of 10 blocks filled.
         self.assertIn("████░░░░░░", text)
-        # Every row inside the block has the same shape: label,
-        # home value, a 10-block bar, away value.
+        # Two lines per stat: a label line, then a value line
+        # carrying home value, the 10-block bar and away value
+        # together — the one-long-line layout wrapped mid-row on
+        # narrow screens and split the numbers from their bar.
         block = text.split("```")[1]
-        rows = [r for r in block.strip().split("\n") if r.strip()]
-        self.assertEqual(len(rows), 10)
-        for row in rows:
-            self.assertRegex(row, r"[█░]{10}")
+        lines = [r for r in block.strip().split("\n") if r.strip()]
+        self.assertEqual(len(lines), 20)  # 10 stats x 2 lines
+        for i in range(0, len(lines), 2):
+            label, values = lines[i], lines[i + 1]
+            self.assertNotIn("█", label)
+            self.assertNotIn("░", label)
+            self.assertRegex(values, r"[█░]{10}")
+        # The Possession value line holds home, bar and away
+        # on the SAME line.
+        idx = lines.index("Possession")
+        self.assertIn("40%", lines[idx + 1])
+        self.assertIn("████░░░░░░", lines[idx + 1])
+        self.assertIn("60%", lines[idx + 1])
+
+    def test_no_line_in_the_block_can_wrap(self):
+        # Narrow phone screens wrap long lines mid-row; every
+        # line in the stat block stays short enough to fit.
+        text = wmod.render_analytics(self.detail)
+        block = text.split("```")[1]
+        for line in block.strip().split("\n"):
+            self.assertLessEqual(len(line), 32, line)
+
+    def test_header_names_home_and_away_teams(self):
+        # The two numbers on a value line are home then away —
+        # the header says which team is which, once, above the
+        # block.
+        text = wmod.render_analytics(self.detail)
+        home, away = self.detail["home"], self.detail["away"]
+        self.assertIn(f"Home: {home}", text)
+        self.assertIn(f"Away: {away}", text)
 
     def test_non_numeric_stat_renders_without_bar(self):
         detail = dict(self.detail)
@@ -1048,11 +1079,10 @@ class TestRenderAnalytics(unittest.TestCase):
         text = wmod.render_analytics(detail)
         self.assertIn("Man of the match", text)
         block = text.split("```")[1]
-        plain = [r for r in block.split("\n")
-                 if "Man of the match" in r]
-        self.assertEqual(len(plain), 1)
-        self.assertNotIn("█", plain[0])
-        self.assertNotIn("░", plain[0])
+        lines = [r for r in block.strip().split("\n") if r.strip()]
+        idx = lines.index("Man of the match")
+        self.assertNotIn("█", lines[idx + 1])
+        self.assertNotIn("░", lines[idx + 1])
         # The numeric row still has its bar.
         self.assertIn("█████░░░░░", text)
 

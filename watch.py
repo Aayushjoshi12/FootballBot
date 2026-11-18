@@ -1513,13 +1513,19 @@ async def remove_watch(channel_id: int, game_id: str) -> dict | None:
     return entry
 
 
-async def list_channel_watches(channel_id: int) -> list[dict]:
+async def list_channel_watches(channel_id: int,
+                               include_view_only: bool = False) -> list[dict]:
+    """Rows for /watching, /unwatch and /notifications. By
+    default only games with alerts on; with include_view_only
+    every watched game in the channel, including view-only /game
+    panels (they still tick). Every row carries its "notify"
+    flag so the caller can show alerts on/off."""
     rows = await db.list_watches(channel_id)
     out = []
     for row in rows:
-        # View-only /game panels are not watches — /watching and
-        # /unwatch only ever see games with alerts on.
-        if not row.get("notify", 1):
+        # View-only /game panels are not alert watches — they
+        # are left out unless the caller asked for all of them.
+        if not include_view_only and not row.get("notify", 1):
             continue
         try:
             snapshot = json.loads(row.get("snapshot") or "{}")
@@ -1530,8 +1536,22 @@ async def list_channel_watches(channel_id: int) -> list[dict]:
             "away": row.get("away", ""), "league": row.get("league", ""),
             "detail": row.get("detail") or DETAIL_SIMPLE,
             "snapshot": snapshot,
+            "notify": bool(row.get("notify", 1)),
         })
     return out
+
+
+# Statuses whose panel is live and refreshing right now — the
+# same set /game uses to decide a reply becomes a panel.
+_PANEL_LIVE_STATUSES = ("1H", "2H", "ET", "PEN", "HT", "Live",
+                        "1st innings", "2nd innings")
+
+
+def is_panel_live(status) -> bool:
+    """True when a watch's snapshot status means its panel is
+    live and refreshing (as opposed to an upcoming game, whose
+    panel has not started yet)."""
+    return str(status or "") in _PANEL_LIVE_STATUSES
 
 
 def live_line(d: dict) -> str:
@@ -1649,35 +1669,46 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
 # Every panel gets its edit on every tick (see
 # _schedule_panel_edits): the tick hands each panel's fresh
 # detail to that panel's worker task, content changes first,
-# and the workers space the edits 0.35s apart per channel.
-# The old design called _refresh_panel inline, one panel after
-# another, and its stagger gate let only ONE panel per channel
-# edit per tick — with four panels in one channel each panel's
-# Updated footer only advanced about every 4s, which is exactly
-# what the user saw. A worker always edits the FRESHEST pending
-# detail, so a panel never reverts to a stale score.
-_PANEL_HEARTBEAT_S = 1.0
+# and the workers take 1s-spaced edit slots per channel (see
+# _CHANNEL_EDIT_GAP_S below) — 1 game refreshes every 1s, 2
+# games every 2s each, 3 every 3s, 4 every 4s. The old design
+# called _refresh_panel inline, one panel after another, and
+# its stagger gate let only ONE panel per channel edit per tick
+# — with four panels in one channel each panel's Updated footer
+# only advanced about every 4s, which is exactly what the user
+# saw. A worker always edits the FRESHEST pending detail, so a
+# panel never reverts to a stale score.
+# 0.9s, not 1.0s: the channel slots are 1.0s apart, and a gate
+# at exactly 1.0s would refuse a slot-timed heartbeat that
+# lands a few ms early — halving a quiet panel's cadence.
+_PANEL_HEARTBEAT_S = 0.9
 # Analytics momentum stays on its old 30s cadence — it is a db
 # read, not a visible edit, and nothing about it needs to move
 # every second.
 _PANEL_MOMENTUM_REFRESH_S = 30.0
-# Panel edits: at most one per second per panel (the tick itself),
-# and a 429 pauses that panel until the retry time — the same
-# discipline as the scoreboard's edits, but the ticking clock
-# needs the panel to update as fast as the tick allows.
-_PANEL_MIN_EDIT_GAP_S = 1.0
-# Channel stagger: at most one panel edit per channel per 0.35s,
-# so several panels ticking in one channel never fire in the
-# same instant. The stagger is a SPACING, not a skip: a panel
-# whose slot has not come yet waits for it (in its worker) instead
-# of being deferred to the next tick. A lone panel still edits
-# every second; a crowded channel shares the spacing.
-_CHANNEL_EDIT_GAP_S = 0.35
+# Panel edits: the channel slots below are the real pacer, so
+# this is only a guard against true bursts (a button tap and a
+# tick edit landing together). 0.5s, not 1.0s: a gate at exactly
+# 1.0s would refuse a slot-timed edit that lands a few ms early.
+# A 429 pauses that panel until the retry time — the same
+# discipline as the scoreboard's edits.
+_PANEL_MIN_EDIT_GAP_S = 0.5
+# Channel edit slots: one panel edit per channel per second —
+# exactly Discord's sustained per-channel edit budget (5 per
+# 5s, refilling 1/s). The slots divide the budget evenly: 1
+# live game refreshes every 1s, 2 games every 2s each, 3 every
+# 3s, 4 every 4s. The old 0.35s spacing tried to edit faster
+# than the budget, so Discord 429'd about half the attempts and
+# the retry pauses wasted the rest (the VM journal showed only
+# 38 edits/min for 2 panels instead of ~60). A panel whose slot
+# has not come yet waits for it (in its worker) instead of being
+# deferred to the next tick.
+_CHANNEL_EDIT_GAP_S = 1.0
 _channel_last_edit: dict[int, float] = {}
 # Per-channel edit slot timeline: the monotonic time at which the
 # channel's next panel edit may fire. Workers take slots from it
 # (each slot is _CHANNEL_EDIT_GAP_S after the previous one), so
-# edits in one channel form a continuous 0.35s-spaced stream
+# edits in one channel form a continuous 1s-spaced stream
 # across ticks. _refresh_panel also advances it on any successful
 # edit, so a button tap and a tick edit never collide.
 _channel_next_slot: dict[int, float] = {}
@@ -1928,10 +1959,11 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
 
 async def delete_panel_message(bot: discord.Client | None,
                                channel_id: int, game_id: str) -> bool:
-    """Delete a watch's panel message — used when a watch is
-    stopped on purpose (/unwatch, the 🔕 button, /watch unfollow).
-    Best-effort, never raises. Terminal watches keep their panel
-    (it shows the final score), so on_tick never calls this."""
+    """Delete a watch's panel message — used by /unwatch, the
+    full remove. Best-effort, never raises. Terminal watches
+    keep their panel (it shows the final score), so on_tick
+    never calls this; the 🔕 Unfollow button never calls it
+    either (notifications-only, panel keeps ticking)."""
     if bot is None:
         return False
     watch = _watches.get((channel_id, str(game_id)))
@@ -2018,8 +2050,9 @@ async def _switch_panel_view(interaction: discord.Interaction,
       code, or a second /game reply) and edited in place to the
       new view.
     - The button sits on any other message (an alert): the real
-      panel is switched in place and the tap gets a short
-      ephemeral confirm.
+      panel is switched in place, silently — the panel changing
+      IS the feedback. No ephemeral confirm: one per tap stacked
+      identical "Live panel updated." replies in the user's chat.
     - No panel anywhere: the old ephemeral snapshot — there is
       nothing live to update.
     - An ephemeral message is never adopted as a panel (the tick
@@ -2094,7 +2127,9 @@ async def _switch_panel_view(interaction: discord.Interaction,
         return
     if entry is not None and channel_id is not None:
         # The button sits on an alert: switch the real panel in
-        # place and confirm briefly.
+        # place, silently — the panel changing IS the feedback.
+        # No ephemeral confirm: one per tap stacked identical
+        # "Live panel updated." replies in the user's chat.
         if kind is not None:
             entry["panel_kind"] = kind
         if level is not None:
@@ -2103,8 +2138,6 @@ async def _switch_panel_view(interaction: discord.Interaction,
         bot = getattr(interaction, "client", None)
         if bot is not None:
             await _refresh_panel(bot, channel_id, game_id, entry, detail)
-        await interaction.followup.send(
-            "Live panel updated.", ephemeral=True)
         return
     # No panel anywhere: the old one-off snapshot.
     if kind == "analytics":
@@ -2388,7 +2421,7 @@ def _schedule_panel_edits(bot: discord.Client, details: dict,
     Every panel gets its edit on this tick — content changes
     first, heartbeats after — instead of the old take-turns
     design where the stagger gate let only one panel per channel
-    edit per tick. The workers space the edits 0.35s apart per
+    edit per tick. The workers space the edits 1s apart per
     channel (see _panel_edit_worker), so the tick itself returns
     at once and the scoreboard loop keeps its 1s cadence. A
     panel that already has a worker running just gets fresher
@@ -2411,7 +2444,7 @@ def _schedule_panel_edits(bot: discord.Client, details: dict,
 async def _panel_edit_worker(bot: discord.Client, channel_id: int,
                              key: tuple) -> None:
     """One panel's edit loop. Waits for this channel's next edit
-    slot (0.35s after the previous edit in the channel), then
+    slot (1s after the previous edit in the channel), then
     edits the panel with the FRESHEST pending detail — a newer
     tick may have replaced it while we waited — and loops while
     fresh work keeps arriving. Exits when the watch is gone,
@@ -2473,9 +2506,9 @@ def _maybe_log_panel_cadence() -> None:
     """Once a minute, log how many panels are registered and how
     many tick edits actually landed in the last 60s — the number
     the VM journal can prove the refresh cadence from. (One
-    panel editing every second contributes ~60; four panels in
-    one channel share Discord's per-channel edit budget, so
-    their total is whatever that budget allows.)"""
+    panel editing every second contributes ~60; N panels divide
+    the ~1 edit/sec channel budget evenly, so the total stays
+    ~60/min whatever N is.)"""
     global _panel_log_window_start, _panel_log_edits
     if not _watches:
         _panel_log_window_start = 0.0
@@ -2533,7 +2566,7 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
     # detects its events); the panel refreshes themselves happen
     # in _schedule_panel_edits below, via the per-panel workers
     # — every panel gets its edit on this tick, content changes
-    # first, spaced 0.35s apart per channel.
+    # first, spaced 1s apart per channel.
     details: dict[tuple, dict] = {}
     # Keys whose snapshot moved this tick (a goal, a wicket, a
     # new over — and a football clock, which advances every
@@ -2673,7 +2706,7 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
 
     # Panel refreshes: every panel gets its edit on this tick —
     # content changes first, heartbeats after — via the per-panel
-    # workers, which space the edits 0.35s apart per channel.
+    # workers, which space the edits 1s apart per channel.
     # (The old phase 2 let only one panel per channel edit per
     # tick, so four panels in one channel took turns and each
     # panel's Updated footer only advanced about every 4s.)

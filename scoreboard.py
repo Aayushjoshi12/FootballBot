@@ -387,21 +387,36 @@ async def _fetch_all() -> tuple[list[dict], list[dict], list[dict]]:
 
 
 async def scoreboard_loop(bot: discord.Client) -> None:
-    """Watch 1xBet every second; edit only when the score changes."""
+    """Watch 1xBet every second; edit only when the score changes.
+
+    Strict 1s schedule: each tick STARTS exactly `interval`
+    after the previous tick STARTED — not `interval` after it
+    finished. The old shape (fetch, work, then sleep 1s) drifted
+    by the fetch latency on every tick, so its period was ~1.3s
+    and a single live panel edited ~46 times a minute instead
+    of ~60 — /game did not refresh at 1 second. On an overrun
+    the next tick starts at once (no catch-up burst); the panel
+    workers still space edits 1s apart per channel, so a fast
+    tick can never produce two identical whole-second footers
+    in a row."""
     global last_tick_ts, last_good_tick_ts, _stale_episode, _last_cleanup_ts
     log.info("[scoreboard] watch started (1s poll, edits only on change)")
     await bot.wait_until_ready()
     interval = WATCH_SECONDS
     empty_ticks = 0
+    loop = asyncio.get_running_loop()
+    next_tick = loop.time()
     while not bot.is_closed():
+        await asyncio.sleep(max(0.0, next_tick - loop.time()))
+        tick_start = loop.time()
         try:
             if await maintenance.is_on():
                 # Silent: no fetch, no edits, no watches. The loop
-                # keeps sleeping so a resume picks up at once; the
-                # tick timestamp still moves so /health does not
+                # keeps its cadence so a resume picks up at once;
+                # the tick timestamp still moves so /health does not
                 # report a false stale episode after a resume.
                 last_tick_ts = time.monotonic()
-                await asyncio.sleep(interval)
+                next_tick = tick_start + interval
                 continue
             npl, games, raw = await _fetch_all()
             last_tick_ts = time.monotonic()
@@ -467,7 +482,7 @@ async def scoreboard_loop(bot: discord.Client) -> None:
         except Exception as exc:
             log.error("[scoreboard] tick failed (%s); continuing",
                       type(exc).__name__)
-        await asyncio.sleep(interval)
+        next_tick = tick_start + interval
 
 
 def ensure_running(bot: discord.Client) -> None:

@@ -257,7 +257,7 @@ async def cmd_help(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="👀 Follow a game", value=(
         "`/watch` — follow a game; its panel ticks live, alerts on goals, wickets and cards\n"
-        "`/unwatch` — stop alerts for a game (its live panel keeps ticking)\n"
+        "`/unwatch` — remove a game (its live panel and alerts stop)\n"
         "`/watching` — games this channel follows\n"
         "`/notifications` — manage alerts for watched games\n"
         "`/history` — past matches and alerts that were sent"
@@ -825,11 +825,12 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
 
 
 # ── /unwatch ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="unwatch", description="Stop following a game in this channel")
+@bot.tree.command(name="unwatch", description="Remove a game — its live panel and alerts stop")
 @app_commands.describe(game="Game ID or team name")
 async def cmd_unwatch(interaction: discord.Interaction, game: str):
     await interaction.response.defer(ephemeral=True)
-    rows = await watch.list_channel_watches(interaction.channel_id)
+    rows = await watch.list_channel_watches(interaction.channel_id,
+                                            include_view_only=True)
     q = (game or "").strip()
     picked = None
     if q.isdigit():
@@ -851,14 +852,20 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
             f"No watched game matches '{game}' in this channel. "
             "Use `/watching` to see what is watched here.", ephemeral=True)
         return
-    # Unfollow stops the alerts; the live panel keeps ticking in
-    # place while the game is live.
-    entry = await watch.set_notify(
-        interaction.channel_id, picked["game_id"], False)
+    # Full remove — not just alerts off. The panel stops
+    # ticking, its message is deleted (best effort), and the
+    # watch leaves the DB. This is the /unwatch command only:
+    # the 🔕 Unfollow button stays notifications-only (the
+    # panel keeps ticking), and /watch's unfollow action too.
+    await watch.delete_panel_message(
+        getattr(interaction, "client", None),
+        interaction.channel_id, picked["game_id"])
+    entry = await watch.remove_watch(
+        interaction.channel_id, picked["game_id"])
     if entry:
         await interaction.followup.send(
-            f"🔕 Stopped following **{entry['home']} vs {entry['away']}** — "
-            f"the live panel keeps ticking here while the game is live.",
+            f"🗑️ Removed **{entry['home']} vs {entry['away']}** — "
+            f"it is no longer refreshing in this channel.",
             ephemeral=True)
     else:
         await interaction.followup.send("That watch is already gone.", ephemeral=True)
@@ -867,22 +874,51 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
 # ── /watching ─────────────────────────────────────────────────────────────────
 @bot.tree.command(name="watching", description="Games this channel is following")
 async def cmd_watching(interaction: discord.Interaction):
-    rows = await watch.list_channel_watches(interaction.channel_id)
+    rows = await watch.list_channel_watches(interaction.channel_id,
+                                            include_view_only=True)
     if not rows:
         await interaction.response.send_message(
             "No games watched in this channel. Use `/watch <game>` to follow one.",
             ephemeral=True)
         return
-    lines = ["👀 **Watched games in this channel**\n"]
+    # How many are actually refreshing: the live panels share
+    # Discord's ~1 edit/sec channel budget evenly — 1 game
+    # refreshes every second, 2 every 2s each, and so on.
+    live = [r for r in rows
+            if watch.is_panel_live((r.get("snapshot") or {}).get("status"))]
+    n = len(live)
+    if n:
+        each = "every second" if n == 1 else f"every {n}s"
+        lines = [f"👀 **{n} game{'s' if n > 1 else ''} refreshing in this "
+                 f"channel — each about {each}**\n"]
+    else:
+        lines = [f"👀 **No games refreshing yet** — {len(rows)} watched, "
+                 f"starting later\n"]
     for r in rows:
         snap = r.get("snapshot") or {}
         score = ""
         hs, aws = snap.get("home_score"), snap.get("away_score")
         if hs not in (None, "") or aws not in (None, ""):
             score = f" — {hs or '?'}–{aws or '?'}"
-        clock = f" · {snap.get('clock')}" if snap.get("clock") else ""
-        lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} "
-                     f"({r['detail']}, ID `{r['game_id']}`)")
+        cricket = snap.get("cricket") or {}
+        if cricket.get("is_break"):
+            clock = " · Innings break"
+        elif cricket.get("over_str"):
+            clock = f" · {cricket['over_str']} ov"
+        elif snap.get("clock"):
+            clock = f" · {snap['clock']}"
+        else:
+            clock = ""
+        alerts = "🔔 alerts on" if r.get("notify") else "🔕 alerts off"
+        if watch.is_panel_live(snap.get("status")):
+            each = "every second" if n == 1 else f"every {n}s"
+            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
+                         f"{each} · {alerts} "
+                         f"({r['detail']}, ID `{r['game_id']}`)")
+        else:
+            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
+                         f"not refreshing yet · {alerts} "
+                         f"({r['detail']}, ID `{r['game_id']}`)")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 

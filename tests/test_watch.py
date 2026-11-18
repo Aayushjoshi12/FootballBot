@@ -2682,6 +2682,37 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertIn("67:00", interaction.followup.sent[0])
         self.assertEqual(len(interaction.edited), 0)
 
+    async def test_detail_button_on_alert_is_silent(self):
+        # Reproduction of the user's screenshot (18 Nov, four
+        # identical ephemeral "Live panel updated." replies at
+        # 06:34 PM): one tap on an alert message must switch
+        # the real panel in place and send NOTHING — the panel
+        # changing IS the feedback. Before the fix this tap
+        # sends one ephemeral per tap, so repeated taps stack
+        # identical replies.
+        channel = FakeChannel()
+        bot = FakeBot(channel)
+        detail = self.detail
+        body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(2001, body)
+        channel.messages[2001] = msg
+        self._seed_watch()
+        watch = wmod._watches[(777, "771747666")]
+        watch["panel_message_id"] = 2001
+        watch["panel_body"] = body
+        watch["panel_base_body"] = body
+        watch["panel_kind"] = "compact"
+        alert = ("⚽ **GOAL** — Republic of the Gambia 1–1 Ivory Coast (67')\n"
+                 "Game ID: 771747666")
+        view = self._view()
+        interaction = self._interaction("watch:detail", content=alert)
+        interaction.client = bot
+        with self._mock_search(detail):
+            await view.children[0].callback(interaction)
+        self.assertEqual(len(msg.edits), 1)
+        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
+
     async def test_timeline_lists_events(self):
         view = self._view()
         interaction = self._interaction("panel:timeline")
@@ -2865,7 +2896,12 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         await _drain_panel_workers()
         self.assertEqual(len(self.channel.sent), 1)
         self.assertEqual(len(panel.edits), 1)
-        self.assertIn("67:05", panel.edits[0])
+        # The clock advanced ~5s — plus up to ~1s of channel-slot
+        # wait before the render — so it reads 67:05 or 67:06.
+        # (With the old 0.35s slot it always landed on 67:05.)
+        self.assertTrue(any(c in panel.edits[0]
+                            for c in ("67:05", "67:06")),
+                        panel.edits[0])
 
     async def test_goal_sends_alert_and_edits_panel(self):
         self._seed_watch(with_panel=True)
@@ -3124,7 +3160,8 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
     place every second (score + MM:SS clock), no new messages for
     routine changes. Follow controls notifications only; Unfollow
     stops the alerts and the panel keeps ticking until full-time.
-    Several panels in one channel take turns editing."""
+    Several panels in one channel share Discord's ~1 edit/sec
+    budget evenly: 1 game every 1s, 2 every 2s each, and so on."""
 
     def setUp(self):
         self._orig_db = db._DB
@@ -3343,10 +3380,11 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
 
     async def test_channel_edits_are_staggered(self):
         # Two panels ticking in one channel: one tick edits BOTH
-        # of them — but spaced 0.35s apart, never in the same
-        # instant. (The old take-turns design edited only one per
-        # tick, so each panel refreshed every ~2s with two panels
-        # and ~4s with four.)
+        # of them — but spaced 1s apart (one channel edit slot
+        # per second), never in the same instant. (The old
+        # take-turns design edited only one per tick, so each
+        # panel refreshed every ~2s with two panels and ~4s with
+        # four.)
         a = self._seed_panel_for_raw(0, 2001, "771747666")
         b = self._seed_panel_for_raw(2, 2002, "771750037")
         stamps = []
@@ -3369,7 +3407,7 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(b.edits), 1)
         self.assertEqual(len(stamps), 2)
         # Spaced, not simultaneous: the second edit lands about
-        # 0.35s after the first.
+        # 1s after the first (one channel edit slot per second).
         self.assertGreaterEqual(stamps[1][1] - stamps[0][1], 0.30)
         self.assertLess(stamps[1][1] - stamps[0][1], 2.0)
 
@@ -3404,8 +3442,8 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         # one whose clock has genuinely moved (a real content
         # change, but no goal — so no alert is sent). The content
         # change lands FIRST, and the idle panel's heartbeat lands
-        # on the SAME tick, right after it (spaced 0.35s apart)
-        # instead of waiting for the next tick.
+        # on the SAME tick, right after it (one channel edit slot
+        # per second) instead of waiting for the next tick.
         idle = self._seed_game_panel()
         stale = self._seed_panel_for_raw(4, 2002, "771747706")
         stamps = []
@@ -3718,13 +3756,16 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         interaction.client = self.bot
         with self._mock_search(self._detail()):
             await view.children[1].callback(interaction)
-        # The real panel switched to the compact line, in place.
+        # The real panel switched to the compact line, in place —
+        # and the tap sent NOTHING. The old code answered every
+        # tap with an ephemeral "Live panel updated.", so
+        # repeated taps stacked identical replies (the user's
+        # screenshot: four of them at 06:34 PM).
         self.assertEqual(len(msg.edits), 1)
         self.assertIn("🔴 LIVE", msg.edits[0])
         self.assertIn("10.5 ov", msg.edits[0])
         self.assertNotIn("Match stats", msg.edits[0])
-        self.assertEqual(interaction.followup.sent,
-                         ["Live panel updated."])
+        self.assertEqual(interaction.followup.sent, [])
         self.assertEqual(interaction.edited, [])
 
     async def test_ephemeral_card_is_never_adopted(self):
@@ -3764,7 +3805,9 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
     is 4 panels in one channel, which used to take turns (one
     edit per tick), so each panel's Updated footer only advanced
     about every 4s. Now the tick schedules an edit for every
-    panel on every tick, spaced 0.35s apart in the channel."""
+    panel on every tick, spaced 1s apart in the channel (one
+    edit/sec/channel, Discord's sustained budget), so 1 game
+    refreshes every 1s, 2 every 2s each, and so on."""
 
     def setUp(self):
         self._orig_db = db._DB
@@ -3796,12 +3839,12 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
             p.unlink()
         self._tmp.rmdir()
 
-    def _seed_four(self, bucket=None):
+    def _seed_four(self, bucket=None, count=4):
         """Four compact panels in one channel (the user's
         mix: one football, three cricket), all with stale
         bodies so the next tick wants to edit them."""
         msgs = []
-        for idx in range(4):
+        for idx in range(count):
             raw = self.games1x2[idx]
             detail = prov._onex_detail_from_raw(raw)
             game_id = str(raw["id"])
@@ -3894,44 +3937,95 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         await _drain_panel_workers()
         self.assertEqual(len(msgs[1].edits), 1)
 
-    async def test_measured_cadence_under_discord_bucket(self):
-        # The honest limit: Discord's per-channel edit bucket
-        # (5 edits per 5s, refilling 1/s) caps what 4 panels in
-        # one channel can do. With the bucket in place the bot
-        # attempts every panel every tick — but the bucket only
-        # grants ~1 edit/sec, so each panel lands about every
-        # 3-4s and none is starved. (Without the bucket — the
-        # 0.35s stagger only — all 4 land on every tick; see
-        # test_four_panels_all_edit_every_tick.)
+    async def test_refresh_budget_divides_evenly(self):
+        # The user's rule: 1 game refreshes every 1s, 2 games
+        # every 2s each, 3 every 3s, 4 every 4s. The channel
+        # slots are 1s apart — exactly Discord's sustained
+        # per-channel edit budget — so attempts never exceed
+        # the bucket: every scheduled edit lands, no 429s, and
+        # the total stays ~60 edits/min whatever N is. Measured
+        # in real time against the fake bucket, which refills
+        # from the wall clock between ticks. (The old 0.35s
+        # spacing tried to edit faster than the budget: 80
+        # attempts, only ~24 granted, the rest 429'd — and the
+        # VM journal showed only 38 edits/min for 2 panels.)
+        for n, ticks in ((1, 3), (2, 3), (3, 2), (4, 2)):
+            await _cancel_panel_workers()
+            wmod._watches = {}
+            wmod._channel_next_slot.clear()
+            wmod._channel_last_edit.clear()
+            bucket = FakeBucket()
+            msgs = self._seed_four(bucket=bucket, count=n)
+            for msg in msgs:
+                msg.edit_times = []
+                orig_edit = msg.edit
+
+                async def _timed_edit(*args, _orig=orig_edit,
+                                      _msg=msg, **kwargs):
+                    _msg.edit_times.append(time.monotonic())
+                    return await _orig(*args, **kwargs)
+
+                msg.edit = _timed_edit
+            clock = {"n": 0}
+            last = time.monotonic()
+            with patch.object(
+                    wmod, "now_npt_str",
+                    side_effect=lambda: self._ticking_time(clock)):
+                for _ in range(ticks):
+                    now = time.monotonic()
+                    # Refill for the whole previous tick — on_tick
+                    # AND the drain that waited for the 1s slots —
+                    # not just the gap between ticks, or the bucket
+                    # starves and 429s edits that are due.
+                    bucket.advance(now - last)
+                    last = now
+                    await wmod.on_tick(self.bot, self.games1x2)
+                    await _drain_panel_workers(timeout=10.0)
+            total = sum(len(m.edits) for m in msgs)
+            # Every scheduled edit landed — no 429 denied any.
+            self.assertEqual(total, n * ticks)
+            for msg in msgs:
+                self.assertEqual(len(msg.edits), ticks)
+                gaps = [b - a for a, b in
+                        zip(msg.edit_times, msg.edit_times[1:])]
+                for gap in gaps:
+                    # Each panel's edits are ~n seconds apart.
+                    self.assertAlmostEqual(gap, n, delta=0.75)
+            self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_single_panel_refreshes_every_second_for_60_ticks(self):
+        # The hard requirement: with exactly ONE live panel in a
+        # channel, /game MUST refresh at 1 second — ~60 edits
+        # across 60 ticks, no skipped ticks. This runs in real
+        # time (~60s): each tick's worker waits for its 1s
+        # channel slot, so the drain after every tick lands about
+        # a second after the previous one. The fake bucket refills
+        # from the measured wall time between ticks, and the fake
+        # clock advances one second per render, so no two
+        # consecutive footers can ever be identical. At most 1-2
+        # edits may be missed to scheduling slack; the exact
+        # count is reported in the failure message.
         bucket = FakeBucket()
-        msgs = self._seed_four(bucket=bucket)
+        msgs = self._seed_four(bucket=bucket, count=1)
         clock = {"n": 0}
-        # The gaps are patched to 0 (the fake clock advances a
-        # second per tick, so the 1s min-gap/heartbeat would
-        # otherwise block every tick) — but last_panel_edit is
-        # deliberately NOT reset: a panel the bucket denied keeps
-        # its old timestamp, so the oldest-first order rotates
-        # the grants instead of letting the first panels hog them.
-        with patch.object(wmod, "now_npt_str",
-                          side_effect=lambda: self._ticking_time(clock)), \
-                patch.object(wmod, "_CHANNEL_EDIT_GAP_S", 0.0), \
-                patch.object(wmod, "_PANEL_MIN_EDIT_GAP_S", 0.0), \
-                patch.object(wmod, "_PANEL_HEARTBEAT_S", 0.0):
-            for _ in range(20):
-                bucket.advance(1.0)
-                for watch in wmod._watches.values():
-                    watch["panel_blocked_until"] = 0.0
-                wmod._channel_last_edit.clear()
-                wmod._channel_next_slot.clear()
+        last = time.monotonic()
+        with patch.object(
+                wmod, "now_npt_str",
+                side_effect=lambda: self._ticking_time(clock)):
+            for _ in range(60):
+                now = time.monotonic()
+                # Refill for the whole previous tick — on_tick AND
+                # the drain that waited for the 1s slot — not just
+                # the gap between ticks, or the bucket starves.
+                bucket.advance(now - last)
+                last = now
                 await wmod.on_tick(self.bot, self.games1x2)
-                await _drain_panel_workers()
-        total = sum(len(m.edits) for m in msgs)
-        # 80 attempts, ~24 granted: the bucket, not the bot, is
-        # the limit — and no panel is starved.
-        self.assertGreaterEqual(total, 15)
-        self.assertLessEqual(total, 25)
-        for msg in msgs:
-            self.assertGreaterEqual(len(msg.edits), 3)
+                await _drain_panel_workers(timeout=10.0)
+        total = len(msgs[0].edits)
+        print(f"[60-tick] single panel edits: {total}/60")
+        self.assertGreaterEqual(
+            total, 58,
+            f"single panel edited only {total}/60 ticks")
         self.assertEqual(len(self.channel.sent), 0)
 
     async def test_per_minute_panel_log_line(self):
@@ -3964,6 +4058,180 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         finally:
             wmod.log.removeHandler(handler)
             wmod.log.setLevel(old_level)
+
+
+class TestWatchingAndUnwatch(unittest.IsolatedAsyncioTestCase):
+    """/watching shows how many games are refreshing and how
+    fast each one is; /unwatch fully removes a game (panel
+    deleted, watch gone, never ticks again). The 🔕 Unfollow
+    button stays notifications-only — it is not /unwatch."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp9"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._channel_last_edit.clear()
+        wmod._channel_next_slot.clear()
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _detail(self, idx=0):
+        return prov._onex_detail_from_raw(self.games1x2[idx])
+
+    def _snap(self, idx=0):
+        detail = self._detail(idx)
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        return detail, snap
+
+    async def _add_row(self, idx, game_id, notify=True, level="simple",
+                       kind="compact", snapshot=None):
+        detail, snap = self._snap(idx)
+        await db.add_watch(777, game_id, detail["home"], detail["away"],
+                           detail.get("league", ""), level, "",
+                           snapshot if snapshot is not None else snap,
+                           notify=notify, panel_kind=kind)
+        return detail, snap
+
+    def _seed_panel(self, idx, mid, game_id, notify=True, kind="compact"):
+        detail, snap = self._snap(idx)
+        if kind == "detail":
+            body = wmod.render_detail(detail, wmod.DETAIL_SIMPLE)
+        else:
+            body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(mid, body)
+        self.channel.messages[mid] = msg
+        wmod._watches[(777, game_id)] = {
+            "home": detail["home"], "away": detail["away"],
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": str(detail.get("format") or ""), "snapshot": snap,
+            "missing": 0, "notify": notify, "panel_kind": kind,
+            "panel_message_id": mid, "panel_body": body,
+            "panel_base_body": body, "panel_static": {},
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        return msg
+
+    async def test_watching_shows_count_intervals_and_alerts(self):
+        import bot as botmod
+        _, snap0 = await self._add_row(0, "771747666", notify=True)
+        detail1, snap1 = await self._add_row(
+            1, "771739998", notify=False, level="advanced", kind="detail")
+        up_snap = wmod.snapshot_from_detail({
+            "home": "Lumbini Lions", "away": "Kathmandu Gurkhas",
+            "home_score": None, "away_score": None, "status": "upcoming",
+            "clock": "", "stats": None, "cricket": None})
+        await db.add_watch(777, "771747118", "Lumbini Lions",
+                           "Kathmandu Gurkhas", "Nepal Premier League",
+                           "simple", "", up_snap, notify=True,
+                           panel_kind="compact")
+        interaction = FakeInteraction(channel_id=777)
+        await botmod.cmd_watching.callback(interaction)
+        text = interaction.response.sent[0]
+        # Header: 2 live games refreshing, each about every 2s.
+        self.assertIn("2 games refreshing in this channel", text)
+        self.assertIn("each about every 2s", text)
+        # Football row: score, clock, interval, alerts on.
+        self.assertIn("Republic of the Gambia", text)
+        self.assertIn(f"{snap0['home_score']}–{snap0['away_score']}", text)
+        self.assertIn(snap0["clock"], text)
+        self.assertIn("every 2s", text)
+        self.assertIn("🔔 alerts on", text)
+        # Cricket row (a view-only /game panel): overs, alerts off.
+        self.assertIn(detail1["home"], text)
+        self.assertIn(f"{snap1['cricket']['over_str']} ov", text)
+        self.assertIn("🔕 alerts off", text)
+        # Upcoming row: clearly not refreshing yet.
+        self.assertIn("Lumbini Lions", text)
+        self.assertIn("not refreshing yet", text)
+
+    async def test_watching_single_game_refreshes_every_second(self):
+        import bot as botmod
+        await self._add_row(0, "771747666", notify=True)
+        interaction = FakeInteraction(channel_id=777)
+        await botmod.cmd_watching.callback(interaction)
+        text = interaction.response.sent[0]
+        self.assertIn("1 game refreshing in this channel", text)
+        self.assertIn("every second", text)
+
+    async def test_unwatch_removes_watch_and_deletes_panel(self):
+        import bot as botmod
+        await self._add_row(0, "771747666", notify=True)
+        msg = self._seed_panel(0, 2001, "771747666", notify=True)
+        interaction = FakeInteraction(channel_id=777)
+        interaction.client = self.bot
+        await botmod.cmd_unwatch.callback(interaction, "771747666")
+        self.assertEqual(
+            interaction.followup.sent,
+            ["🗑️ Removed **Republic of the Gambia vs Ivory Coast** — "
+             "it is no longer refreshing in this channel."])
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertEqual(await db.list_watches(777), [])
+        self.assertTrue(msg.deleted)
+        # And it never ticks again: a tick with the game live
+        # posts nothing and edits nothing.
+        await wmod.on_tick(self.bot, self.games1x2)
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_unwatch_removes_view_only_game_panel(self):
+        import bot as botmod
+        # A /game reply (notifications off, no /watch): /unwatch
+        # by team name still fully removes it — deleting the
+        # reply message is the remove.
+        await self._add_row(0, "771747666", notify=False,
+                            level="simple", kind="detail")
+        msg = self._seed_panel(0, 2001, "771747666", notify=False,
+                               kind="detail")
+        interaction = FakeInteraction(channel_id=777)
+        interaction.client = self.bot
+        await botmod.cmd_unwatch.callback(interaction, "Gambia")
+        self.assertIn("Removed", interaction.followup.sent[0])
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertEqual(await db.list_watches(777), [])
+        self.assertTrue(msg.deleted)
+
+    async def test_unfollow_button_still_only_toggles(self):
+        # The 🔕 button is NOT /unwatch: it stops alerts only,
+        # the panel keeps ticking until full-time.
+        detail, _ = await self._add_row(0, "771747666", notify=True)
+        msg = self._seed_panel(0, 2001, "771747666", notify=True)
+        view = wmod.WatchAlertView()
+        interaction = FakeInteraction(
+            message=SimpleNamespace(
+                content=wmod.render_detail(detail, wmod.DETAIL_ADVANCED)),
+            data={"custom_id": "panel:unfollow"})
+        await view.children[7].callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertFalse(wmod._watches[(777, "771747666")]["notify"])
+        self.assertIn("Notifications off", interaction.followup.sent[0])
+        self.assertFalse(msg.deleted)
+        # ...and the panel still ticks on the next tick.
+        await wmod.on_tick(self.bot, self.games1x2)
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 1)
 
 
 if __name__ == "__main__":

@@ -867,7 +867,7 @@ async def _handle_ask(interaction, text: str, model,
             return
         # Unfollow stops the alerts; the live panel keeps ticking
         # in place while the game is live (same rule as the 🔕
-        # button and /unwatch).
+        # button — not /unwatch, which fully removes the game).
         entry = await wmod.set_notify(channel_id, str(game_id), False)
         if entry:
             await _send(interaction,

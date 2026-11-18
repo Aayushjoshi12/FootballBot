@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
+import channel_edits as cemod
 import providers as prov
 import watch as wmod
 
@@ -510,14 +511,16 @@ async def _drain_panel_workers(timeout=5.0):
 
 async def _cancel_panel_workers():
     """Cancel any leftover panel workers (test hygiene: a worker
-    from one test must never edit another test's panel)."""
+    from one test must never edit another test's panel). Also
+    resets the shared edit scheduler — its per-channel worker
+    would otherwise outlive the test's event loop."""
     for task in list(wmod._panel_workers.values()):
         task.cancel()
     if wmod._panel_workers:
         await asyncio.gather(*wmod._panel_workers.values(),
                              return_exceptions=True)
     wmod._panel_workers.clear()
-    wmod._channel_next_slot.clear()
+    await cemod.reset_for_tests()
 
 
 class FakeBucket:
@@ -528,12 +531,17 @@ class FakeBucket:
     advance(1.0) per simulated second — so a 20s measurement
     runs in milliseconds. Default 5 tokens per 5s: Discord's
     standard per-route bucket, which the bot's journal (1
-    edit/sec/channel, never a 429) is consistent with."""
-    def __init__(self, limit=5, window=5.0):
+    edit/sec/channel, never a 429) is consistent with.
+    `now_fn` (a virtual clock) refills the bucket from that
+    clock on every acquire instead — used by the shared-scheduler
+    measurements, where the scheduler's virtual sleeps advance
+    the same clock."""
+    def __init__(self, limit=5, window=5.0, now_fn=None):
         self.limit = limit
         self.window = window
         self.tokens = float(limit)
         self.now = 0.0
+        self.now_fn = now_fn
 
     def advance(self, seconds):
         self.now += seconds
@@ -541,6 +549,10 @@ class FakeBucket:
                           self.tokens + seconds * self.limit / self.window)
 
     def try_acquire(self):
+        if self.now_fn is not None:
+            now = self.now_fn()
+            if now > self.now:
+                self.advance(now - self.now)
         if self.tokens >= 1.0:
             self.tokens -= 1.0
             return True
@@ -557,8 +569,6 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.games1x2 = _load("games1x2.json")
@@ -2257,8 +2267,6 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
         wmod._watches = {}
         wmod._loaded = True
         wmod._barca_last_check = 0.0
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.channel = FakeChannel()
@@ -2469,8 +2477,6 @@ class TestOnTickEngine(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.games1x2 = _load("games1x2.json")
@@ -2816,8 +2822,6 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         wmod._watches = {}
         wmod._loaded = True
         wmod._refresh_cooldown = {}
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.games1x2 = _load("games1x2.json")
@@ -2945,14 +2949,18 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         await wmod.on_tick(self.bot, [changed])
         await _drain_panel_workers()
         # The GOAL alert still goes out (a new message); the panel
-        # edit fails with 429 and the panel is paused, not retried.
+        # edit fails with 429 and the WHOLE channel pauses — the
+        # shared scheduler records the pause, not the panel.
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("GOAL", self.channel.sent[0].content)
         self.assertEqual(len(panel.edits), 0)
-        watch = wmod._watches[(777, "771747666")]
-        self.assertGreater(watch["panel_blocked_until"], time.monotonic())
-        # While paused, another tick does not try to edit again.
+        self.assertGreater(cemod.channel_blocked_until(777),
+                           time.monotonic())
+        # While paused, another tick does not try to edit again —
+        # the scheduler refuses at once instead of queueing a job
+        # that would land stale.
         panel.edit_error = None
+        watch = wmod._watches[(777, "771747666")]
         watch["last_panel_edit"] = time.monotonic() - 2
         await wmod.on_tick(self.bot, [changed])
         await _drain_panel_workers()
@@ -3170,11 +3178,8 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         db._DB = str(self._tmp / "test.db")
         self._orig_watches = dict(wmod._watches)
         self._orig_loaded = wmod._loaded
-        self._orig_channel_last = dict(wmod._channel_last_edit)
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit = {}
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.games1x2 = _load("games1x2.json")
@@ -3190,7 +3195,6 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         db._DB = self._orig_db
         wmod._watches = self._orig_watches
         wmod._loaded = self._orig_loaded
-        wmod._channel_last_edit = self._orig_channel_last
         for p in self._tmp.glob("*"):
             p.unlink()
         self._tmp.rmdir()
@@ -3208,8 +3212,6 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         # heartbeat from taking the slot ahead of a score change).
         for watch in wmod._watches.values():
             watch["last_panel_edit"] = time.monotonic() - 2.0
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
 
@@ -3546,8 +3548,6 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         wmod._watches = {}
         wmod._loaded = True
         wmod._refresh_cooldown = {}
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.npl = _load_scoreboard("games1x2_npl.json")
@@ -3662,8 +3662,6 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
             # A second later: the footer advances again.
             wmod._watches[(777, "771678099")]["last_panel_edit"] = \
                 time.monotonic() - 2
-            wmod._channel_last_edit.clear()
-            wmod._channel_next_slot.clear()
             wmod._panel_log_window_start = 0.0
             wmod._panel_log_edits = 0
             await wmod.on_tick(self.bot, self.npl)
@@ -3818,8 +3816,6 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         wmod._panel_log_window_start = 0.0
         wmod._panel_log_edits = 0
         self.games1x2 = _load("games1x2.json")
@@ -3869,13 +3865,12 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         return msgs
 
     def _reset_tick_state(self):
-        # The 1s per-panel gap and the channel stagger are real
-        # time — reset them so the next tick in the test can edit.
+        # The 1s heartbeat gate is real time — reset it so the
+        # next tick in the test can edit. (Pacing lives in the
+        # shared scheduler now, not in per-panel state, so there
+        # is no slot timeline to reset between ticks.)
         for watch in wmod._watches.values():
             watch["last_panel_edit"] = time.monotonic() - 2
-            watch["panel_blocked_until"] = 0.0
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
 
     def _ticking_time(self, clock):
         clock["n"] += 1
@@ -3908,52 +3903,87 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         plan = wmod._panel_edit_plan(details, {"b"})
         self.assertEqual(plan[777], [(777, "b"), (777, "a"), (777, "c")])
 
-    async def test_429_on_one_panel_pauses_only_that_panel(self):
+    async def test_429_pauses_the_whole_channel_not_just_one_panel(self):
+        # A 429 is a per-CHANNEL bucket, not a per-panel one: when
+        # one panel's edit is rate-limited, the scheduler pauses
+        # the whole channel until retry_after. The other panels
+        # wait out the same pause instead of firing into a drained
+        # bucket — that firing is what used to cascade (the VM
+        # journal showed ~14.6 429s/min and only ~30 landed
+        # edits/min). Exactly one 429 happens, and every panel
+        # still lands its edit.
         msgs = self._seed_four()
         resp = SimpleNamespace(status=429, reason="Too Many Requests",
-                               headers={"Retry-After": "30"})
+                               headers={"Retry-After": "5"})
         err = discord.HTTPException(resp, "rate limited")
-        err.retry_after = 30.0
+        err.retry_after = 5.0
         msgs[1].edit_error = err
+        raises = []
+        orig_edit = msgs[1].edit
+
+        async def _counting_edit(*args, **kwargs):
+            try:
+                return await orig_edit(*args, **kwargs)
+            except discord.HTTPException as exc:
+                if getattr(exc, "status", None) == 429:
+                    raises.append(exc)
+                raise
+
+        msgs[1].edit = _counting_edit
+        times = {}
+        for idx in (0, 2, 3):
+            msg = msgs[idx]
+            orig = msg.edit
+
+            async def _timed(*args, _orig=orig, _idx=idx, **kwargs):
+                times.setdefault(_idx, []).append(time.monotonic())
+                return await _orig(*args, **kwargs)
+
+            msg.edit = _timed
         self._reset_tick_state()
         await wmod.on_tick(self.bot, self.games1x2)
-        await _drain_panel_workers()
+        # The drain waits out the 5s channel pause (msg2 lands
+        # ~6s after msg0: 1s pacing, then the pause).
+        await _drain_panel_workers(timeout=10.0)
         self.assertEqual(len(msgs[0].edits), 1)
         self.assertEqual(len(msgs[1].edits), 0)
         self.assertEqual(len(msgs[2].edits), 1)
         self.assertEqual(len(msgs[3].edits), 1)
         self.assertEqual(len(self.channel.sent), 0)
-        # The limited panel is blocked for 30s; the others are not.
-        blocked = wmod._watches[(777, "771739998")]["panel_blocked_until"]
-        self.assertGreater(blocked, time.monotonic())
-        for gid in ("771747666", "771750037", "771750038"):
-            self.assertEqual(
-                wmod._watches[(777, gid)]["panel_blocked_until"], 0.0)
-        # Once the block clears, the panel edits again.
+        # Exactly one 429 — no cascade.
+        self.assertEqual(len(raises), 1)
+        # The pause delayed the other panels well past their
+        # normal 1s slots: msg2 landed ~6s after msg0, not ~2s.
+        self.assertGreaterEqual(times[2][0] - times[0][0], 4.0)
+        self.assertAlmostEqual(times[3][0] - times[2][0], 1.0, delta=0.75)
+        # Once the error clears, the limited panel edits again —
+        # and no second 429 follows.
         msgs[1].edit_error = None
-        wmod._watches[(777, "771739998")]["panel_blocked_until"] = 0.0
         self._reset_tick_state()
         await wmod.on_tick(self.bot, self.games1x2)
-        await _drain_panel_workers()
+        await _drain_panel_workers(timeout=10.0)
         self.assertEqual(len(msgs[1].edits), 1)
+        self.assertEqual(len(raises), 1)
 
     async def test_refresh_budget_divides_evenly(self):
         # The user's rule: 1 game refreshes every 1s, 2 games
-        # every 2s each, 3 every 3s, 4 every 4s. The channel
-        # slots are 1s apart — exactly Discord's sustained
-        # per-channel edit budget — so attempts never exceed
-        # the bucket: every scheduled edit lands, no 429s, and
-        # the total stays ~60 edits/min whatever N is. Measured
-        # in real time against the fake bucket, which refills
-        # from the wall clock between ticks. (The old 0.35s
-        # spacing tried to edit faster than the budget: 80
-        # attempts, only ~24 granted, the rest 429'd — and the
-        # VM journal showed only 38 edits/min for 2 panels.)
+        # every 2s each, 3 every 3s, 4 every 4s. The shared
+        # scheduler paces ALL edits in the channel 1s apart —
+        # exactly Discord's sustained per-channel edit budget —
+        # so attempts never exceed the bucket: every scheduled
+        # edit lands, no 429s, and the total stays ~60 edits/min
+        # whatever N is. Measured in real time against the fake
+        # bucket, which refills from the wall clock between ticks.
+        # (The old 0.35s spacing tried to edit faster than the
+        # budget: 80 attempts, only ~24 granted, the rest 429'd —
+        # and the VM journal showed only 38 edits/min for 2
+        # panels. The 1.0s slots that replaced it still only
+        # reached ~30/min, because the scoreboard edited outside
+        # the slot system and every 429 stalled ~4.2s — that is
+        # what the shared scheduler fixes.)
         for n, ticks in ((1, 3), (2, 3), (3, 2), (4, 2)):
             await _cancel_panel_workers()
             wmod._watches = {}
-            wmod._channel_next_slot.clear()
-            wmod._channel_last_edit.clear()
             bucket = FakeBucket()
             msgs = self._seed_four(bucket=bucket, count=n)
             for msg in msgs:
@@ -3971,7 +4001,7 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
             with patch.object(
                     wmod, "now_npt_str",
                     side_effect=lambda: self._ticking_time(clock)):
-                for _ in range(ticks):
+                for i in range(ticks):
                     now = time.monotonic()
                     # Refill for the whole previous tick — on_tick
                     # AND the drain that waited for the 1s slots —
@@ -3981,6 +4011,13 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
                     last = now
                     await wmod.on_tick(self.bot, self.games1x2)
                     await _drain_panel_workers(timeout=10.0)
+                    if i < ticks - 1:
+                        # Production ticks once a second: the
+                        # heartbeat gate (0.9s) only opens when a
+                        # real second has passed since the last
+                        # edit — back-to-back ticks would all be
+                        # gated and nothing would land.
+                        await asyncio.sleep(1.1)
             total = sum(len(m.edits) for m in msgs)
             # Every scheduled edit landed — no 429 denied any.
             self.assertEqual(total, n * ticks)
@@ -4012,7 +4049,7 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         with patch.object(
                 wmod, "now_npt_str",
                 side_effect=lambda: self._ticking_time(clock)):
-            for _ in range(60):
+            for i in range(60):
                 now = time.monotonic()
                 # Refill for the whole previous tick — on_tick AND
                 # the drain that waited for the 1s slot — not just
@@ -4021,6 +4058,11 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
                 last = now
                 await wmod.on_tick(self.bot, self.games1x2)
                 await _drain_panel_workers(timeout=10.0)
+                if i < 59:
+                    # Production ticks once a second: the heartbeat
+                    # gate (0.9s) only opens when a real second
+                    # has passed since the last edit.
+                    await asyncio.sleep(1.1)
         total = len(msgs[0].edits)
         print(f"[60-tick] single panel edits: {total}/60")
         self.assertGreaterEqual(
@@ -4075,8 +4117,6 @@ class TestWatchingAndUnwatch(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit.clear()
-        wmod._channel_next_slot.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
@@ -4232,6 +4272,293 @@ class TestWatchingAndUnwatch(unittest.IsolatedAsyncioTestCase):
         await wmod.on_tick(self.bot, self.games1x2)
         await _drain_panel_workers()
         self.assertEqual(len(msg.edits), 1)
+
+
+class _VirtualClock:
+    """A hand-driven clock for the edit scheduler: only the
+    test driver advances it, and the scheduler's virtual sleep
+    waits on it — so a 60s measurement runs in milliseconds of
+    real time. Starts at 1000.0 so the scheduler's "last edit"
+    (initially 0.0) is long past, exactly as in production where
+    monotonic time is already large when the bot starts."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
+    """One shared edit budget per channel: panels AND the
+    scoreboard go through the same scheduler, so the bucket
+    never sees more than 1 edit/s and 429s stop.
+
+    Root cause (18 Nov 2026, VM journal): the panels paced at
+    exactly 1 edit/s assuming they were the only editors, while
+    the scoreboard edited the same channel outside the slot
+    system — ~14.6 Discord 429s/min, each stalling ~4.2s, so 2
+    panels landed only ~30 edits/min instead of ~60. These tests
+    measure the fix in virtual time: the scheduler's sleeps wait
+    on a hand-driven clock, and the fake bucket refills from the
+    same clock, so 60 simulated seconds run in milliseconds."""
+
+    async def asyncSetUp(self):
+        self.clock = _VirtualClock()
+        self._orig_now = cemod._now
+        self._orig_sleep = cemod._sleep
+        cemod._now = lambda: self.clock.now
+        clock = self.clock
+
+        async def _vsleep(delay):
+            # Wait until the driver advances the clock past the
+            # target — the driver is the only thing that moves
+            # time, so this can never spin past it.
+            end = clock.now + delay
+            while clock.now < end:
+                await asyncio.sleep(0)
+
+        cemod._sleep = _vsleep
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+        self._tasks = []
+
+    async def asyncTearDown(self):
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        await cemod.reset_for_tests()
+        cemod._now = self._orig_now
+        cemod._sleep = self._orig_sleep
+
+    async def _tick_virtual(self, seconds=1.0, step=0.1):
+        """Advance the virtual clock by `seconds`, letting the
+        scheduler workers run as time passes."""
+        target = self.clock.now + seconds
+        while self.clock.now < target:
+            self.clock.advance(min(step, target - self.clock.now))
+            await asyncio.sleep(0)
+
+    async def _run_scenario(self, n_panels, seconds=60,
+                            scoreboard_every=10):
+        """Simulate `seconds` virtual seconds: every second one
+        edit per panel (as the tick hands them fresh detail) plus
+        a scoreboard edit every `scoreboard_every` seconds (the
+        scoreboard only edits when the score changes — a busy
+        minute). Returns (per-panel landed counts, scoreboard
+        landed count, 429 count)."""
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        panel_msgs = []
+        for idx in range(n_panels):
+            msg = FakeMessage(2001 + idx, "stale", bucket=bucket)
+            self.channel.messages[msg.id] = msg
+            panel_msgs.append(msg)
+        sb_msg = FakeMessage(2999, "stale", bucket=bucket)
+        self.channel.messages[sb_msg.id] = sb_msg
+        denied = {"n": 0}
+        for msg in panel_msgs + [sb_msg]:
+            orig = msg.edit
+
+            async def _counting(*args, _orig=orig, **kwargs):
+                try:
+                    return await _orig(*args, **kwargs)
+                except discord.HTTPException as exc:
+                    if getattr(exc, "status", None) == 429:
+                        denied["n"] += 1
+                    raise
+
+            msg.edit = _counting
+        for s in range(seconds):
+            for idx, msg in enumerate(panel_msgs):
+                self._tasks.append(asyncio.create_task(
+                    cemod.edit_message(
+                        self.bot, 777, msg.id,
+                        content=f"panel {idx} t={s}")))
+            if s % scoreboard_every == 0:
+                self._tasks.append(asyncio.create_task(
+                    cemod.edit_message(
+                        self.bot, 777, sb_msg.id,
+                        content=f"scoreboard t={s}")))
+            await self._tick_virtual(1.0)
+        # Let the trailing queue land (a few more virtual
+        # seconds); those edits count toward the total too.
+        await self._tick_virtual(5.0)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        return ([len(m.edits) for m in panel_msgs],
+                len(sb_msg.edits), denied["n"])
+
+    async def test_one_panel_plus_scoreboard_edits_every_second(self):
+        counts, sb_edits, denied = await self._run_scenario(1)
+        total = sum(counts) + sb_edits
+        print(f"[shared-budget] 1 panel + scoreboard: "
+              f"panel={counts}, scoreboard={sb_edits}, "
+              f"total={total}, 429s={denied}")
+        # One live game refreshes every 1s: ~60 edits/min total,
+        # the panel taking almost all of them (the scoreboard
+        # edits ~6 times a minute), zero 429s.
+        self.assertEqual(denied, 0)
+        self.assertGreaterEqual(total, 55)
+        self.assertLessEqual(total, 65)
+        self.assertGreaterEqual(counts[0], 50)
+        self.assertEqual(sb_edits, 6)
+
+    async def test_two_panels_plus_scoreboard_divide_evenly(self):
+        counts, sb_edits, denied = await self._run_scenario(2)
+        total = sum(counts) + sb_edits
+        print(f"[shared-budget] 2 panels + scoreboard: "
+              f"panels={counts}, scoreboard={sb_edits}, "
+              f"total={total}, 429s={denied}")
+        self.assertEqual(denied, 0)
+        self.assertGreaterEqual(total, 55)
+        self.assertLessEqual(total, 65)
+        # 2 games: every ~2s each, even split.
+        for count in counts:
+            self.assertGreaterEqual(count, 24)
+            self.assertLessEqual(count, 36)
+        self.assertEqual(sb_edits, 6)
+
+    async def test_four_panels_plus_scoreboard_divide_evenly(self):
+        counts, sb_edits, denied = await self._run_scenario(4)
+        total = sum(counts) + sb_edits
+        print(f"[shared-budget] 4 panels + scoreboard: "
+              f"panels={counts}, scoreboard={sb_edits}, "
+              f"total={total}, 429s={denied}")
+        self.assertEqual(denied, 0)
+        self.assertGreaterEqual(total, 55)
+        self.assertLessEqual(total, 65)
+        # 4 games: every ~4s each, even split — no panel starved.
+        for count in counts:
+            self.assertGreaterEqual(count, 11)
+            self.assertLessEqual(count, 19)
+        self.assertEqual(sb_edits, 6)
+
+    async def test_429_does_not_cascade(self):
+        # One injected 429 (retry_after 2s) on a panel edit: the
+        # channel pauses, the failed job is retried on the next
+        # submit and lands, and no second 429 ever follows —
+        # the old design re-fired into the drained bucket and
+        # produced ~14.6 429s/min.
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        msgs = []
+        for idx in range(2):
+            msg = FakeMessage(2001 + idx, "stale", bucket=bucket)
+            self.channel.messages[msg.id] = msg
+            msgs.append(msg)
+        denied = {"n": 0}
+        for msg in msgs:
+            orig = msg.edit
+
+            async def _counting(*args, _orig=orig, **kwargs):
+                try:
+                    return await _orig(*args, **kwargs)
+                except discord.HTTPException as exc:
+                    if getattr(exc, "status", None) == 429:
+                        denied["n"] += 1
+                    raise
+
+            msg.edit = _counting
+        resp = SimpleNamespace(status=429, reason="Too Many Requests",
+                               headers={"Retry-After": "2"})
+        err = discord.HTTPException(resp, "rate limited")
+        err.retry_after = 2.0
+        raised = {"n": 0}
+        orig0 = msgs[0].edit
+
+        async def _once_429(*args, **kwargs):
+            if raised["n"] == 0:
+                raised["n"] += 1
+                raise err
+            return await orig0(*args, **kwargs)
+
+        msgs[0].edit = _once_429
+        results = []
+        for s in range(15):
+            for idx, msg in enumerate(msgs):
+                self._tasks.append(asyncio.create_task(
+                    cemod.edit_message(
+                        self.bot, 777, msg.id,
+                        content=f"panel {idx} t={s}")))
+            await self._tick_virtual(1.0)
+        await self._tick_virtual(2.0)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        for msg in msgs:
+            results.append(len(msg.edits))
+        # Exactly one 429 (the injected one, counted by `raised`);
+        # the bucket itself never denied anything (`denied` is
+        # 0) — the scheduler never exceeded the budget, so the
+        # 429 did not cascade. The failed panel still lands edits
+        # afterwards, and the other panel never stops.
+        self.assertEqual(denied["n"], 0)
+        self.assertEqual(raised["n"], 1)
+        self.assertGreaterEqual(results[0], 5)
+        self.assertGreaterEqual(results[1], 5)
+        # Total landed is ~1/s over the ~17 virtual seconds,
+        # minus the ~2s the channel paused for the 429.
+        self.assertGreaterEqual(sum(results), 12)
+        self.assertLessEqual(sum(results), 16)
+
+    async def test_priority_tap_jumps_the_queue(self):
+        # Three normal edits queued, then a priority tap: the tap
+        # lands ahead of the normals that were queued before it
+        # (third, not fifth) — it cannot preempt the edit already
+        # popped for its pacing wait, but it never waits behind a
+        # whole tick of heartbeats.
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        landed = []
+        msgs = []
+        for idx in range(4):
+            msg = FakeMessage(2001 + idx, "stale", bucket=bucket)
+            self.channel.messages[msg.id] = msg
+            msgs.append(msg)
+            orig = msg.edit
+
+            async def _recording(*args, _orig=orig, _idx=idx, **kwargs):
+                await _orig(*args, **kwargs)
+                landed.append(_idx)
+
+            msg.edit = _recording
+        # Fill the channel with a slow first edit: block the
+        # worker's pacing by submitting the first job, letting it
+        # land, then queueing three normals before the tap.
+        self._tasks.append(asyncio.create_task(
+            cemod.edit_message(self.bot, 777, 2001, content="first")))
+        await self._tick_virtual(0.5)
+        for idx in (1, 2, 3):
+            self._tasks.append(asyncio.create_task(
+                cemod.edit_message(
+                    self.bot, 777, 2001 + idx, content=f"normal {idx}")))
+        await self._tick_virtual(0.2)
+        self._tasks.append(asyncio.create_task(
+            cemod.edit_message(
+                self.bot, 777, 2001, content="tap", priority=True)))
+        await self._tick_virtual(6.0)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self.assertEqual(landed[0], 0)
+        # The tap (message 2001 again) is the third edit to land —
+        # ahead of normals 2 and 3, which were queued before it.
+        self.assertEqual(landed[2], 0)
+        self.assertEqual(landed, [0, 1, 0, 2, 3])
+
+    async def test_coalescing_keeps_only_the_freshest_edit(self):
+        # Three rapid submits for the same message: one PATCH
+        # lands, with the LAST content — the queue never holds
+        # stale renders.
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        msg = FakeMessage(2001, "stale", bucket=bucket)
+        self.channel.messages[msg.id] = msg
+        tasks = [asyncio.create_task(cemod.edit_message(
+                    self.bot, 777, 2001, content=f"v{i}"))
+                 for i in range(3)]
+        self._tasks.extend(tasks)
+        await self._tick_virtual(3.0)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(len(msg.edits), 1)
+        self.assertEqual(msg.edits[0], "v2")
+        self.assertEqual(results[0][0], "superseded")
+        self.assertEqual(results[1][0], "superseded")
+        self.assertEqual(results[2][0], "ok")
 
 
 if __name__ == "__main__":

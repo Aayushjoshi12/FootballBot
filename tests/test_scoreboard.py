@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import discord
 
+import channel_edits as cemod
 import providers as prov
 import scoreboard as sb
 
@@ -309,6 +310,12 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
             p.unlink()
         self._tmp.rmdir()
 
+    async def asyncTearDown(self):
+        # Edits go through the shared scheduler now — its
+        # per-channel worker would otherwise outlive the test's
+        # event loop.
+        await cemod.reset_for_tests()
+
     def _text(self, score="157"):
         return sb.render_scoreboard(
             [_npl_match(home_score=score)], [], now=FIXED_NOW)
@@ -354,10 +361,13 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
         self.channel.sent[0].edit_error = err
         self.assertFalse(
             await sb.refresh_channel(self.bot, 123, self._text("158")))
-        # Blocked: no retry while the pause lasts, even with new text.
+        # The scheduler paused the WHOLE channel for 30s: a retry
+        # with new text is refused at once (no 30s wait) and the
+        # scoreboard tries again on a later tick.
         self.assertFalse(
             await sb.refresh_channel(self.bot, 123, self._text("159")))
-        self.assertGreater(sb._state[123]["blocked_until"], time.time())
+        self.assertGreater(cemod.channel_blocked_until(123),
+                           time.monotonic())
 
     async def test_loop_posts_once_and_skips_identical(self):
         sb._state[sb.TEST_CHANNEL_ID] = sb._new_entry()

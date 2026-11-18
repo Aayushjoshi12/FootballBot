@@ -53,6 +53,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 import barcelona_reminder
+import channel_edits
 import db
 import history
 import maintenance
@@ -1268,7 +1269,6 @@ async def load_watches() -> None:
             "panel_body": None, "panel_base_body": None,
             "panel_static": {}, "panel_momentum": None,
             "panel_momentum_ts": 0.0, "last_panel_edit": 0.0,
-            "panel_blocked_until": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
     if _watches:
@@ -1336,7 +1336,6 @@ async def start_watch(channel_id: int, entry: dict, level: str,
         "panel_momentum": kept.get("panel_momentum"),
         "panel_momentum_ts": kept.get("panel_momentum_ts") or 0.0,
         "last_panel_edit": kept.get("last_panel_edit") or 0.0,
-        "panel_blocked_until": kept.get("panel_blocked_until") or 0.0,
         "panel_timer_sec": kept.get("panel_timer_sec"),
         "panel_timer_ts": kept.get("panel_timer_ts") or 0.0,
     }
@@ -1399,7 +1398,7 @@ async def register_game_panel(channel_id: int, game_id: str,
         "panel_base_body": _strip_updated_footer(body),
         "panel_static": _panel_static_from_detail(detail),
         "panel_momentum": None, "panel_momentum_ts": 0.0,
-        "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+        "last_panel_edit": 0.0,
         "panel_timer_sec": None, "panel_timer_ts": 0.0,
     }
     return True
@@ -1462,7 +1461,7 @@ async def adopt_game_panel(channel_id: int, game_id: str,
             "panel_base_body": _strip_updated_footer(body),
             "panel_static": static,
             "panel_momentum": None, "panel_momentum_ts": 0.0,
-            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "last_panel_edit": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
         _watches[(channel_id, game_id)] = entry
@@ -1476,7 +1475,6 @@ async def adopt_game_panel(channel_id: int, game_id: str,
     old["detail"] = level
     old["panel_static"] = static
     old["last_panel_edit"] = 0.0
-    old["panel_blocked_until"] = 0.0
     await _persist_panel_view(channel_id, game_id, old)
     try:
         await db.set_watch_panel(channel_id, game_id, message_id)
@@ -1669,55 +1667,36 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
 # Every panel gets its edit on every tick (see
 # _schedule_panel_edits): the tick hands each panel's fresh
 # detail to that panel's worker task, content changes first,
-# and the workers take 1s-spaced edit slots per channel (see
-# _CHANNEL_EDIT_GAP_S below) — 1 game refreshes every 1s, 2
-# games every 2s each, 3 every 3s, 4 every 4s. The old design
-# called _refresh_panel inline, one panel after another, and
-# its stagger gate let only ONE panel per channel edit per tick
-# — with four panels in one channel each panel's Updated footer
-# only advanced about every 4s, which is exactly what the user
-# saw. A worker always edits the FRESHEST pending detail, so a
-# panel never reverts to a stale score.
-# 0.9s, not 1.0s: the channel slots are 1.0s apart, and a gate
-# at exactly 1.0s would refuse a slot-timed heartbeat that
+# and the edits go through the ONE shared per-channel scheduler
+# (see channel_edits) — 1 game refreshes every 1s, 2 games
+# every 2s each, 3 every 3s, 4 every 4s. The old design paced
+# the panels with a per-panel slot timeline (1s apart) and let
+# the scoreboard edit the same channel OUTSIDE that timeline:
+# the VM journal showed only ~30 edits/min for 2 panels with
+# ~14.6 Discord 429s/min, because any 5s window with 5 panel
+# edits plus one scoreboard edit blew the 5-per-5s bucket and
+# each 429 stalled ~4.2s. The scheduler owns ALL edits in the
+# channel now — panels and scoreboard alike — so the bucket
+# never sees more than 1 edit/s and there is nothing left to
+# collide with. A worker always edits the FRESHEST pending
+# detail, so a panel never reverts to a stale score.
+# 0.9s, not 1.0s: the scheduler spaces edits 1.0s apart, and a
+# gate at exactly 1.0s would refuse a slot-timed heartbeat that
 # lands a few ms early — halving a quiet panel's cadence.
 _PANEL_HEARTBEAT_S = 0.9
 # Analytics momentum stays on its old 30s cadence — it is a db
 # read, not a visible edit, and nothing about it needs to move
 # every second.
 _PANEL_MOMENTUM_REFRESH_S = 30.0
-# Panel edits: the channel slots below are the real pacer, so
-# this is only a guard against true bursts (a button tap and a
-# tick edit landing together). 0.5s, not 1.0s: a gate at exactly
-# 1.0s would refuse a slot-timed edit that lands a few ms early.
-# A 429 pauses that panel until the retry time — the same
-# discipline as the scoreboard's edits.
-_PANEL_MIN_EDIT_GAP_S = 0.5
-# Channel edit slots: one panel edit per channel per second —
-# exactly Discord's sustained per-channel edit budget (5 per
-# 5s, refilling 1/s). The slots divide the budget evenly: 1
-# live game refreshes every 1s, 2 games every 2s each, 3 every
-# 3s, 4 every 4s. The old 0.35s spacing tried to edit faster
-# than the budget, so Discord 429'd about half the attempts and
-# the retry pauses wasted the rest (the VM journal showed only
-# 38 edits/min for 2 panels instead of ~60). A panel whose slot
-# has not come yet waits for it (in its worker) instead of being
-# deferred to the next tick.
-_CHANNEL_EDIT_GAP_S = 1.0
-_channel_last_edit: dict[int, float] = {}
-# Per-channel edit slot timeline: the monotonic time at which the
-# channel's next panel edit may fire. Workers take slots from it
-# (each slot is _CHANNEL_EDIT_GAP_S after the previous one), so
-# edits in one channel form a continuous 1s-spaced stream
-# across ticks. _refresh_panel also advances it on any successful
-# edit, so a button tap and a tick edit never collide.
-_channel_next_slot: dict[int, float] = {}
 # One background worker task per live panel, keyed by
 # (channel_id, game_id). A worker loops while its panel has a
 # fresh detail pending and exits when there is nothing to do;
 # the tick only hands it fresh detail and starts it if it is not
 # already running — so there is never more than one worker per
-# panel, and a panel never edits from a stale detail.
+# panel, and a panel never edits from a stale detail. The
+# workers do NOT pace edits themselves any more: pacing lives
+# entirely in channel_edits, which also paces the scoreboard
+# and any button-tap edit in the same channel.
 _panel_workers: dict[tuple, asyncio.Task] = {}
 # Cadence log: successful tick edits in the current 60s window.
 # Logged once a minute (see _maybe_log_panel_cadence) so the VM
@@ -1796,15 +1775,26 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
                          detail: dict | None = None,
                          text: str | None = None,
                          post_if_missing: bool = True,
-                         heartbeat: bool = True) -> bool:
+                         heartbeat: bool = True,
+                         priority: bool = False) -> bool:
     """Post the watch panel on its first tick, then edit it in
     place whenever its text changes. Pass text to edit the panel to
     a fixed line (e.g. the ended state) instead of rendering from
     detail. Returns True when a send/edit happened. Never raises —
-    a failed edit is retried on the next tick, a 429 pauses this
-    panel until Discord says otherwise, a deleted watch panel is
-    re-posted once, and a deleted /game panel stops quietly (its
-    reply stays deleted, no new message).
+    a failed edit is retried on the next tick, a deleted watch
+    panel is re-posted once, and a deleted /game panel stops
+    quietly (its reply stays deleted, no new message).
+
+    Edits go through the shared per-channel scheduler
+    (channel_edits): it paces ALL edits in the channel — panels,
+    scoreboard, button taps — 1.0s apart, so the 5-per-5s bucket
+    never overflows. A 429 pauses the WHOLE channel until
+    retry_after (the bucket is per-channel, so any other edit in
+    the meantime would 429 too); there is no per-panel block any
+    more — the old one let other panels keep firing into a
+    drained bucket, which is what cascaded. `priority` jumps the
+    edit ahead of queued heartbeats (user taps and final
+    full-time states only) — still paced, still inside the budget.
 
     The tick compares the render WITHOUT the Updated footer
     (panel_base_body): a score/overs/clock change edits at once,
@@ -1846,114 +1836,77 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
                                   updated=now_npt_str())
     if text == watch.get("panel_body"):
         return False
-    now = time.monotonic()
-    if now < (watch.get("panel_blocked_until") or 0):
-        return False
-    if now - (watch.get("last_panel_edit") or 0) < _PANEL_MIN_EDIT_GAP_S:
-        return False
-    channel = await _get_channel(bot, channel_id)
-    if channel is None:
-        return False
     view = WatchAlertView(game_id)
     message_id = watch.get("panel_message_id")
-    if not message_id and not post_if_missing:
-        # Ended watch with no panel yet: edit only, never post.
-        return False
-    message = None
-    if message_id:
-        try:
-            message = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            if watch.get("panel_kind") in ("detail", "analytics"):
-                # A deleted /game reply stays deleted — the panel
-                # stops quietly instead of posting a new message.
-                log.info("[watch] game panel deleted for %s; stopping",
-                         game_id)
-                await remove_watch(channel_id, game_id)
-                return False
-            log.info("[watch] panel message gone for %s; posting fresh",
-                     game_id)
-            if not post_if_missing:
-                return False
-            message_id = None
-            watch["panel_message_id"] = None
-        except discord.HTTPException as exc:
-            log.warning("[watch] panel fetch failed for %s (%s)",
-                        game_id, exc)
+    if not message_id:
+        if not post_if_missing:
+            # Ended watch with no panel yet: edit only, never post.
             return False
-    # The stagger below governs EDITS only: the first post of a
-    # panel is a single send, not a flood, and a panel posted and
-    # edited in quick succession (the clock test fakes 5s passing)
-    # must not be blocked by its own post.
-    edited = False
-    try:
-        if message is not None:
-            # No stagger gate here: the workers space edits via
-            # _channel_next_slot (see _panel_edit_worker), and
-            # _refresh_panel advances that timeline on every
-            # successful edit below, so a button tap and a worker
-            # edit never land in the same instant. The old gate
-            # (last edit + 0.35s) fought the slot timeline — a
-            # worker woke a few ms "early" relative to the
-            # previous edit and was refused, so the 3rd panel in
-            # a channel never edited at all.
-            await message.edit(content=text, view=view,
-                               allowed_mentions=discord.AllowedMentions.none())
-            edited = True
-        else:
+        # First post of a panel is a single send, not an edit —
+        # sends do not go through the edit scheduler, and a panel
+        # posted and edited in quick succession (the clock test
+        # fakes 5s passing) must not be blocked by its own post.
+        channel = await _get_channel(bot, channel_id)
+        if channel is None:
+            return False
+        try:
             message = await channel.send(
                 text, view=view,
                 allowed_mentions=discord.AllowedMentions.none())
-    except discord.NotFound:
-        # Deleted between fetch and edit. A /game panel stops
-        # quietly; a watch panel posts a fresh one once.
+        except discord.HTTPException as exc:
+            log.warning("[watch] panel post failed for %s (%s)",
+                        game_id, exc)
+            return False
+        watch["panel_message_id"] = message.id
+        try:
+            await db.set_watch_panel(channel_id, game_id, message.id)
+        except Exception:
+            pass
+        watch["panel_body"] = text
+        if new_base is not None:
+            # Only after a successful send — a failed send is
+            # retried on the next tick, not swallowed.
+            watch["panel_base_body"] = new_base
+        watch["last_panel_edit"] = time.monotonic()
+        return True
+    # Edit in place, through the shared per-channel scheduler —
+    # it fetches the message, paces the edit against every other
+    # edit in the channel (scoreboard included), and reports
+    # whether the message is gone.
+    status, _landed = await channel_edits.edit_message(
+        bot, channel_id, message_id, content=text, view=view,
+        priority=priority)
+    if status == "gone":
         if watch.get("panel_kind") in ("detail", "analytics"):
+            # A deleted /game reply stays deleted — the panel
+            # stops quietly instead of posting a new message.
             log.info("[watch] game panel deleted for %s; stopping",
                      game_id)
             await remove_watch(channel_id, game_id)
             return False
+        log.info("[watch] panel message gone for %s; posting fresh",
+                 game_id)
         if not post_if_missing:
             return False
-        try:
-            message = await channel.send(
-                text, view=view,
-                allowed_mentions=discord.AllowedMentions.none())
-        except discord.HTTPException as exc:
-            log.warning("[watch] panel re-post failed for %s (%s)",
-                        game_id, exc)
-            return False
-    except discord.HTTPException as exc:
-        if getattr(exc, "status", None) == 429:
-            retry_after = getattr(exc, "retry_after", None) or 60
-            watch["panel_blocked_until"] = now + float(retry_after)
-            log.warning("[watch] panel rate-limited for %s; paused %ss",
-                        game_id, retry_after)
-        else:
-            log.warning("[watch] panel edit failed for %s (%s)",
-                        game_id, exc)
+        watch["panel_message_id"] = None
+        return await _refresh_panel(bot, channel_id, game_id, watch,
+                                    detail=detail, text=text,
+                                    post_if_missing=post_if_missing,
+                                    heartbeat=heartbeat,
+                                    priority=priority)
+    if status != "ok":
+        # Failed, superseded, or the channel is paused after a
+        # 429 — the next tick retries with fresh detail.
         return False
-    new_id = getattr(message, "id", None)
-    if new_id != message_id:
-        watch["panel_message_id"] = new_id
-        try:
-            await db.set_watch_panel(channel_id, game_id, new_id)
-        except Exception:
-            pass
     watch["panel_body"] = text
     if new_base is not None:
         # Only after a successful edit — a failed edit is
         # retried on the next tick, not swallowed.
         watch["panel_base_body"] = new_base
-    watch["last_panel_edit"] = now
-    watch["panel_blocked_until"] = 0.0
-    if edited:
-        _channel_last_edit[channel_id] = now
-        # Keep the slot timeline honest for every edit, whoever
-        # made it — a button tap must not let a worker fire into
-        # the same instant, and vice versa.
-        _channel_next_slot[channel_id] = max(
-            _channel_next_slot.get(channel_id, 0.0),
-            time.monotonic() + _CHANNEL_EDIT_GAP_S)
+    # The landing time, not the render time: the edit may have
+    # waited in the scheduler's queue, and the heartbeat gate
+    # measures from when the panel actually moved.
+    watch["last_panel_edit"] = time.monotonic()
     return True
 
 
@@ -2137,7 +2090,11 @@ async def _switch_panel_view(interaction: discord.Interaction,
         await _persist_panel_view(channel_id, game_id, entry)
         bot = getattr(interaction, "client", None)
         if bot is not None:
-            await _refresh_panel(bot, channel_id, game_id, entry, detail)
+            # Priority: a tap jumps ahead of queued heartbeats
+            # (still paced by the shared scheduler, still inside
+            # the budget) so the panel switches at once.
+            await _refresh_panel(bot, channel_id, game_id, entry,
+                                 detail, priority=True)
         return
     # No panel anywhere: the old one-off snapshot.
     if kind == "analytics":
@@ -2421,11 +2378,11 @@ def _schedule_panel_edits(bot: discord.Client, details: dict,
     Every panel gets its edit on this tick — content changes
     first, heartbeats after — instead of the old take-turns
     design where the stagger gate let only one panel per channel
-    edit per tick. The workers space the edits 1s apart per
-    channel (see _panel_edit_worker), so the tick itself returns
-    at once and the scoreboard loop keeps its 1s cadence. A
-    panel that already has a worker running just gets fresher
-    detail handed to it — never a second worker."""
+    edit per tick. The edits themselves are paced by the shared
+    per-channel scheduler (see channel_edits), so the tick
+    itself returns at once and the scoreboard loop keeps its 1s
+    cadence. A panel that already has a worker running just gets
+    fresher detail handed to it — never a second worker."""
     plan = _panel_edit_plan(details, changed)
     for channel_id, keys in plan.items():
         for key in keys:
@@ -2443,16 +2400,18 @@ def _schedule_panel_edits(bot: discord.Client, details: dict,
 
 async def _panel_edit_worker(bot: discord.Client, channel_id: int,
                              key: tuple) -> None:
-    """One panel's edit loop. Waits for this channel's next edit
-    slot (1s after the previous edit in the channel), then
-    edits the panel with the FRESHEST pending detail — a newer
-    tick may have replaced it while we waited — and loops while
-    fresh work keeps arriving. Exits when the watch is gone,
-    there is nothing pending, or the panel is rate-limited (the
-    next tick retries it). Never raises: a failed edit is
-    retried on the next tick, never a crash. A 429 pauses ONLY
-    this panel (via _refresh_panel's panel_blocked_until); the
-    other panels keep ticking."""
+    """One panel's edit loop. Hands each fresh detail to
+    _refresh_panel — the shared scheduler (see channel_edits)
+    paces the edit against every other edit in the channel, so
+    this worker takes no slots and keeps no stagger of its own.
+    Loops while fresh work keeps arriving (a newer tick may have
+    replaced the detail while the scheduler was pacing the last
+    edit) and exits when there is nothing pending, the watch is
+    gone, or the edit failed (the next tick retries it). Never
+    raises: a failed edit is retried on the next tick, never a
+    crash. A channel-wide 429 pauses the scheduler, not this
+    panel — the other panels wait out the same pause instead of
+    firing into a drained bucket, which is what used to cascade."""
     game_id = key[1]
     global _panel_log_edits
     try:
@@ -2463,31 +2422,11 @@ async def _panel_edit_worker(bot: discord.Client, channel_id: int,
             detail = watch.get("_pending_detail")
             if detail is None:
                 return
-            if time.monotonic() < (watch.get("panel_blocked_until") or 0):
-                # Rate-limited: leave the detail pending; the next
-                # tick starts a fresh worker after the pause ends.
-                return
-            # Take this channel's next slot: edits in one channel
-            # never fire in the same instant, and the slots form
-            # a continuous stream across ticks.
-            now = time.monotonic()
-            slot = max(now, _channel_next_slot.get(channel_id, 0.0))
-            _channel_next_slot[channel_id] = slot + _CHANNEL_EDIT_GAP_S
-            if slot > now:
-                await asyncio.sleep(slot - now)
-                watch = _watches.get(key)
-                if watch is None:
-                    return
-                detail = watch.get("_pending_detail")
-                if detail is None:
-                    return
-                if time.monotonic() < (watch.get("panel_blocked_until") or 0):
-                    return
             edited = await _refresh_panel(bot, channel_id, game_id,
                                           watch, detail)
             if not edited:
-                # Nothing changed, gated, or failed — leave the
-                # detail pending; the next tick retries it.
+                # Nothing changed, superseded, or failed — leave
+                # the detail pending; the next tick retries it.
                 return
             _panel_log_edits += 1
             # Only clear the pending detail if it is still the
@@ -2581,12 +2520,13 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
                 if watch["missing"] >= MISSING_TICKS_TO_END:
                     # The panel (if one was posted) shows the ended
                     # state; the message below is the notification
-                    # that the watch itself has ended.
+                    # that the watch itself has ended. Priority: a
+                    # one-off final state, it should land at once.
                     await _refresh_panel(
                         bot, channel_id, game_id, watch,
                         text=(f"🏁 **{watch['home']} vs {watch['away']}**"
                               f" — no longer live\nGame ID: {game_id}"),
-                        post_if_missing=False)
+                        post_if_missing=False, priority=True)
                     # A view-only /game panel ends silently — its
                     # panel already says the game is over.
                     if watch.get("notify", True):
@@ -2688,9 +2628,12 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
             if is_terminal:
                 # Final state first, in place — the watch is
                 # removed below, so its worker would never run.
+                # Priority: a one-off final state, it should land
+                # at once rather than behind queued heartbeats.
                 # (Same inline edit as before the worker rework.)
                 await _refresh_panel(bot, channel_id, game_id, watch,
-                                     detail, heartbeat=False)
+                                     detail, heartbeat=False,
+                                     priority=True)
                 await history.record_match_result(
                     game_id, watch["home"], watch["away"],
                     watch.get("league", ""), str(detail.get("sport") or ""),
@@ -2706,7 +2649,9 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
 
     # Panel refreshes: every panel gets its edit on this tick —
     # content changes first, heartbeats after — via the per-panel
-    # workers, which space the edits 1s apart per channel.
+    # workers. The edits themselves are paced by the shared
+    # per-channel scheduler (see channel_edits), which also paces
+    # the scoreboard's edits in the same channel.
     # (The old phase 2 let only one panel per channel edit per
     # tick, so four panels in one channel took turns and each
     # panel's Updated footer only advanced about every 4s.)

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import barcelona_reminder as barca
 import bot as botmod
+import channel_edits as cemod
 import db
 import maintenance
 import providers as prov
@@ -150,7 +151,6 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
-        wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
@@ -159,6 +159,7 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         await db.init()
 
     async def asyncTearDown(self):
+        await cemod.reset_for_tests()
         await db.close()
         db._DB = self._orig_db
         wmod._watches = self._orig_watches
@@ -372,6 +373,7 @@ class TestMaintenanceScoreboardLoop(unittest.IsolatedAsyncioTestCase):
         await db.init()
 
     async def asyncTearDown(self):
+        await cemod.reset_for_tests()
         await db.close()
         db._DB = self._orig_db
         sb.STATE_PATH = self._orig_state_path

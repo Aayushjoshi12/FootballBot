@@ -12,6 +12,13 @@ WATCH vs EDIT — the two cadences are deliberately different:
     "Updated HH:MM:SS" footer stays fresh. Discord rate-limits message
     edits; editing every second would get the bot blocked. Watching
     every second is fine — a score only changes on a goal or a ball.
+    The edit itself goes through the shared per-channel scheduler
+    (channel_edits): the scoreboard shares the channel's 1 edit/s
+    budget with the live panels instead of editing outside their
+    timeline — on 18 Nov 2026 the uncoordinated scoreboard edits
+    were half the Discord 429s in the test channel and each one
+    stalled the panels ~4.2s. A 429 now pauses the whole channel
+    (the scheduler owns the block), never just the scoreboard.
 
 If 1xBet stops answering with live data for several ticks in a row
 (throttled, blocked, or genuinely no games live), the watch backs off
@@ -37,6 +44,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+import channel_edits
 import db
 import history
 import maintenance
@@ -295,6 +303,23 @@ async def _get_channel(bot: discord.Client, channel_id: int):
     return channel
 
 
+async def _post_scoreboard(bot: discord.Client, channel_id: int,
+                           text: str) -> object | None:
+    """Send a fresh scoreboard message (first post, or the stored
+    one was deleted). A send, not an edit — sends do not go
+    through the edit scheduler. Returns the message, or None."""
+    channel = await _get_channel(bot, channel_id)
+    if channel is None:
+        return None
+    try:
+        return await channel.send(
+            text, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as exc:
+        log.warning("[scoreboard] post failed in %s (%s)",
+                    channel_id, exc)
+        return None
+
+
 async def refresh_channel(bot: discord.Client, channel_id: int,
                           text: str) -> bool:
     """Post or edit the scoreboard in one channel, per the edit rule.
@@ -302,72 +327,61 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
     errors — a 429 backs off, a deleted message is re-posted once.
     Never posts in a channel that was stopped: a stop is checked
     here, not just in the loop, so a tick already in flight when
-    the stop lands cannot resurrect the scoreboard."""
+    the stop lands cannot resurrect the scoreboard.
+
+    The edit goes through the shared per-channel scheduler
+    (channel_edits) with a short timeout: the scoreboard must
+    never stall the 1s loop waiting behind a queue of panel
+    heartbeats — if its edit cannot land promptly it returns
+    False and the next tick retries it. (The entry's own
+    "blocked_until" field is retained only so old state files
+    still load; the live 429 pause lives in the scheduler.)"""
     if channel_id in _stopped:
         return False
     now = time.time()
     body, _ = _split_body(text)
     entry = _state.setdefault(channel_id, _new_entry())
     if entry["message_id"] is not None and not should_edit(
-            entry["body"], body, entry["last_edit"], now,
-            entry.get("blocked_until") or 0):
-        return False
-    channel = await _get_channel(bot, channel_id)
-    if channel is None:
+            entry["body"], body, entry["last_edit"], now):
         return False
     if (channel_id in _stopped
             or _state.get(channel_id) is not entry):
-        # Stopped while this tick was fetching the channel, or the
-        # entry was replaced by a fresh start — do not touch it.
+        # Stopped while this tick was fetching, or the entry was
+        # replaced by a fresh start — do not touch it.
         return False
-    message = None
-    if entry["message_id"] is not None:
-        try:
-            message = await channel.fetch_message(entry["message_id"])
-        except discord.NotFound:
-            log.info("[scoreboard] stored message gone in %s; posting fresh",
-                     channel_id)
-            entry["message_id"] = None
-        except discord.HTTPException as exc:
-            log.warning("[scoreboard] cannot fetch message in %s (%s)",
-                        channel_id, exc)
+    if entry["message_id"] is None:
+        message = await _post_scoreboard(bot, channel_id, text)
+        if message is None:
             return False
-    if (channel_id in _stopped
-            or _state.get(channel_id) is not entry):
+        entry["message_id"] = message.id
+        entry["body"] = body
+        entry["last_edit"] = now
+        _save_state()
+        return True
+    status, _landed = await channel_edits.edit_message(
+        bot, channel_id, entry["message_id"], content=text,
+        timeout=2.0)
+    if status == "gone":
+        # Deleted between ticks — post a fresh one once, unless
+        # the channel was stopped in the meantime.
+        if (channel_id in _stopped
+                or _state.get(channel_id) is not entry):
+            return False
+        entry["message_id"] = None
+        message = await _post_scoreboard(bot, channel_id, text)
+        if message is None:
+            return False
+        entry["message_id"] = message.id
+        entry["body"] = body
+        entry["last_edit"] = now
+        _save_state()
+        return True
+    if status != "ok":
+        # Failed, superseded, or the channel is paused after a
+        # 429 — the next tick retries with fresh text.
         return False
-    try:
-        if message is not None:
-            await message.edit(content=text,
-                               allowed_mentions=discord.AllowedMentions.none())
-        else:
-            message = await channel.send(
-                text, allowed_mentions=discord.AllowedMentions.none())
-    except discord.NotFound:
-        # Deleted between fetch and edit — post a fresh one once,
-        # unless the channel was stopped in the meantime.
-        if channel_id in _stopped or _state.get(channel_id) is not entry:
-            return False
-        try:
-            message = await channel.send(
-                text, allowed_mentions=discord.AllowedMentions.none())
-        except discord.HTTPException as exc:
-            log.warning("[scoreboard] re-post failed in %s (%s)", channel_id, exc)
-            return False
-    except discord.HTTPException as exc:
-        if getattr(exc, "status", None) == 429:
-            retry_after = getattr(exc, "retry_after", None) or 60
-            entry["blocked_until"] = now + float(retry_after)
-            _save_state()
-            log.warning("[scoreboard] Discord rate-limited edits in %s; "
-                        "paused for %ss", channel_id, retry_after)
-        else:
-            log.warning("[scoreboard] edit/send failed in %s (%s)",
-                        channel_id, exc)
-        return False
-    entry["message_id"] = message.id
     entry["body"] = body
     entry["last_edit"] = now
-    entry["blocked_until"] = 0.0
     _save_state()
     return True
 

@@ -221,11 +221,75 @@ _ANALYTICS_ORDER = (
 )
 _ANALYTICS_LABELS = {"Possession %": "Possession", "Corner": "Corners"}
 
+# One stat row's split bar: 10 blocks, home share filled.
+# Discord does not render markdown tables, so the old pipe
+# table showed up as raw text — the analytics stats now render
+# as aligned rows in a monospace block instead: label, home
+# value, a bar showing who is on top, away value.
+_STAT_BAR_LEN = 10
+_STAT_BAR_FULL = "█"
+_STAT_BAR_EMPTY = "░"
+
+
+def _stat_bar(home, away) -> str | None:
+    """10-block split bar for one stat, or None when either side
+    is not a number (the row then renders without a bar). The
+    numbers beside the bar stay the source of truth."""
+    try:
+        h = float(str(home).rstrip("%"))
+        a = float(str(away).rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+    total = h + a
+    filled = 0 if total <= 0 else round(h / total * _STAT_BAR_LEN)
+    filled = max(0, min(_STAT_BAR_LEN, filled))
+    return (_STAT_BAR_FULL * filled
+            + _STAT_BAR_EMPTY * (_STAT_BAR_LEN - filled))
+
+
+def _stat_display_value(name: str, value) -> str:
+    """Values for %-stats carry the % the stat name declares
+    (the feed sends bare numbers); every other value is shown
+    exactly as the feed sent it — nothing is invented."""
+    value = str(value)
+    if name.endswith(" %") and not value.endswith("%"):
+        return value + "%"
+    return value
+
+
+def format_analytics_stats(stats: list[dict] | None) -> list[str]:
+    """The analytics stat block, in display order: one aligned
+    row per stat inside a monospace block, so the columns hold
+    in Discord. Stats the feed sends that are not numbers get a
+    plain row with no bar. Returns [] when there are no stats."""
+    rows = []
+    for s in stats or []:
+        name = str(s.get("name", ""))
+        label = _ANALYTICS_LABELS.get(name, name)
+        if label.endswith(" %"):
+            label = label[:-2]
+        home = _stat_display_value(name, s.get("home", ""))
+        away = _stat_display_value(name, s.get("away", ""))
+        bar = _stat_bar(s.get("home", ""), s.get("away", ""))
+        rows.append((label, home, away, bar))
+    if not rows:
+        return []
+    lw = max(len(r[0]) for r in rows)
+    lines = ["```"]
+    for label, home, away, bar in rows:
+        if bar is None:
+            lines.append(f"{label:<{lw}}  {home} — {away}")
+        else:
+            lines.append(
+                f"{label:<{lw}}  {home:>5}  {bar}  {away:<5}".rstrip())
+    lines.append("```")
+    return lines
+
 
 def render_analytics(d: dict, momentum: str | None = None,
                      updated: str | None = None) -> str:
-    """Advanced analytics view: home/away comparison table from
-    the stats the feed actually carries, plus cricket target/
+    """Advanced analytics view: home/away comparison from the
+    stats the feed actually carries, plus cricket target/
     need/run-rate when present and a momentum estimate when one
     was computed from real snapshots. Ends with the Game ID line
     so the panel buttons on this message keep resolving."""
@@ -240,13 +304,8 @@ def render_analytics(d: dict, momentum: str | None = None,
     ordered += [n for n in by_name if n not in _ANALYTICS_ORDER]
     if ordered:
         lines.append("")
-        lines.append("**Match statistics**")
-        lines.append("| Statistic | Home | Away |")
-        lines.append("|---|---:|---:|")
-        for name in ordered:
-            s = by_name[name]
-            label = _ANALYTICS_LABELS.get(name, name)
-            lines.append(f"| {label} | {s.get('home', '')} | {s.get('away', '')} |")
+        lines.append("**📊 Match statistics**")
+        lines.extend(format_analytics_stats([by_name[n] for n in ordered]))
     else:
         lines.append("")
         lines.append("No match statistics available yet.")
@@ -1173,7 +1232,7 @@ async def post_panel_now(bot, channel_id: int, game_id: str,
     watch = _watches.get((channel_id, str(game_id)))
     if watch is None:
         return False
-    return await _refresh_panel(bot, channel_id, watch, detail)
+    return await _refresh_panel(bot, channel_id, game_id, watch, detail)
 
 
 async def register_game_panel(channel_id: int, game_id: str,

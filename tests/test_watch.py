@@ -991,6 +991,79 @@ class TestAiWatchAll(unittest.IsolatedAsyncioTestCase):
                             for s in interaction.followup.sent))
 
 
+class TestRenderAnalytics(unittest.TestCase):
+    """The Advanced analytics view: the old markdown pipe table
+    rendered as raw text in Discord — the stats now render as
+    aligned rows with a split bar in a monospace block."""
+
+    def setUp(self):
+        g = _load("games1x2.json")[0]
+        self.detail = prov._onex_detail_from_raw(g)
+
+    def test_keeps_every_stat_row_and_momentum(self):
+        momentum = ("Momentum (estimate, last ~3 min): away side +7 "
+                    "attacks/shots vs the other side")
+        text = wmod.render_analytics(self.detail, momentum,
+                                     updated="16:17:34")
+        for name in ("Possession", "Shots on target",
+                     "Corners", "Yellow cards", "Red card", "Attacks",
+                     "xG", "Saves", "Substitutions", "Penalty"):
+            self.assertIn(name, text)
+        # Possession % values carry the % the stat name declares.
+        self.assertIn("40%", text)
+        self.assertIn("60%", text)
+        # xG decimals are kept exactly as the feed sent them.
+        self.assertIn("0.15", text)
+        self.assertIn("0.71", text)
+        self.assertIn("Momentum (estimate", text)
+        self.assertIn("Game ID: 771747666", text)
+        self.assertIn("-# Updated 16:17:34 NPT", text)
+
+    def test_no_markdown_pipe_table(self):
+        text = wmod.render_analytics(self.detail)
+        self.assertNotIn("| Statistic |", text)
+        self.assertNotIn("|---|", text)
+        self.assertNotIn("| Possession", text)
+
+    def test_stat_block_is_aligned_with_bars(self):
+        text = wmod.render_analytics(self.detail)
+        self.assertIn("```", text)
+        self.assertIn("█", text)
+        self.assertIn("░", text)
+        # Possession 40/60: 4 of 10 blocks filled.
+        self.assertIn("████░░░░░░", text)
+        # Every row inside the block has the same shape: label,
+        # home value, a 10-block bar, away value.
+        block = text.split("```")[1]
+        rows = [r for r in block.strip().split("\n") if r.strip()]
+        self.assertEqual(len(rows), 10)
+        for row in rows:
+            self.assertRegex(row, r"[█░]{10}")
+
+    def test_non_numeric_stat_renders_without_bar(self):
+        detail = dict(self.detail)
+        detail["stats"] = [
+            {"name": "Possession %", "home": "53", "away": "47"},
+            {"name": "Man of the match", "home": "—", "away": "—"}]
+        text = wmod.render_analytics(detail)
+        self.assertIn("Man of the match", text)
+        block = text.split("```")[1]
+        plain = [r for r in block.split("\n")
+                 if "Man of the match" in r]
+        self.assertEqual(len(plain), 1)
+        self.assertNotIn("█", plain[0])
+        self.assertNotIn("░", plain[0])
+        # The numeric row still has its bar.
+        self.assertIn("█████░░░░░", text)
+
+    def test_no_stats_message_unchanged(self):
+        detail = dict(self.detail)
+        detail["stats"] = []
+        text = wmod.render_analytics(detail)
+        self.assertIn("No match statistics available yet.", text)
+        self.assertIn("Game ID: 771747666", text)
+
+
 class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
     """The 📊 Detail / 🔄 Live buttons on watch alerts (mocked
     providers + fake Discord interactions, no network)."""
@@ -2696,6 +2769,66 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("🔴 LIVE", text)
         watch = wmod._watches[(777, "771747666")]
         self.assertIsNone(watch["panel_message_id"])
+
+    async def test_analytics_panel_ticks_in_place_with_new_layout(self):
+        # An analytics panel edits in place on a stat change and
+        # keeps the bar layout, the Game ID line and the footer.
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        body = wmod.render_analytics(detail, updated="16:17:34")
+        self.channel.messages[2001] = FakeMessage(2001, body)
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        wmod._watches[(777, "771747666")] = {
+            "home": detail["home"], "away": detail["away"],
+            "league": detail.get("league", ""), "detail": "advanced",
+            "fmt": "", "snapshot": snap, "missing": 0, "notify": False,
+            "panel_kind": "analytics", "panel_message_id": 2001,
+            "panel_body": body,
+            "panel_base_body": wmod._strip_updated_footer(body),
+            "panel_static": wmod._panel_static_from_detail(detail),
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": time.monotonic() - 2,
+            "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        # Possession flips 40/60 -> 55/45.
+        changed["scores"]["tabloStats"]["0"][4]["s1"] = "55"
+        changed["scores"]["tabloStats"]["0"][4]["s2"] = "45"
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(self.channel.sent), 0)
+        panel = self.channel.messages[2001]
+        self.assertEqual(len(panel.edits), 1)
+        self.assertIn("```", panel.edits[0])
+        self.assertIn("55%", panel.edits[0])
+        self.assertIn("Game ID: 771747666", panel.edits[0])
+        self.assertIn("-# Updated", panel.edits[0])
+
+    async def test_post_panel_now_posts_panel_in_other_channel(self):
+        # /watch into a different channel: post_panel_now posts
+        # the live panel there. (It used to call _refresh_panel
+        # with the arguments in the wrong order, so the panel was
+        # never posted and the call silently returned False.)
+        self._seed_watch(with_panel=False)
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        posted = await wmod.post_panel_now(self.bot, 777, "771747666",
+                                           detail)
+        self.assertTrue(posted)
+        self.assertEqual(len(self.channel.sent), 1)
+        panel = self.channel.sent[0]
+        self.assertIn("🔴 LIVE", panel.content)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast",
+                      panel.content)
+        self.assertIn("Game ID: 771747666", panel.content)
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_message_id"],
+            panel.id)
+
+    async def test_post_panel_now_false_without_watch(self):
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        self.assertFalse(await wmod.post_panel_now(
+            self.bot, 777, "771747666", detail))
+        self.assertEqual(len(self.channel.sent), 0)
 
 
 class TestGamePanel(unittest.IsolatedAsyncioTestCase):

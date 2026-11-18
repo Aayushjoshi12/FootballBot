@@ -569,7 +569,8 @@ async def _send_game_detail(interaction: discord.Interaction,
     in place (score + MM:SS clock) until full-time, with no new
     messages. When the game already has a panel in this channel
     the reply stays a static detail card."""
-    body = watch.render_detail(detail, level)
+    body = watch.render_detail(detail, level,
+                               updated=watch.now_npt_str())
     msg = await interaction.followup.send(
         body, view=watch.WatchAlertView(), wait=True)
     status = str(detail.get("status") or "")
@@ -799,7 +800,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
     if detail is not None and live_status in (
             "1H", "2H", "ET", "PEN", "HT", "Live",
             "1st innings", "2nd innings"):
-        panel = watch.render_panel(detail)
+        panel = watch.render_panel(detail, updated=watch.now_npt_str())
         view = watch.WatchAlertView(str(started["game_id"]))
         if target.id == interaction.channel_id:
             msg = await interaction.followup.send(

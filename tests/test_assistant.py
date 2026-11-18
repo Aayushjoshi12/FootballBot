@@ -107,6 +107,43 @@ class FakeInteraction:
         self.user = SimpleNamespace(id=42)
 
 
+class _Missing:
+    """Sentinel mirroring discord.utils.MISSING: an omitted view
+    argument is fine, an explicit view=None is not."""
+
+    def __repr__(self):
+        return "MISSING"
+
+
+MISSING = _Missing()
+
+
+class StrictFakeFollowup(FakeFollowup):
+    """followup.send that enforces discord.py 2.4.0's real rule
+    (Webhook.send): `view` omitted is fine, but an explicit
+    view=None raises TypeError — "expected view parameter to be
+    of type View not NoneType". The old permissive fake accepted
+    view=None, which hid the production /ask failure: every _send
+    without a view raised in production while the tests passed."""
+
+    async def send(self, content=None, ephemeral=False, view=MISSING,
+                   **kwargs):
+        if view is not MISSING and view is None:
+            raise TypeError(
+                "expected view parameter to be of type View not NoneType")
+        self.sent.append(content)
+        self.sent_views.append(None if view is MISSING else view)
+
+
+class StrictFakeInteraction(FakeInteraction):
+    """An /ask interaction whose followup enforces the real
+    discord.py rule."""
+
+    def __init__(self, channel_id=777):
+        super().__init__(channel_id)
+        self.followup = StrictFakeFollowup()
+
+
 CHANNELS = [{"id": 111, "name": "general"},
             {"id": 222, "name": "test"}]
 
@@ -427,6 +464,73 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
             await amod.handle_ask(interaction2, "what games are live",
                                   None, CHANNELS)
             self.assertIn("Lumbini", interaction2.followup.sent[0])
+
+    async def test_live_football_strict_followup_no_view_none(self):
+        # The 18 Nov 2026 production traceback: handle_ask ->
+        # _send -> followup.send(view=None) raised TypeError in
+        # real discord.py, so EVERY /ask live-list question failed
+        # in production while the permissive fakes passed. With a
+        # followup that enforces the real rule, the same question
+        # must answer with the list, not "Something went wrong".
+        npl = json.loads((Path(__file__).resolve().parent
+                          / "fixtures" / "scoreboard"
+                          / "games1x2_npl.json").read_text(encoding="utf-8"))
+        mixed = self.games1x2 + npl
+        with patch.object(prov, "onex_live_raw",
+                          new=AsyncMock(return_value=mixed)):
+            interaction = StrictFakeInteraction()
+            await amod.handle_ask(interaction,
+                                  "show me all live football",
+                                  None, CHANNELS)
+            self.assertEqual(len(interaction.followup.sent), 1)
+            text = interaction.followup.sent[0]
+            self.assertNotIn("Something went wrong", text)
+            self.assertIn("Gambia", text)
+            self.assertNotIn("Lumbini", text)
+
+    async def test_live_cricket_strict_followup_no_view_none(self):
+        # Same production failure, cricket wording.
+        npl = json.loads((Path(__file__).resolve().parent
+                          / "fixtures" / "scoreboard"
+                          / "games1x2_npl.json").read_text(encoding="utf-8"))
+        mixed = self.games1x2 + npl
+        with patch.object(prov, "onex_live_raw",
+                          new=AsyncMock(return_value=mixed)):
+            interaction = StrictFakeInteraction()
+            await amod.handle_ask(interaction,
+                                  "show me all live cricket",
+                                  None, CHANNELS)
+            self.assertEqual(len(interaction.followup.sent), 1)
+            text = interaction.followup.sent[0]
+            self.assertNotIn("Something went wrong", text)
+            self.assertIn("Lumbini", text)
+            self.assertNotIn("Gambia", text)
+
+    async def test_send_without_view_omits_view_argument(self):
+        # _send with no view must not pass view=None at all — not
+        # on a single chunk and not on any chunk of a split reply.
+        interaction = StrictFakeInteraction()
+        await amod._send(interaction, "hello")
+        self.assertEqual(interaction.followup.sent, ["hello"])
+        self.assertEqual(interaction.followup.sent_views, [None])
+        interaction2 = StrictFakeInteraction()
+        await amod._send(interaction2, "first line\n" + "x" * 2500)
+        # "first line" + the 2500-char line hard-cut at 1900 = 3 chunks.
+        self.assertEqual(len(interaction2.followup.sent), 3)
+        self.assertEqual(interaction2.followup.sent_views,
+                         [None, None, None])
+
+    async def test_send_with_view_attaches_it_to_last_chunk_only(self):
+        # A view still reaches the last chunk — and only it.
+        view = Mock()
+        interaction = StrictFakeInteraction()
+        await amod._send(interaction, "first line\n" + "x" * 2500,
+                         view=view)
+        # 3 chunks (see above): the view rides the last one only.
+        self.assertEqual(len(interaction.followup.sent), 3)
+        self.assertIsNone(interaction.followup.sent_views[0])
+        self.assertIsNone(interaction.followup.sent_views[1])
+        self.assertIs(interaction.followup.sent_views[2], view)
 
     async def test_live_list_stays_under_discord_limit(self):
         # A 15-game list of long cricket names can pass Discord's

@@ -675,10 +675,17 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
 async def _send(interaction, content: str, view=None) -> None:
     parts = _split_message(content)
     for i, part in enumerate(parts):
-        # The buttons belong with the last chunk.
-        await interaction.followup.send(
-            part, view=view if i == len(parts) - 1 else None,
-            ephemeral=True)
+        # The buttons belong with the last chunk — and real
+        # discord.py (Webhook.send, used by followup.send) rejects
+        # an explicit view=None with TypeError, so the argument is
+        # omitted entirely when there is no view to attach. That
+        # is what failed every /ask live-list question in
+        # production on 18 Nov 2026 while the permissive fakes
+        # passed.
+        kwargs: dict = {"ephemeral": True}
+        if i == len(parts) - 1 and view is not None:
+            kwargs["view"] = view
+        await interaction.followup.send(part, **kwargs)
 
 
 async def _handle_ask(interaction, text: str, model,

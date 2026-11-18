@@ -17,7 +17,16 @@ edits in place on the same 1s tick — score + ticking MM:SS clock
 a new message. Routine changes only ever edit the panel; only
 goals, wickets, cards and other big events send a separate
 notification. When the game ends the panel shows the final score
-and stops ticking.
+and stops ticking. The panel proves it is alive with an
+"Updated HH:MM:SS NPT" footer: the footer advances on every
+edit, and when the game itself has not changed for 30s the tick
+heartbeat-edits the footer alone, so a cricket panel whose score
+has not moved for an over still shows life without an edit every
+second. Detail / Live / Simple / Advanced / Refresh switch the
+panel's view IN PLACE (never a fresh static snapshot); a button
+tapped on a /game reply that was never registered adopts that
+message as the panel. Timeline stays a one-off ephemeral list
+and Follow/Unfollow stay ephemeral confirms.
 
 A /game reply IS a panel too: the same tick edits the detail card
 in place (panel_kind "detail") while the game is live. Follow
@@ -139,11 +148,13 @@ def format_stats_table(stats: list[dict] | None) -> list[str]:
     return lines
 
 
-def render_detail(d: dict, level: str = DETAIL_SIMPLE) -> str:
+def render_detail(d: dict, level: str = DETAIL_SIMPLE,
+                  updated: str | None = None) -> str:
     """One game's detail. Simple: score, clock, venue/weather/
     format/kickoff, game ID, goals + cards summary. Advanced:
     everything simple has + the full stats table and the cricket
-    target/need/balls-left/run-rate."""
+    target/need/balls-left/run-rate. `updated` appends the panel's
+    Updated footer (a live panel's proof it is ticking)."""
     lines = [f"**{d.get('home', '?')} {_score_str(d)} {d.get('away', '?')}**"]
     if d.get("league"):
         lines.append(str(d["league"]))
@@ -194,7 +205,7 @@ def render_detail(d: dict, level: str = DETAIL_SIMPLE) -> str:
             lines.append("")
             lines.append("**Match stats**")
             lines.extend(table)
-    return "\n".join(lines)
+    return "\n".join(lines) + _updated_footer(updated)
 
 
 # Preferred stat order for the analytics table (Feature 4);
@@ -210,7 +221,8 @@ _ANALYTICS_ORDER = (
 _ANALYTICS_LABELS = {"Possession %": "Possession", "Corner": "Corners"}
 
 
-def render_analytics(d: dict, momentum: str | None = None) -> str:
+def render_analytics(d: dict, momentum: str | None = None,
+                     updated: str | None = None) -> str:
     """Advanced analytics view: home/away comparison table from
     the stats the feed actually carries, plus cricket target/
     need/run-rate when present and a momentum estimate when one
@@ -253,7 +265,7 @@ def render_analytics(d: dict, momentum: str | None = None) -> str:
     gid = str(d.get("onex_id") or d.get("id") or "?")
     const = d.get("const_id")
     lines.append(f"Game ID: {gid}" + (f" · {const}" if const else ""))
-    return "\n".join(lines)
+    return "\n".join(lines) + _updated_footer(updated)
 
 
 def render_match_list(games: list[dict]) -> str:
@@ -1058,7 +1070,9 @@ async def load_watches() -> None:
             "notify": bool(row.get("notify", 1)),
             "panel_kind": row.get("panel_kind") or "compact",
             "panel_message_id": int(panel_id) if panel_id else None,
-            "panel_body": None, "last_panel_edit": 0.0,
+            "panel_body": None, "panel_base_body": None,
+            "panel_static": {}, "panel_momentum": None,
+            "panel_momentum_ts": 0.0, "last_panel_edit": 0.0,
             "panel_blocked_until": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
@@ -1119,6 +1133,13 @@ async def start_watch(channel_id: int, entry: dict, level: str,
         # and edited in place after that — never a second message.
         "panel_message_id": kept.get("panel_message_id"),
         "panel_body": kept.get("panel_body"),
+        "panel_base_body": kept.get("panel_base_body"),
+        # A re-follow keeps the old panel's static fields too, so
+        # the next tick does not strip the card's Venue/Weather.
+        "panel_static": (kept.get("panel_static") or
+                         _panel_static_from_detail(detail)),
+        "panel_momentum": kept.get("panel_momentum"),
+        "panel_momentum_ts": kept.get("panel_momentum_ts") or 0.0,
         "last_panel_edit": kept.get("last_panel_edit") or 0.0,
         "panel_blocked_until": kept.get("panel_blocked_until") or 0.0,
         "panel_timer_sec": kept.get("panel_timer_sec"),
@@ -1139,6 +1160,7 @@ async def set_panel_message(channel_id: int, game_id: str,
     if watch is not None:
         watch["panel_message_id"] = message_id
         watch["panel_body"] = body
+        watch["panel_base_body"] = _strip_updated_footer(body)
     await db.set_watch_panel(channel_id, str(game_id), message_id)
 
 
@@ -1179,10 +1201,94 @@ async def register_game_panel(channel_id: int, game_id: str,
         "snapshot": snapshot, "missing": 0,
         "notify": False, "panel_kind": "detail",
         "panel_message_id": message_id, "panel_body": body,
+        "panel_base_body": _strip_updated_footer(body),
+        "panel_static": _panel_static_from_detail(detail),
+        "panel_momentum": None, "panel_momentum_ts": 0.0,
         "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
         "panel_timer_sec": None, "panel_timer_ts": 0.0,
     }
     return True
+
+
+async def _persist_panel_view(channel_id: int, game_id: str,
+                              entry: dict) -> None:
+    """Persist a panel view switch (kind/detail level) without
+    touching the panel message id — add_watch's ON CONFLICT
+    keeps the stored panel_message_id. Best effort: the in-memory
+    view is what the tick uses."""
+    try:
+        await db.add_watch(channel_id, game_id, entry.get("home", ""),
+                           entry.get("away", ""), entry.get("league", ""),
+                           entry.get("detail") or DETAIL_SIMPLE,
+                           entry.get("fmt") or "",
+                           entry.get("snapshot") or {},
+                           notify=bool(entry.get("notify", True)),
+                           panel_kind=entry.get("panel_kind") or "compact")
+    except Exception:
+        pass
+
+
+async def adopt_game_panel(channel_id: int, game_id: str,
+                           message_id: int, body: str,
+                           detail: dict, level: str,
+                           kind: str = "detail") -> dict:
+    """Adopt a detail-card or compact-panel message as the live
+    panel — used when a button is tapped on a /game reply that
+    was never registered: posted before the panel code went live,
+    or a second /game reply while another panel ticks. The tapped
+    message becomes THE panel; any older panel message for the
+    game stops ticking (it stays as it is, frozen — its own
+    buttons adopt it back if tapped). Returns the watch entry.
+    The db writes are best effort: the in-memory entry is what
+    the tick uses, so a tap never fails because sqlite hiccuped
+    (the panel re-adopts on the next tap after a restart)."""
+    game_id = str(game_id)
+    snapshot = snapshot_from_detail(detail)
+    snapshot["_home"], snapshot["_away"] = detail.get("home", ""), detail.get("away", "")
+    fmt = str(detail.get("format") or "")
+    static = _panel_static_from_detail(detail)
+    old = _watches.get((channel_id, game_id))
+    if old is None:
+        try:
+            await db.add_watch(channel_id, game_id, detail.get("home", ""),
+                               detail.get("away", ""), detail.get("league", ""),
+                               level, fmt, snapshot, notify=False,
+                               panel_kind=kind)
+            await db.set_watch_panel(channel_id, game_id, message_id)
+        except Exception as exc:
+            log.warning("[watch] adopt panel persist failed for %s (%s)",
+                        game_id, type(exc).__name__)
+        entry = {
+            "home": detail.get("home", ""), "away": detail.get("away", ""),
+            "league": detail.get("league", ""), "detail": level, "fmt": fmt,
+            "snapshot": snapshot, "missing": 0,
+            "notify": False, "panel_kind": kind,
+            "panel_message_id": message_id, "panel_body": body,
+            "panel_base_body": _strip_updated_footer(body),
+            "panel_static": static,
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        _watches[(channel_id, game_id)] = entry
+        return entry
+    # An entry already exists: re-point it at the tapped message
+    # and keep its alerts flag, snapshot and clock anchor.
+    old["panel_message_id"] = message_id
+    old["panel_body"] = body
+    old["panel_base_body"] = _strip_updated_footer(body)
+    old["panel_kind"] = kind
+    old["detail"] = level
+    old["panel_static"] = static
+    old["last_panel_edit"] = 0.0
+    old["panel_blocked_until"] = 0.0
+    await _persist_panel_view(channel_id, game_id, old)
+    try:
+        await db.set_watch_panel(channel_id, game_id, message_id)
+    except Exception as exc:
+        log.warning("[watch] adopt panel persist failed for %s (%s)",
+                    game_id, type(exc).__name__)
+    return old
 
 
 async def set_notify(channel_id: int, game_id: str,
@@ -1242,7 +1348,29 @@ def live_line(d: dict) -> str:
 # LIVE PANEL — one message per watched game, edited in place.
 # ══════════════════════════════════════════════════════════════════════════
 
-def render_panel(d: dict, clock: str | None = None) -> str:
+def now_npt_str() -> str:
+    """Current Nepal time as HH:MM:SS, for the panel's Updated
+    footer — the visible proof a panel is alive."""
+    return datetime.now(NEPAL).strftime("%H:%M:%S")
+
+
+_UPDATED_FOOTER_RE = re.compile(r"\n\n-# Updated \d{2}:\d{2}:\d{2} NPT$")
+
+
+def _strip_updated_footer(text: str) -> str:
+    """The panel text without its Updated footer — the part the
+    tick compares to decide whether the GAME changed. The footer
+    alone must never count as a change, or the panel would edit
+    itself every second forever."""
+    return _UPDATED_FOOTER_RE.sub("", text or "")
+
+
+def _updated_footer(updated: str | None) -> str:
+    return f"\n\n-# Updated {updated} NPT" if updated else ""
+
+
+def render_panel(d: dict, clock: str | None = None,
+                 updated: str | None = None) -> str:
     """One game's live panel: league header, score, ticking clock
     (or overs / Innings break for cricket), Game ID line so the
     panel buttons keep resolving. The panel is edited in place on
@@ -1274,7 +1402,7 @@ def render_panel(d: dict, clock: str | None = None) -> str:
     gid = str(d.get("onex_id") or d.get("id") or "?")
     const = d.get("const_id")
     lines.append(f"Game ID: {gid}" + (f" · {const}" if const else ""))
-    return "\n".join(lines)
+    return "\n".join(lines) + _updated_footer(updated)
 
 
 def _panel_clock(watch: dict, detail: dict, now: float) -> str:
@@ -1306,6 +1434,16 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
     return _clock_str(detail)
 
 
+# Panel heartbeat: a panel whose game has not changed still
+# proves it is alive — the Updated line advances at most every
+# 30s, the way the scoreboard force-refreshes every 5 min.
+# Score/overs/clock changes still land within a second; the
+# heartbeat only fires when nothing else changed, so a quiet
+# cricket panel shows life without an edit every second. The
+# Updated time is the LAST-EDIT time, not a promise the score
+# moved — honest, and it is the only thing that can move when
+# no ball has been bowled.
+_PANEL_HEARTBEAT_S = 30.0
 # Panel edits: at most one per second per panel (the tick itself),
 # and a 429 pauses that panel until the retry time — the same
 # discipline as the scoreboard's edits, but the ticking clock
@@ -1332,6 +1470,58 @@ async def _get_channel(bot: discord.Client, channel_id: int):
     return channel
 
 
+def _panel_static_from_detail(detail: dict) -> dict:
+    """The fields a /game reply knows that the 1s tick does not:
+    venue / weather / format come from gameInfo, which the tick
+    never calls. Kept on the watch so the first tick does not
+    strip those lines off the card. In-memory only — after a
+    restart they drop once and come back on the next Refresh."""
+    return {
+        "venue": str(detail.get("venue") or ""),
+        "weather": str(detail.get("weather") or ""),
+        "format": str(detail.get("format") or ""),
+        "league": str(detail.get("league") or ""),
+        "start_ts": detail.get("start_ts"),
+    }
+
+
+def _with_static(detail: dict, watch: dict) -> dict:
+    """Fill the tick detail's blank venue/weather/format/league/
+    kickoff from the panel's stored static fields."""
+    static = watch.get("panel_static") or {}
+    if not static:
+        return detail
+    out = dict(detail)
+    for key in ("venue", "weather", "format", "league"):
+        if not out.get(key) and static.get(key):
+            out[key] = static[key]
+    if not out.get("start_ts") and static.get("start_ts"):
+        out["start_ts"] = static["start_ts"]
+    return out
+
+
+def _render_panel_view(detail: dict, watch: dict, clock: str,
+                       updated: str | None) -> str:
+    """Render the panel in its current view: the /game detail
+    card (simple or advanced), the analytics table, or the
+    compact live line. The ticking clock and the stored static
+    fields go into the detail views; the compact view renders
+    from the raw detail."""
+    kind = watch.get("panel_kind") or "compact"
+    if kind == "detail":
+        ticking = _with_static(dict(detail), watch)
+        ticking["clock"] = clock
+        return render_detail(ticking,
+                             watch.get("detail") or DETAIL_SIMPLE,
+                             updated=updated)
+    if kind == "analytics":
+        ticking = _with_static(dict(detail), watch)
+        ticking["clock"] = clock
+        return render_analytics(ticking, watch.get("panel_momentum"),
+                                updated=updated)
+    return render_panel(detail, clock, updated=updated)
+
+
 async def _refresh_panel(bot: discord.Client, channel_id: int,
                          game_id: str, watch: dict,
                          detail: dict | None = None,
@@ -1344,20 +1534,40 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     a failed edit is retried on the next tick, a 429 pauses this
     panel until Discord says otherwise, a deleted watch panel is
     re-posted once, and a deleted /game panel stops quietly (its
-    reply stays deleted, no new message)."""
+    reply stays deleted, no new message).
+
+    The tick compares the render WITHOUT the Updated footer
+    (panel_base_body): a score/overs/clock change edits at once,
+    and when nothing about the game changed the panel still
+    heartbeat-edits its footer every 30s so it visibly proves it
+    is alive. The base is only stored after a successful edit —
+    a failed edit must be retried, not swallowed by the
+    heartbeat."""
+    new_base = None
     if text is None:
         if detail is None:
             return False
-        clock = _panel_clock(watch, detail, time.monotonic())
-        if watch.get("panel_kind") == "detail":
-            # The /game reply keeps its full detail card and ticks
-            # in place — same render, fresh data, ticking clock.
-            ticking = dict(detail)
-            ticking["clock"] = clock
-            text = render_detail(ticking,
-                                 watch.get("detail") or DETAIL_SIMPLE)
-        else:
-            text = render_panel(detail, clock)
+        now = time.monotonic()
+        if watch.get("panel_kind") == "analytics" and \
+                now - (watch.get("panel_momentum_ts") or 0) \
+                >= _PANEL_HEARTBEAT_S:
+            # The momentum estimate stays fresh without a db read
+            # on every tick — same 30s cadence as the heartbeat.
+            try:
+                watch["panel_momentum"] = await history.momentum_summary(game_id)
+            except Exception:
+                pass
+            watch["panel_momentum_ts"] = now
+        clock = _panel_clock(watch, detail, now)
+        base = _render_panel_view(detail, watch, clock, updated=None)
+        if base == watch.get("panel_base_body"):
+            # Nothing about the game changed: heartbeat only.
+            if now - (watch.get("last_panel_edit") or 0) \
+                    < _PANEL_HEARTBEAT_S:
+                return False
+        new_base = base
+        text = _render_panel_view(detail, watch, clock,
+                                  updated=now_npt_str())
     if text == watch.get("panel_body"):
         return False
     now = time.monotonic()
@@ -1378,7 +1588,7 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound:
-            if watch.get("panel_kind") == "detail":
+            if watch.get("panel_kind") in ("detail", "analytics"):
                 # A deleted /game reply stays deleted — the panel
                 # stops quietly instead of posting a new message.
                 log.info("[watch] game panel deleted for %s; stopping",
@@ -1418,7 +1628,7 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     except discord.NotFound:
         # Deleted between fetch and edit. A /game panel stops
         # quietly; a watch panel posts a fresh one once.
-        if watch.get("panel_kind") == "detail":
+        if watch.get("panel_kind") in ("detail", "analytics"):
             log.info("[watch] game panel deleted for %s; stopping",
                      game_id)
             await remove_watch(channel_id, game_id)
@@ -1451,6 +1661,10 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
         except Exception:
             pass
     watch["panel_body"] = text
+    if new_base is not None:
+        # Only after a successful edit — a failed edit is
+        # retried on the next tick, not swallowed.
+        watch["panel_base_body"] = new_base
     watch["last_panel_edit"] = now
     watch["panel_blocked_until"] = 0.0
     if edited:
@@ -1537,6 +1751,124 @@ _REFRESH_COOLDOWN_S = 10.0
 _refresh_cooldown: dict[tuple[int, str], float] = {}
 
 
+async def _switch_panel_view(interaction: discord.Interaction,
+                             kind: str | None,
+                             level: str | None = None) -> None:
+    """Detail / Live / Simple / Advanced / Refresh: switch the
+    game's live panel to that view IN PLACE — never a fresh
+    static snapshot. kind None = keep the current view (Refresh).
+
+    - The button sits on the live panel, or on a /game detail
+      card, or on a compact panel: that message is adopted as
+      the panel when needed (a reply posted before the panel
+      code, or a second /game reply) and edited in place to the
+      new view.
+    - The button sits on any other message (an alert): the real
+      panel is switched in place and the tap gets a short
+      ephemeral confirm.
+    - No panel anywhere: the old ephemeral snapshot — there is
+      nothing live to update.
+    - An ephemeral message is never adopted as a panel (the tick
+      could not fetch it back) — its buttons fall through to the
+      real panel or the snapshot.
+    Timeline stays a one-off ephemeral list (it is history, not
+    a live view) and Follow/Unfollow stay ephemeral confirms."""
+    game_id = _resolve_game_id(interaction)
+    if game_id is None:
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            "Could not tell which game this is.", ephemeral=True)
+        return
+    channel_id = getattr(interaction, "channel_id", None)
+    message = getattr(interaction, "message", None)
+    content = getattr(message, "content", "") or ""
+    msg_id = getattr(message, "id", None)
+    flags = getattr(message, "flags", None)
+    is_ephemeral = bool(getattr(flags, "ephemeral", False))
+    entry = (_watches.get((channel_id, game_id))
+             if channel_id is not None else None)
+    is_panel_msg = bool(entry and entry.get("panel_message_id") == msg_id)
+    is_detail_card = content.startswith("**") and "Game ID:" in content
+    is_compact_panel = (content.startswith("🔴 LIVE")
+                        or content.startswith("🏁")) \
+        and "Game ID:" in content
+    on_live_msg = (is_panel_msg or is_detail_card or is_compact_panel) \
+        and not is_ephemeral
+    # Defer first, in the shape the branch needs — a tap on the
+    # live message edits that message, anything else answers
+    # ephemerally — so the error below can use followup.send.
+    if on_live_msg:
+        await interaction.response.defer()
+    else:
+        await interaction.response.defer(ephemeral=True)
+    detail = await _fetch_live_detail(game_id)
+    if detail is None:
+        await interaction.followup.send(
+            "That game is no longer live.", ephemeral=True)
+        return
+    if on_live_msg:
+        # Edit THIS message in place — adopt it first when it
+        # was never registered as a panel.
+        if not is_panel_msg:
+            adopt_kind = "compact" if is_compact_panel else "detail"
+            adopt_level = level or (DETAIL_ADVANCED
+                                    if "Match stats" in content
+                                    else DETAIL_SIMPLE)
+            entry = await adopt_game_panel(
+                channel_id, game_id, msg_id, content, detail,
+                adopt_level, kind=adopt_kind)
+        if kind is not None:
+            entry["panel_kind"] = kind
+        if level is not None:
+            entry["detail"] = level
+        await _persist_panel_view(channel_id, game_id, entry)
+        clock = _panel_clock(entry, detail, time.monotonic())
+        if entry.get("panel_kind") == "analytics":
+            try:
+                entry["panel_momentum"] = await history.momentum_summary(game_id)
+            except Exception:
+                pass
+            entry["panel_momentum_ts"] = time.monotonic()
+        text = _render_panel_view(detail, entry, clock,
+                                  updated=now_npt_str())
+        await interaction.edit_original_response(
+            content=text, view=WatchAlertView(game_id))
+        entry["panel_body"] = text
+        entry["panel_base_body"] = _render_panel_view(
+            detail, entry, clock, updated=None)
+        entry["last_panel_edit"] = time.monotonic()
+        return
+    if entry is not None and channel_id is not None:
+        # The button sits on an alert: switch the real panel in
+        # place and confirm briefly.
+        if kind is not None:
+            entry["panel_kind"] = kind
+        if level is not None:
+            entry["detail"] = level
+        await _persist_panel_view(channel_id, game_id, entry)
+        bot = getattr(interaction, "client", None)
+        if bot is not None:
+            await _refresh_panel(bot, channel_id, game_id, entry, detail)
+        await interaction.followup.send(
+            "Live panel updated.", ephemeral=True)
+        return
+    # No panel anywhere: the old one-off snapshot.
+    if kind == "analytics":
+        try:
+            momentum = await history.momentum_summary(game_id)
+        except Exception:
+            momentum = None
+        await interaction.followup.send(
+            render_analytics(detail, momentum, updated=now_npt_str()),
+            ephemeral=True)
+    elif kind == "compact":
+        await interaction.followup.send(live_line(detail), ephemeral=True)
+    else:
+        await interaction.followup.send(
+            render_detail(detail, level or DETAIL_SIMPLE,
+                          updated=now_npt_str()), ephemeral=True)
+
+
 class WatchAlertView(discord.ui.View):
     """Buttons on a watch alert or a detail reply — the live match
     panel (Feature 2). Persistent (timeout=None) with STATIC
@@ -1547,10 +1879,11 @@ class WatchAlertView(discord.ui.View):
     ("watch:detail:<id>", "panel:refresh:<id>", ...) still works
     as a fallback when the view was built with a game id.
 
-    Detail / Live are the original two buttons. Refresh updates
-    a detail card in place (or answers with a fresh live line);
-    Timeline shows the chronoLine events; Simple / Advanced show
-    that level of detail; Follow / Unfollow start or stop a
+    Detail / Live / Simple / Advanced / Refresh switch the
+    game's live panel to that view IN PLACE — the tick keeps
+    editing it after that, so no tap ever sends a fresh static
+    snapshot while a panel exists. Timeline shows the chronoLine
+    events (a one-off list); Follow / Unfollow start or stop a
     watch for this game in this channel."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1590,33 +1923,14 @@ class WatchAlertView(discord.ui.View):
             self.add_item(btn)
 
     async def _on_detail(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        game_id = _resolve_game_id(interaction)
-        if game_id is None:
-            await interaction.followup.send(
-                "Could not tell which game this is.", ephemeral=True)
-            return
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        await interaction.followup.send(
-            render_detail(detail, DETAIL_ADVANCED), ephemeral=True)
+        # The detail card, in place — the old behaviour sent a
+        # fresh static snapshot on every tap.
+        await _switch_panel_view(interaction, "detail",
+                                 level=DETAIL_ADVANCED)
 
     async def _on_live(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        game_id = _resolve_game_id(interaction)
-        if game_id is None:
-            await interaction.followup.send(
-                "Could not tell which game this is.", ephemeral=True)
-            return
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        await interaction.followup.send(live_line(detail), ephemeral=True)
+        # The compact live line, in place.
+        await _switch_panel_view(interaction, "compact")
 
     async def _on_refresh(self, interaction: discord.Interaction):
         game_id = _resolve_game_id(interaction)
@@ -1633,30 +1947,9 @@ class WatchAlertView(discord.ui.View):
                 ephemeral=True)
             return
         _refresh_cooldown[(user_id, game_id)] = now
-        # Non-ephemeral defer: edit_original_response below edits
-        # the message the button sits on.
-        await interaction.response.defer()
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        content = getattr(getattr(interaction, "message", None),
-                          "content", "") or ""
-        if (content.startswith("🔴 LIVE") or content.startswith("🏁")) \
-                and "Game ID:" in content:
-            # The live panel itself: refresh it in place.
-            await interaction.edit_original_response(
-                content=render_panel(detail),
-                view=WatchAlertView(game_id))
-        elif content.startswith("**") and "Game ID:" in content:
-            level = (DETAIL_ADVANCED if "Match stats" in content
-                     else DETAIL_SIMPLE)
-            await interaction.edit_original_response(
-                content=render_detail(detail, level),
-                view=WatchAlertView(game_id))
-        else:
-            await interaction.followup.send(live_line(detail), ephemeral=True)
+        # Keep the panel's current view — Refresh re-renders it
+        # in place; the tick already shows new scores on its own.
+        await _switch_panel_view(interaction, None)
 
     async def _on_timeline(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1692,38 +1985,11 @@ class WatchAlertView(discord.ui.View):
                                         ephemeral=True)
 
     async def _on_simple(self, interaction: discord.Interaction):
-        await self._on_level(interaction, DETAIL_SIMPLE)
+        await _switch_panel_view(interaction, "detail",
+                                 level=DETAIL_SIMPLE)
 
     async def _on_advanced(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        game_id = _resolve_game_id(interaction)
-        if game_id is None:
-            await interaction.followup.send(
-                "Could not tell which game this is.", ephemeral=True)
-            return
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        momentum = await history.momentum_summary(game_id)
-        await interaction.followup.send(
-            render_analytics(detail, momentum), ephemeral=True)
-
-    async def _on_level(self, interaction: discord.Interaction, level: str):
-        await interaction.response.defer(ephemeral=True)
-        game_id = _resolve_game_id(interaction)
-        if game_id is None:
-            await interaction.followup.send(
-                "Could not tell which game this is.", ephemeral=True)
-            return
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        await interaction.followup.send(
-            render_detail(detail, level), ephemeral=True)
+        await _switch_panel_view(interaction, "analytics")
 
     async def _on_follow(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)

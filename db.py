@@ -57,7 +57,8 @@ async def init() -> None:
             -- notify: 1 = event alerts on (/watch); 0 = view-only
             -- live panel (/game) — Follow flips this, it never
             -- removes the panel. panel_kind: 'compact' (the /watch
-            -- panel) or 'detail' (the /game detail card).
+            -- panel), 'detail' (the /game detail card) or
+            -- 'analytics' (the stats-table view).
             notify     INTEGER NOT NULL DEFAULT 1,
             panel_kind TEXT    NOT NULL DEFAULT 'compact',
             PRIMARY KEY (channel_id, game_id)

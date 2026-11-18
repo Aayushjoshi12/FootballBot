@@ -37,6 +37,15 @@ def _load(name):
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+async def _drain_panel_workers(timeout=5.0):
+    """The tick hands panel edits to background workers — wait
+    for them before asserting on a panel."""
+    tasks = [t for t in list(wmod._panel_workers.values()) if not t.done()]
+    if tasks:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout)
+
+
 class FakeMessage:
     def __init__(self, mid, content, view=None):
         self.id = mid
@@ -203,6 +212,7 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.sent), 0)
         await maintenance.set_on(False)
         await wmod.on_tick(self.bot, [changed])
+        await _drain_panel_workers()
         # Resumed: the goal alert goes out and the panel ticks.
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("GOAL", self.channel.sent[0].content)

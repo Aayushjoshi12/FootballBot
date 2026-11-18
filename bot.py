@@ -156,6 +156,11 @@ class FootballBot(discord.Client):
         # custom_id matches a registered template, so the
         # template itself must be registered here.
         self.add_dynamic_items(watch.RemoveWatchButton)
+        # ▶ Watch buttons on /ask replies are dynamic items too
+        # (template "panel:watch:<game_id>"), for the same
+        # reason — they must keep working after a restart, with
+        # no in-memory view state.
+        self.add_dynamic_items(watch.WatchGameButton)
         await self.tree.sync()
         # Global updates can take up to an hour to appear.  This bot is used
         # in a small set of servers, so also perform an immediate guild sync.

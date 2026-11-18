@@ -2191,7 +2191,21 @@ async def _switch_panel_view(interaction: discord.Interaction,
     actually sends (football: tabloStats), and a game/league
     that sends none has nothing to show. When the details
     feed is ALSO not answering (info_failed), the view says
-    so plainly instead."""
+    so plainly instead.
+
+    REPAIR (18 Nov 2026 — "Advanced stops the refresh"): the
+    snapshot above is a one-off message that never ticks, and
+    the live panel kept its OLD view — so the user stared at a
+    frozen analytics card while the panel ticked on in compact
+    view somewhere else, which reads as "refreshing stopped".
+    A view tap therefore ALSO switches the live panel to the
+    tapped view (kind + detail level, persisted) and
+    re-asserts its worker, so the panel keeps refreshing in
+    the view the user asked for. The tap still never edits the
+    panel message itself — only the stored view changes, and
+    the next tick (or the re-asserted worker) renders it. A
+    tap on a stale message repairs the REAL panel the same
+    way; the stale message is never adopted."""
     game_id = _resolve_game_id(interaction)
     if game_id is None:
         _tap_log(interaction, button, None, "failed: unknown game")
@@ -2213,6 +2227,7 @@ async def _switch_panel_view(interaction: discord.Interaction,
     entry = (_watches.get((channel_id, game_id))
              if channel_id is not None else None)
     now = time.monotonic()
+    momentum = None
     if kind == "analytics":
         try:
             momentum = await history.momentum_summary(game_id)
@@ -2253,6 +2268,36 @@ async def _switch_panel_view(interaction: discord.Interaction,
             live_count=(live_watch_count(channel_id)
                         if channel_id is not None else None)))
     _tap_log(interaction, button, game_id, "sent new message")
+    if entry is not None and kind in ("analytics", "compact", "detail"):
+        # View switch (see the REPAIR note in the docstring):
+        # the live panel keeps refreshing, now in the tapped
+        # view. Refresh (kind None) switches nothing — it just
+        # re-renders the panel's current view as the snapshot.
+        if kind == "analytics":
+            entry["panel_kind"] = "analytics"
+            entry["panel_momentum"] = momentum
+            entry["panel_momentum_ts"] = now
+        elif kind == "compact":
+            entry["panel_kind"] = "compact"
+        else:
+            entry["panel_kind"] = "detail"
+            if level:
+                entry["detail"] = level
+        await _persist_panel_view(channel_id, game_id, entry)
+    if entry is not None:
+        # Re-assert the panel worker with the fresh detail, so
+        # the panel's next edit lands at once in the (possibly
+        # new) view instead of waiting for the next 1s tick —
+        # and so a worker that died mid-edit is recreated now,
+        # not whenever the tick notices. Idempotent: when a
+        # worker is already running it just gets fresher detail.
+        # No bot handle in the interaction (tests, mostly) means
+        # no worker to assert — the tick re-creates it anyway.
+        bot = getattr(interaction, "client", None)
+        if bot is not None and channel_id is not None:
+            _schedule_panel_edits(
+                bot, {(channel_id, game_id): detail},
+                {(channel_id, game_id)})
 
 
 class WatchAlertView(discord.ui.View):
@@ -2270,8 +2315,11 @@ class WatchAlertView(discord.ui.View):
     never edited by a tap — see _switch_panel_view: in-place
     tap edits gave no visible feedback on the tapped message
     and could switch a panel elsewhere).
-    The live panel keeps ticking in place in its current view;
-    the new message is a one-off snapshot that never ticks.
+    The live panel keeps ticking in place — a view tap also
+    switches it to the tapped view (stored kind + re-asserted
+    worker, see _switch_panel_view), so it keeps refreshing
+    in the view the user asked for; the new message is a
+    one-off snapshot that never ticks.
     Timeline sends the chronoLine events as a new channel
     message too; Follow / Unfollow send a new channel message
     confirming, and start/stop alerts for this game in this
@@ -2303,7 +2351,8 @@ class WatchAlertView(discord.ui.View):
 
     def __init__(self, game_id: str | None = None,
                  live_count: int | None = None,
-                 channel_id: int | None = None):
+                 channel_id: int | None = None,
+                 watch_button: bool = False):
         super().__init__(timeout=None)
         self.game_id = str(game_id) if game_id else None
         # The live count, when the caller knows it (every panel
@@ -2346,6 +2395,13 @@ class WatchAlertView(discord.ui.View):
                                     custom_id=custom_id)
             btn.callback = callback
             self.add_item(btn)
+        if watch_button and self.game_id:
+            # /ask detail replies only (18 Nov 2026): the user
+            # asked for a ▶ Watch button when /ask shows a game.
+            # Live panels do NOT get it — the game there is
+            # already watched, and 🔔 Follow already starts a
+            # watch from a panel.
+            self.add_item(WatchGameButton(self.game_id, "▶ Watch"))
 
     async def _on_detail(self, interaction: discord.Interaction):
         # The detail card as a new message — the live panel is
@@ -2691,6 +2747,134 @@ async def _remove_watch_from_list(interaction: discord.Interaction,
         f"❌ Removed **{home} vs {away}** from watching in this "
         f"channel.")
     _tap_log(interaction, "Remove", game_id, "watch removed")
+
+
+def _ask_game_id(game: dict) -> str | None:
+    """The live game id for one grounding entry: the plain
+    onex_id when present, else the "onex_<id>" id with the
+    prefix stripped. None when the entry carries no numeric
+    id — such a game gets no Watch button, never a guessed
+    one."""
+    raw = (game or {}).get("onex_id") or (game or {}).get("id") or ""
+    gid = str(raw).replace("onex_", "")
+    return gid if gid.isdigit() else None
+
+
+class WatchGameButton(discord.ui.DynamicItem[discord.ui.Button],
+                      template=r"panel:watch:(?P<game_id>\d+)"):
+    """One ▶ Watch button on an /ask reply — starts watching
+    that game in this channel, exactly like /watch: a live
+    panel that ticks every second, with simple alerts on
+    goals, wickets and cards.
+
+    A DynamicItem, not a plain button, for the same reason as
+    ❌ Remove (see RemoveWatchButton): discord.py only
+    dispatches a tap after a restart when the custom_id
+    matches a registered template. The template is registered
+    in setup_hook via bot.add_dynamic_items; the game id
+    travels in the custom_id itself, so no in-memory state is
+    needed to resolve it after a restart. It works from an
+    ephemeral /ask reply because the tap is answered with a
+    visible new channel message, not an edit of the reply."""
+
+    def __init__(self, game_id: str, label: str = "▶ Watch"):
+        button = discord.ui.Button(
+            label=label, style=discord.ButtonStyle.success,
+            custom_id=f"panel:watch:{game_id}")
+        super().__init__(button)
+        self.game_id = str(game_id)
+        button.callback = self._on_watch
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["game_id"], item.label)
+
+    async def interaction_check(self, interaction) -> bool:
+        # Maintenance gate, like every other button. A blocked
+        # tap logs here (it never reaches the handler).
+        if await maintenance.view_blocked(interaction):
+            _tap_log(interaction, f"panel:watch:{self.game_id}",
+                     self.game_id, "blocked: maintenance")
+            return False
+        return True
+
+    async def _on_watch(self, interaction: discord.Interaction):
+        # The /watch path, shared with 🔔 Follow: an existing
+        # watch is never double-started, a game that is gone
+        # from the live list is answered plainly, and the
+        # confirmation is a VISIBLE new channel message — the
+        # /ask reply it was tapped from is ephemeral, so an
+        # ephemeral answer would be easy to miss.
+        await interaction.response.defer()
+        game_id = self.game_id
+        channel_id = getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            _tap_log(interaction, "Watch", game_id,
+                     "failed: unknown channel")
+            await interaction.followup.send(
+                "Could not tell which channel this is.", ephemeral=True)
+            return
+        existing = _watches.get((channel_id, game_id))
+        if existing is not None:
+            if existing.get("notify", True):
+                _tap_log(interaction, "Watch", game_id,
+                         "already watched")
+                await interaction.followup.send(
+                    "That game is already watched in this channel.")
+                return
+            # A panel-only watch (from /game): /watch would
+            # switch alerts on, so the button does the same.
+            await set_notify(channel_id, game_id, True)
+            _tap_log(interaction, "Watch", game_id,
+                     "notifications on")
+            await interaction.followup.send(
+                f"🔔 Now following **{existing['home']} vs "
+                f"{existing['away']}** — alerts on goals, wickets "
+                f"and cards. The live panel keeps ticking here.")
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            _tap_log(interaction, "Watch", game_id,
+                     "failed: game no longer live")
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        entry = {"id": game_id, "home": detail.get("home", ""),
+                 "away": detail.get("away", ""),
+                 "league": detail.get("league", ""),
+                 "status": detail.get("status", "")}
+        started = await start_watch(channel_id, entry, DETAIL_SIMPLE)
+        if not started:
+            _tap_log(interaction, "Watch", game_id,
+                     "failed: could not start watch")
+            await interaction.followup.send(
+                "Could not start watching that game.", ephemeral=True)
+            return
+        _tap_log(interaction, "Watch", game_id, "watch started")
+        await interaction.followup.send(
+            f"👀 Watching **{started['home']} vs {started['away']}** — "
+            f"a live panel in this channel ticks every second; simple "
+            f"alerts only when the game changes.")
+
+
+class AskWatchView(discord.ui.View):
+    """The view on an /ask reply that lists games: one ▶ Watch
+    button per listed game, labelled with the teams, max 5
+    (Discord allows 25 components, but five labelled buttons
+    is the most that stays readable on a pick list). The
+    buttons are dynamic items, so they survive a restart.
+    timeout=None so the message keeps its buttons."""
+
+    def __init__(self, games: list[dict]):
+        super().__init__(timeout=None)
+        for game in (games or [])[:5]:
+            gid = _ask_game_id(game)
+            if gid is None:
+                continue
+            label = ("▶ Watch "
+                     f"{_short_team(game.get('home', '?'), 12)} v "
+                     f"{_short_team(game.get('away', '?'), 12)}")
+            self.add_item(WatchGameButton(gid, label))
 
 
 async def _send_to_channel(bot: discord.Client, channel_id: int,

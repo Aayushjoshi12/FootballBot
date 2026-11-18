@@ -617,6 +617,16 @@ def _no_game_pick_text(live_now: list[dict]) -> str | None:
             + _live_line_list(_top_pick(live_now), 5))
 
 
+def _ask_watch_view(games: list[dict]):
+    """One ▶ Watch button per listed game (max 5) for an /ask
+    reply that lists games — the list text names the games,
+    the buttons let the user watch one without typing /watch.
+    None when no listed game has a usable id, so _send omits
+    the view entirely instead of attaching an empty one."""
+    view = wmod.AskWatchView(games or [])
+    return view if view.children else None
+
+
 def _pick_list(games: list[dict], header: str) -> str:
     return (header + "\n"
             + wmod.render_top_games(games, header=""))
@@ -779,14 +789,16 @@ async def _handle_ask(interaction, text: str, model,
                     "⚽ **Live games right now — pick one:**\n"
                     + _live_line_list(pool, 15)
                     + "\n\nUse `/game <ID>` for the full detail, "
-                      "or ask me to follow one.")
+                      "or ask me to follow one.",
+                    view=_ask_watch_view(pool))
         return
 
     if intent == "SEARCH_MATCH":
         if not game_id and not valid.get("team"):
             pick = _no_game_pick_text(live_now)
             if pick:
-                await _send(interaction, pick)
+                await _send(interaction, pick,
+                            view=_ask_watch_view(_top_pick(live_now)))
             else:
                 await _send(interaction, "No games are live right now.")
             return
@@ -795,7 +807,8 @@ async def _handle_ask(interaction, text: str, model,
             if matches:
                 await _send(interaction, _pick_list(
                     matches, f"Found {len(matches)} live game(s) "
-                             f"for '{valid.get('team')}':"))
+                             f"for '{valid.get('team')}':"),
+                            view=_ask_watch_view(matches))
                 return
             if live_now:
                 pool, sport = _live_pool(text, live_now)
@@ -807,7 +820,8 @@ async def _handle_ask(interaction, text: str, model,
                 await _send(interaction,
                             f"No live match for '{valid.get('team')}' "
                             f"— here are the live games right now:\n"
-                            + _live_line_list(pool, 15))
+                            + _live_line_list(pool, 15),
+                            view=_ask_watch_view(pool))
                 return
             await _send(interaction,
                         f"No live match for '{valid.get('team')}' "
@@ -838,7 +852,8 @@ async def _handle_ask(interaction, text: str, model,
             await _send(interaction,
                         f"No live match for '{valid.get('team') or game_id}' "
                         f"— here are the live games right now:\n"
-                        + _live_line_list(pool, 15))
+                        + _live_line_list(pool, 15),
+                        view=_ask_watch_view(pool))
             return
         await _send(interaction,
                     f"No live match for '{valid.get('team') or game_id}' "
@@ -852,7 +867,8 @@ async def _handle_ask(interaction, text: str, model,
                 return
             pick = _no_game_pick_text(live_now)
             if pick:
-                await _send(interaction, pick)
+                await _send(interaction, pick,
+                            view=_ask_watch_view(_top_pick(live_now)))
                 return
             await _send(interaction, "I couldn't find a live game for that.")
             return
@@ -869,7 +885,8 @@ async def _handle_ask(interaction, text: str, model,
         await _send(interaction, wmod.render_detail(detail, detail_level),
                     view=wmod.WatchAlertView(
                         str(game_id),
-                        channel_id=getattr(interaction, "channel_id", None)))
+                        channel_id=getattr(interaction, "channel_id", None),
+                        watch_button=True))
         return
 
     if intent == "FOLLOW_MATCH":
@@ -882,7 +899,8 @@ async def _handle_ask(interaction, text: str, model,
             await _send(interaction,
                         "I don't follow every game at once — pick one "
                         "to follow:\n"
-                        + _live_line_list(live_now, 15))
+                        + _live_line_list(live_now, 15),
+                        view=_ask_watch_view(live_now))
             return
         if not game_id or entry is None:
             if _is_barca_team(valid.get("team")):

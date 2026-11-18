@@ -2828,9 +2828,13 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         # That is the design the user said does not work
         # properly (a queued tick edit could overwrite the
         # tap's switch): a tap on an alert now sends a NEW
-        # visible message with the detail view, and the live
-        # panel is left exactly as it is — same kind, same
-        # body, still ticking.
+        # visible message with the detail view. The live panel
+        # is never EDITED by the tap — same message, same body
+        # — but its stored view DOES switch to detail (18 Nov
+        # 2026: "Advanced stops the refresh" — the panel kept
+        # its old view while the snapshot froze, so the tap
+        # must switch the panel's view and re-assert its
+        # worker, or the user stares at a frozen card).
         channel = FakeChannel()
         bot = FakeBot(channel)
         detail = self.detail
@@ -2856,7 +2860,9 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(interaction.edited, [])
         self.assertEqual(len(msg.edits), 0)
         self.assertEqual(msg.content, body)
-        self.assertEqual(watch["panel_kind"], "compact")
+        # The tap never edits the panel message — but the
+        # panel's stored view switches to the tapped one.
+        self.assertEqual(watch["panel_kind"], "detail")
         self.assertEqual(watch["panel_body"], body)
 
     async def test_timeline_lists_events(self):
@@ -3935,8 +3941,10 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         with self._mock_search(self._detail()):
             await view.children[1].callback(interaction)
         # The tap sends a NEW visible message with the compact
-        # line — the real panel is left exactly as it is (same
-        # kind, same body, no edit) and keeps ticking.
+        # line — the real panel's message is never edited by the
+        # tap, but its stored view switches to compact (18 Nov
+        # 2026 repair: a tap must switch the panel's view, or
+        # the user stares at a frozen card) and it keeps ticking.
         self.assertEqual(len(interaction.followup.sent), 1)
         self.assertEqual(interaction.followup.ephemeral_flags, [False])
         self.assertIn("🔴 LIVE", interaction.followup.sent[0])
@@ -5314,7 +5322,11 @@ class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msg.edits), 0)
         self.assertEqual(msg.content, body)
         watch = wmod._watches[(777, "771747666")]
-        self.assertEqual(watch["panel_kind"], "compact")
+        # The tap never edits the panel message — but its
+        # stored view switches to the tapped one (18 Nov 2026:
+        # "Advanced stops the refresh"), so the next tick
+        # renders the panel in detail view.
+        self.assertEqual(watch["panel_kind"], "detail")
         self.assertEqual(watch["panel_body"], body)
 
     async def test_live_tap_sends_new_compact_message(self):
@@ -5331,8 +5343,9 @@ class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Match stats", text)
         self.assertEqual(interaction.edited, [])
         self.assertEqual(len(msg.edits), 0)
+        # Live switches the panel's stored view back to compact.
         self.assertEqual(
-            wmod._watches[(777, "771747666")]["panel_kind"], "detail")
+            wmod._watches[(777, "771747666")]["panel_kind"], "compact")
 
     async def test_advanced_tap_with_no_stats_says_so_plainly(self):
         # The user's screenshot case (Cheetah Kasoa vs Gaz
@@ -5484,6 +5497,196 @@ class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(interaction.followup.sent), 1)
         self.assertEqual(interaction.followup.ephemeral_flags, [False])
         self.assertIn("Notifications off", interaction.followup.sent[0])
+
+
+class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026 — "Advanced stops the refresh": tapping
+    Advanced sent a one-off analytics snapshot that never
+    ticks, while the live panel kept its OLD view, so the user
+    stared at a frozen card. A view tap must ALSO switch the
+    live panel to the tapped view and re-assert its worker, so
+    the panel keeps refreshing in the view the user asked for.
+    The tap itself never edits the panel message."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp12"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        self._orig_cooldown = dict(wmod._refresh_cooldown)
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._refresh_cooldown = {}
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        wmod._refresh_cooldown = self._orig_cooldown
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _mock_search(self, detail):
+        return patch.object(
+            prov, "onex_search",
+            new=AsyncMock(return_value={"games": [], "detail": detail}))
+
+    def _seed_panel(self, kind="compact"):
+        snap = wmod.snapshot_from_detail(
+            {"home": "Republic of the Gambia", "away": "Ivory Coast",
+             "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
+             "clock": "67'", "stats": [], "cricket": None})
+        snap["_home"], snap["_away"] = ("Republic of the Gambia",
+                                        "Ivory Coast")
+        body = wmod.render_panel(self.detail, "67:00")
+        msg = FakeMessage(2001, body)
+        self.channel.messages[2001] = msg
+        wmod._watches[(777, "771747666")] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": "simple",
+            "fmt": "", "snapshot": snap, "missing": 0,
+            "missing_since": 0.0, "notify": True, "panel_kind": kind,
+            "panel_message_id": 2001, "panel_body": body,
+            "panel_base_body": body, "panel_static": {},
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": 0.0, "panel_timer_sec": None,
+            "panel_timer_ts": 0.0,
+        }
+        return msg, body
+
+    def _interaction(self, custom_id, content=None):
+        if content is None:
+            content = wmod.render_detail(self.detail,
+                                         wmod.DETAIL_ADVANCED)
+        interaction = FakeInteraction(
+            message=SimpleNamespace(content=content),
+            data={"custom_id": custom_id})
+        interaction.client = self.bot
+        return interaction
+
+    async def test_advanced_tap_switches_panel_and_it_keeps_ticking(self):
+        msg, body = self._seed_panel(kind="compact")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(self.detail):
+            await view.children[5].callback(interaction)
+        # The snapshot arrives as a new visible message...
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Match statistics", interaction.followup.sent[0])
+        # ...the tap itself never edits the panel message...
+        self.assertEqual(msg.content, body)
+        self.assertEqual(len(msg.edits), 0)
+        # ...but the panel's stored view switches to analytics
+        # and its worker is re-asserted on the spot.
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "analytics")
+        self.assertIn((777, "771747666"), wmod._panel_workers)
+        # The re-asserted worker edits the panel to the new
+        # view — the panel now IS the analytics card.
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("Match statistics", msg.content)
+        # ...and the NEXT tick still refreshes it: a goal lands
+        # on the panel, in the analytics view, instead of the
+        # panel going quiet after the tap.
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 2)
+        self.assertIn("1 – 1", msg.content)
+        self.assertIn("Match statistics", msg.content)
+        self.assertIn((777, "771747666"), wmod._watches)
+
+    async def test_advanced_tap_on_stale_message_repairs_real_panel(self):
+        # The tap lands on an old alert, not the live panel:
+        # the real panel must still switch to analytics and
+        # keep ticking — the stale message is never adopted.
+        msg, body = self._seed_panel(kind="compact")
+        alert = ("⚽ **GOAL** — Republic of the Gambia 1–1 Ivory Coast "
+                 "(67')\nGame ID: 771747666")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:advanced", content=alert)
+        with self._mock_search(self.detail):
+            await view.children[5].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_kind"], "analytics")
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_message_id"], 2001)
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("Match statistics", msg.content)
+
+    async def test_detail_tap_switches_panel_view_simple_too(self):
+        msg, body = self._seed_panel(kind="compact")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("watch:detail")
+        with self._mock_search(self.detail):
+            await view.children[0].callback(interaction)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "detail")
+        self.assertEqual(watch["detail"], wmod.DETAIL_ADVANCED)
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("Match stats", msg.content)
+
+    async def test_refresh_tap_reasserts_worker_without_switching_view(self):
+        msg, body = self._seed_panel(kind="detail")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:refresh")
+        with self._mock_search(self.detail):
+            await view.children[2].callback(interaction)
+        # Refresh switches nothing — the panel keeps its view —
+        # but the worker is re-asserted, so a stalled panel
+        # gets its next edit.
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_kind"], "detail")
+        self.assertIn((777, "771747666"), wmod._panel_workers)
+
+    async def test_tap_with_no_live_panel_just_sends_snapshot(self):
+        # An /ask detail reply with no watch behind it: the tap
+        # sends its snapshot and nothing else — no watch is
+        # invented, no crash.
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(self.detail):
+            await view.children[5].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+
+    async def test_follow_tap_does_not_freeze_panel(self):
+        # The other taps never touch the panel at all: after a
+        # Follow tap the panel is exactly as it was, and the
+        # next tick still refreshes it.
+        msg, body = self._seed_panel(kind="compact")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:follow")
+        with self._mock_search(self.detail):
+            await view.children[6].callback(interaction)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "compact")
+        self.assertEqual(watch["panel_message_id"], 2001)
+        self.assertEqual(len(msg.edits), 0)
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        await _drain_panel_workers()
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("1 – 1", msg.content)
 
 
 class TestRemoveWatchButton(unittest.IsolatedAsyncioTestCase):
@@ -5672,6 +5875,193 @@ class TestRemoveWatchButton(unittest.IsolatedAsyncioTestCase):
                  "away": f"Away {i}"} for i in range(30)]
         view = wmod.WatchingListView(rows)
         self.assertEqual(len(view.children), 25)
+
+
+class TestWatchGameButton(unittest.IsolatedAsyncioTestCase):
+    """The ▶ Watch buttons on /ask replies (18 Nov 2026, the
+    user's ask: "add button to like watch when /ask show
+    game"): tapping one starts watching that game in the
+    channel, exactly like /watch, and confirms with a visible
+    new message. The buttons are DynamicItems, so they survive
+    a restart like ❌ Remove does."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp11"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _mock_search(self, detail):
+        return patch.object(
+            prov, "onex_search",
+            new=AsyncMock(return_value={"games": [], "detail": detail}))
+
+    def _interaction(self, game_id):
+        return FakeInteraction(
+            channel_id=777,
+            data={"custom_id": f"panel:watch:{game_id}"})
+
+    def _seed_watch(self, game_id="771747666", notify=True):
+        wmod._watches[(777, game_id)] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": "simple",
+            "fmt": "", "snapshot": {}, "missing": 0,
+            "missing_since": 0.0, "notify": notify,
+            "panel_kind": "compact", "panel_message_id": 2001,
+            "panel_body": "", "panel_base_body": "",
+            "panel_static": {}, "panel_momentum": None,
+            "panel_momentum_ts": 0.0, "last_panel_edit": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+
+    async def test_watch_tap_starts_watch_and_confirms_visibly(self):
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        with self._mock_search(self.detail):
+            await btn.callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertTrue(wmod._watches[(777, "771747666")]["notify"])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Watching", interaction.followup.sent[0])
+        self.assertIn("Republic of the Gambia",
+                      interaction.followup.sent[0])
+
+    async def test_watch_tap_on_already_watched_game_says_so_plainly(self):
+        self._seed_watch()
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        await btn.callback(interaction)
+        # No second watch, no state change — one plain answer.
+        self.assertEqual(len(wmod._watches), 1)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is already watched in this channel."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+
+    async def test_watch_tap_on_panel_only_watch_turns_alerts_on(self):
+        # A /game panel watches with notify off; /watch would
+        # switch alerts on, so the button does the same instead
+        # of saying "already watched" while staying silent.
+        self._seed_watch(notify=False)
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        await btn.callback(interaction)
+        self.assertTrue(wmod._watches[(777, "771747666")]["notify"])
+        self.assertIn("Now following", interaction.followup.sent[0])
+
+    async def test_watch_tap_on_no_longer_live_game_answers_plainly(self):
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        with self._mock_search(None):
+            await btn.callback(interaction)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is no longer live."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [True])
+
+    async def test_watch_tap_logs_one_line(self):
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        with self._mock_search(self.detail), \
+                _capture_watch_log() as recs:
+            await btn.callback(interaction)
+        tap_lines = [r.getMessage() for r in recs
+                     if r.name == "watch" and "tap Watch" in r.getMessage()]
+        self.assertEqual(len(tap_lines), 1)
+        self.assertIn("game=771747666", tap_lines[0])
+        self.assertIn("watch started", tap_lines[0])
+
+    async def test_watch_button_survives_restart(self):
+        # Simulate a restart: rebuild the button from its
+        # custom_id alone, the way discord.py's DynamicItem
+        # dispatch does — no in-memory view state.
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        template = wmod.WatchGameButton.__discord_ui_compiled_template__
+        self.assertIsNotNone(template.fullmatch(btn.custom_id))
+        self.assertIsNone(template.fullmatch("panel:watch:not-a-game"))
+        rebuilt = await wmod.WatchGameButton.from_custom_id(
+            None, btn.item, template.fullmatch(btn.custom_id))
+        self.assertEqual(rebuilt.game_id, "771747666")
+        self.assertEqual(rebuilt.custom_id, "panel:watch:771747666")
+        interaction = self._interaction("771747666")
+        with self._mock_search(self.detail):
+            await rebuilt.callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertIn("Watching", interaction.followup.sent[0])
+
+    async def test_watch_blocked_in_maintenance(self):
+        btn = wmod.WatchGameButton("771747666", "▶ Watch")
+        interaction = self._interaction("771747666")
+        with patch.object(wmod.maintenance, "view_blocked",
+                          new=AsyncMock(return_value=True)):
+            self.assertFalse(await btn.interaction_check(interaction))
+        self.assertNotIn((777, "771747666"), wmod._watches)
+
+    async def test_ask_watch_view_caps_buttons_at_five(self):
+        games = [{"onex_id": 771747666 + i, "home": f"Home {i}",
+                  "away": f"Away {i}"} for i in range(7)]
+        view = wmod.AskWatchView(games)
+        self.assertEqual(len(view.children), 5)
+        self.assertEqual(
+            [b.custom_id for b in view.children],
+            [f"panel:watch:{771747666 + i}" for i in range(5)])
+        self.assertTrue(all(b.item.label.startswith("▶ Watch ")
+                            for b in view.children))
+        self.assertIn("Home 0", view.children[0].item.label)
+
+    async def test_ask_watch_view_skips_games_without_an_id(self):
+        games = [{"home": "No ID", "away": "Team"},
+                 {"onex_id": 771747666, "home": "Republic of the Gambia",
+                  "away": "Ivory Coast"}]
+        view = wmod.AskWatchView(games)
+        self.assertEqual(len(view.children), 1)
+        self.assertEqual(view.children[0].custom_id,
+                         "panel:watch:771747666")
+
+    def test_ask_game_id_reads_both_id_shapes(self):
+        self.assertEqual(wmod._ask_game_id({"onex_id": 771747666}),
+                         "771747666")
+        self.assertEqual(wmod._ask_game_id({"id": "onex_771747666"}),
+                         "771747666")
+        self.assertIsNone(wmod._ask_game_id({"home": "No ID"}))
+        self.assertIsNone(wmod._ask_game_id({}))
+
+    async def test_detail_view_with_watch_button_has_ten_buttons(self):
+        view = wmod.WatchAlertView("771747666", watch_button=True)
+        self.assertEqual(len(view.children), 10)
+        watch_btn = view.children[-1]
+        self.assertEqual(watch_btn.custom_id, "panel:watch:771747666")
+        self.assertEqual(watch_btn.item.label, "▶ Watch")
+        self.assertIsInstance(watch_btn, wmod.WatchGameButton)
+
+    async def test_detail_view_without_watch_button_unchanged(self):
+        # Live panels keep exactly the 9 buttons they had —
+        # the ▶ Watch button is /ask-only.
+        view = wmod.WatchAlertView("771747666")
+        self.assertEqual(len(view.children), 9)
+        self.assertFalse(any(b.custom_id.startswith("panel:watch:")
+                             for b in view.children))
 
 
 if __name__ == "__main__":

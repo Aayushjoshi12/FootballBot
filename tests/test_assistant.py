@@ -446,8 +446,72 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Game ID: 771747666", text)
         view = interaction.followup.sent_views[0]
         self.assertIsNotNone(view)
-        self.assertEqual([b.label for b in view.children][:2],
-                         ["📊 Detail", "🔄 Live"])
+        # The 10th child is a DynamicItem (▶ Watch), whose label
+        # lives on .item — plain buttons carry .label directly.
+        labels = [getattr(b, "label", None) or b.item.label
+                  for b in view.children]
+        self.assertEqual(labels[:2], ["📊 Detail", "🔄 Live"])
+
+    async def test_match_details_reply_has_watch_button(self):
+        # 18 Nov 2026: the user asked for a Watch button when
+        # /ask shows a game. The detail reply carries a 10th
+        # button, ▶ Watch, wired to this game's id.
+        model = FakeModel('{"intent": "MATCH_DETAILS", "game_id": null, '
+                          '"team": "Republic of the Gambia", '
+                          '"events": null, "detail": "simple", '
+                          '"channel": null, "note": "Gambia"}')
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction,
+                              "show me the Gambia game", model, CHANNELS)
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertEqual(len(view.children), 10)
+        watch_btn = view.children[-1]
+        self.assertEqual(watch_btn.item.label, "▶ Watch")
+        self.assertEqual(watch_btn.custom_id, "panel:watch:771747666")
+        self.assertIsInstance(watch_btn, wmod.WatchGameButton)
+
+    async def test_live_matches_reply_has_watch_buttons(self):
+        # The live list is a pick list: one ▶ Watch button per
+        # game, labelled with the teams, so the user can watch
+        # one without typing /watch.
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "what games are live",
+                              None, CHANNELS)
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertIsInstance(view, wmod.AskWatchView)
+        self.assertTrue(view.children)
+        self.assertTrue(all(b.custom_id.startswith("panel:watch:")
+                            for b in view.children))
+        self.assertTrue(all(b.item.label.startswith("▶ Watch ")
+                            for b in view.children))
+        self.assertIn("panel:watch:771747666",
+                      [b.custom_id for b in view.children])
+
+    async def test_football_match_reply_has_watch_buttons(self):
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "football match",
+                              None, CHANNELS)
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertIsInstance(view, wmod.AskWatchView)
+        self.assertTrue(view.children)
+        self.assertIn("panel:watch:771747666",
+                      [b.custom_id for b in view.children])
+
+    async def test_search_match_pick_list_has_watch_buttons(self):
+        model = FakeModel('{"intent": "SEARCH_MATCH", "game_id": null, '
+                          '"team": null, "events": null, "detail": null, '
+                          '"channel": null, "note": ""}')
+        interaction = FakeInteraction()
+        await amod.handle_ask(interaction, "find a game", model, CHANNELS)
+        view = interaction.followup.sent_views[0]
+        self.assertIsNotNone(view)
+        self.assertIsInstance(view, wmod.AskWatchView)
+        self.assertTrue(view.children)
+        self.assertIn("panel:watch:771747666",
+                      [b.custom_id for b in view.children])
 
     async def test_team_fixtures_non_barca_says_unavailable(self):
         model = FakeModel('{"intent": "TEAM_FIXTURES", "game_id": null, '

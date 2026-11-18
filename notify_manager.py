@@ -20,6 +20,7 @@ import logging
 import discord
 
 import db
+import maintenance
 import watch
 from watch import DETAIL_ADVANCED, DETAIL_SIMPLE, EVENT_KINDS
 
@@ -81,6 +82,11 @@ class NotifyManagerView(discord.ui.View):
     one channel. The coordinator wires it to /notifications and
     passes the channel's current watches; prefs are pre-fetched
     so the Pause / detail buttons start with the right labels."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Maintenance mode: a press answers with the short notice
+        # and nothing runs.
+        return not await maintenance.view_blocked(interaction)
 
     def __init__(self, owner_id: int, channel_id: int,
                  watches: list[dict] | None = None,

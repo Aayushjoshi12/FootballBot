@@ -30,6 +30,12 @@ def _load(name: str):
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+def _load_scoreboard(name: str):
+    return json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "scoreboard" / name
+         ).read_text(encoding="utf-8"))
+
+
 class FakeModel:
     """Stand-in for the Gemini model: generate_content returns
     whatever text it was constructed with."""
@@ -408,23 +414,44 @@ class FakeMessage:
         self.view = view
         self.edits = []
         self.edit_error = None
+        self.deleted = False
 
-    async def edit(self, content=None, allowed_mentions=None):
+    async def edit(self, content=None, allowed_mentions=None, view=None):
         if self.edit_error is not None:
             raise self.edit_error
         self.content = content
+        if view is not None:
+            self.view = view
         self.edits.append(content)
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeChannel:
     def __init__(self):
         self.sent: list[FakeMessage] = []
-        self._next_id = 2000
+        self.messages: dict[int, FakeMessage] = {}
+        # Sends start at 3001: tests seed panels at 2001, and a
+        # send must never reuse a seeded panel's id (the panel
+        # refresh fetches by id — a collision would edit the alert
+        # into a panel).
+        self._next_id = 3000
 
     async def send(self, content, allowed_mentions=None, view=None):
         self._next_id += 1
         msg = FakeMessage(self._next_id, content, view=view)
         self.sent.append(msg)
+        self.messages[msg.id] = msg
+        return msg
+
+    async def fetch_message(self, mid):
+        msg = self.messages.get(mid)
+        if msg is None:
+            import discord
+            raise discord.NotFound(
+                SimpleNamespace(status=404, reason="Not Found"),
+                "Unknown Message")
         return msg
 
 
@@ -473,10 +500,20 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
                                        {"name": "Red card", "home": "0", "away": "0"}],
              "cricket": None})
         snap["_home"], snap["_away"] = "Republic of the Gambia", "Ivory Coast"
+        # The watch already has its live panel (posted by an earlier
+        # tick): the panel body matches the tick's render, so a
+        # no-change tick edits nothing and sends nothing.
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        panel_body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(2001, panel_body)
+        self.channel.messages[2001] = msg
         wmod._watches[(777, game_id)] = {
             "home": "Republic of the Gambia", "away": "Ivory Coast",
             "league": "Africa Cup of Nations", "detail": level, "fmt": "",
             "snapshot": snap, "missing": 0,
+            "panel_message_id": 2001, "panel_body": panel_body,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
 
     async def test_goal_sends_one_message(self):
@@ -554,10 +591,15 @@ class FakeFollowup:
     def __init__(self):
         self.sent: list[str] = []
         self.sent_views: list = []
+        self._next_id = 4000
 
     async def send(self, content=None, ephemeral=False, view=None, **kwargs):
         self.sent.append(content)
         self.sent_views.append(view)
+        # followup.send(wait=True) returns the sent message in
+        # discord.py — give the panel-as-reply an id to record.
+        self._next_id += 1
+        return SimpleNamespace(id=self._next_id, content=content, view=view)
 
 
 class FakeGuild:
@@ -1601,6 +1643,39 @@ class TestLiveMerge(unittest.TestCase):
         out = botmod.merge_live_matches([], [], [], [], scheduled)
         self.assertEqual(out, [])
 
+    def test_football_first_when_feed_is_cricket_heavy(self):
+        # 18 Nov 2026, 1:45 PM: /live showed 15 games, ALL cricket,
+        # zero football — 1xBet's feed is cricket-heavy and filled
+        # the cap. Live football must sort first, then other sports.
+        cricket = [_live_match(f"CricketHome{i}", f"CricketAway{i}",
+                               100 + i, 90, provider="onexbet")
+                   for i in range(15)]
+        for m in cricket:
+            m["sport"] = "Cricket"
+        foot = _live_match("FootHome", "FootAway", 1, 0, 67,
+                           provider="onexbet")
+        foot["sport"] = "Football"
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], cricket + [foot], [])
+        self.assertEqual(out[0]["home"], "FootHome")
+        self.assertEqual(
+            [m["home"] for m in out[:1]], ["FootHome"])
+        # ...and the cap still shows football first, not cricket.
+        self.assertEqual(
+            [m.get("sport") for m in out[:15]],
+            ["Football"] + ["Cricket"] * 14)
+
+    def test_unknown_sport_sorts_after_football(self):
+        foot = _live_match("FootHome", "FootAway", 1, 0, 67,
+                           provider="onexbet")
+        foot["sport"] = "Football"
+        unknown = _live_match("UnknownHome", "UnknownAway", 1, 0, 67,
+                              provider="onexbet")
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [unknown, foot], [])
+        self.assertEqual([m["home"] for m in out],
+                         ["FootHome", "UnknownHome"])
+
 
 class TestEspnLive(unittest.IsolatedAsyncioTestCase):
     """espn_live returns live games only — the scoreboard's
@@ -1791,13 +1866,20 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["home"], "FC Barcelona")
         rows = await db.list_watches(777)
         self.assertEqual(len(rows), 1)
-        # Silent: no announcement message in the channel.
-        self.assertEqual(len(self.channel.sent), 0)
-        # Second tick: still one watch, still silent.
+        # Silent: no announcement or alert — but the live panel is
+        # posted once when the watch starts (it ticks in place
+        # after that, same as any other watch).
+        self.assertEqual(len(self.channel.sent), 1)
+        panel = self.channel.sent[0]
+        self.assertIn("🔴 LIVE", panel.content)
+        self.assertIn("FC Barcelona", panel.content)
+        self.assertIsNotNone(panel.view)
+        # Second tick: still one watch, still one message — the
+        # panel edits in place, nothing new is sent.
         wmod._barca_last_check = 0.0
         await wmod.on_tick(self.bot, self.games1x2)
         self.assertEqual(len(wmod._watches), 1)
-        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(self.channel.sent), 1)
 
     async def test_no_start_when_barca_not_live(self):
         self.games1x2 = _load("games1x2.json")
@@ -1985,10 +2067,18 @@ class TestOnTickEngine(unittest.IsolatedAsyncioTestCase):
                                        {"name": "Red card", "home": "0", "away": "0"}],
              "cricket": None})
         snap["_home"], snap["_away"] = "Republic of the Gambia", "Ivory Coast"
+        # The watch already has its live panel (see TestOnTick).
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        panel_body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(2001, panel_body)
+        self.channel.messages[2001] = msg
         wmod._watches[(777, game_id)] = {
             "home": "Republic of the Gambia", "away": "Ivory Coast",
             "league": "Africa Cup of Nations", "detail": level, "fmt": "",
             "snapshot": snap, "missing": 0,
+            "panel_message_id": 2001, "panel_body": panel_body,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
 
     def _changed_raw(self, **score_changes):
@@ -2118,6 +2208,9 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             "home": "Republic of the Gambia", "away": "Ivory Coast",
             "league": "Africa Cup of Nations", "detail": "simple",
             "fmt": "", "snapshot": snap, "missing": 0,
+            "panel_message_id": None, "panel_body": None,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
 
     async def test_refresh_edits_detail_card_in_place(self):
@@ -2238,6 +2331,284 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             await view.children[7].callback(interaction)
         self.assertEqual(interaction.followup.sent,
                          ["That game is not watched in this channel."])
+
+
+class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
+    """The live watch panel: one message per watched game, edited
+    in place every second; goals and big events still send a
+    separate notification; full-time stops the ticking."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp5"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        self._orig_cooldown = dict(wmod._refresh_cooldown)
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._refresh_cooldown = {}
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        wmod._refresh_cooldown = self._orig_cooldown
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _seed_watch(self, game_id="771747666", with_panel=True):
+        snap = wmod.snapshot_from_detail(
+            {"home": "Republic of the Gambia", "away": "Ivory Coast",
+             "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
+             "clock": "67'", "stats": [{"name": "Yellow cards", "home": "3", "away": "1"},
+                                       {"name": "Red card", "home": "0", "away": "0"}],
+             "cricket": None})
+        snap["_home"], snap["_away"] = "Republic of the Gambia", "Ivory Coast"
+        panel_id = 2001 if with_panel else None
+        panel_body = None
+        if with_panel:
+            detail = prov._onex_detail_from_raw(self.games1x2[0])
+            panel_body = wmod.render_panel(detail, "67:00")
+            self.channel.messages[2001] = FakeMessage(2001, panel_body)
+        wmod._watches[(777, game_id)] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": "simple", "fmt": "",
+            "snapshot": snap, "missing": 0,
+            "panel_message_id": panel_id, "panel_body": panel_body,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+
+    async def test_first_tick_posts_one_panel(self):
+        self._seed_watch(with_panel=False)
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(self.channel.sent), 1)
+        panel = self.channel.sent[0]
+        self.assertIn("🔴 LIVE", panel.content)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast",
+                      panel.content)
+        self.assertIn("67:00", panel.content)
+        self.assertIn("Game ID: 771747666", panel.content)
+        self.assertIsNotNone(panel.view)
+        labels = [b.label for b in panel.view.children]
+        self.assertEqual(labels, ["📊 Detail", "🔄 Live", "🔄 Refresh",
+                                  "📜 Timeline", "🟢 Simple", "🔵 Advanced",
+                                  "🔔 Follow", "🔕 Unfollow"])
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_message_id"], panel.id)
+        self.assertEqual(watch["panel_body"], panel.content)
+
+    async def test_clock_only_change_edits_panel_no_new_message(self):
+        self._seed_watch(with_panel=False)
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(self.channel.sent), 1)
+        panel = self.channel.sent[0]
+        self.assertIn("67:00", panel.content)
+        watch = wmod._watches[(777, "771747666")]
+        # Five seconds pass with no score change: only the clock moves.
+        watch["panel_timer_ts"] = time.monotonic() - 5
+        watch["last_panel_edit"] = time.monotonic() - 2
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(len(panel.edits), 1)
+        self.assertIn("67:05", panel.edits[0])
+
+    async def test_goal_sends_alert_and_edits_panel(self):
+        self._seed_watch(with_panel=True)
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        # One new message: the GOAL alert. The panel edits in place.
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("GOAL", self.channel.sent[0].content)
+        panel = self.channel.messages[2001]
+        self.assertEqual(len(panel.edits), 1)
+        self.assertIn("1 – 1", panel.edits[0])
+        self.assertIn("67:00", panel.edits[0])
+
+    async def test_full_time_panel_shows_final_and_watch_ends(self):
+        self._seed_watch(with_panel=True)
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["statusLineStr"] = "Full time"
+        await wmod.on_tick(self.bot, [changed])
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        panel = self.channel.messages[2001]
+        self.assertIn("🏁 Full-time", panel.content)
+        self.assertIn("0 – 1", panel.content)
+        # The full-time alert is still sent as its own notification.
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("Full-time", self.channel.sent[0].content)
+
+    async def test_panel_429_pauses_edits(self):
+        import discord
+
+        self._seed_watch(with_panel=True)
+        panel = self.channel.messages[2001]
+        resp = SimpleNamespace(status=429, reason="Too Many Requests",
+                               headers={"Retry-After": "30"})
+        err = discord.HTTPException(resp, "rate limited")
+        err.retry_after = 30.0
+        panel.edit_error = err
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        # The GOAL alert still goes out (a new message); the panel
+        # edit fails with 429 and the panel is paused, not retried.
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("GOAL", self.channel.sent[0].content)
+        self.assertEqual(len(panel.edits), 0)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertGreater(watch["panel_blocked_until"], time.monotonic())
+        # While paused, another tick does not try to edit again.
+        panel.edit_error = None
+        watch["last_panel_edit"] = time.monotonic() - 2
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(panel.edits), 0)
+
+    async def test_cricket_panel_shows_overs_and_break(self):
+        npl = _load_scoreboard("games1x2_npl.json")
+        detail = prov._onex_detail_from_raw(npl[0])
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        wmod._watches[(777, "771678099")] = {
+            "home": detail["home"], "away": detail["away"],
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": "", "snapshot": snap, "missing": 0,
+            "panel_message_id": None, "panel_body": None,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        await wmod.on_tick(self.bot, npl)
+        self.assertEqual(len(self.channel.sent), 1)
+        panel = self.channel.sent[0]
+        self.assertIn("Lumbini Lions", panel.content)
+        self.assertIn("157", panel.content)
+        self.assertIn("76/2", panel.content)
+        self.assertIn("10.5 ov", panel.content)
+        # Innings break: the panel says so instead of "0.0 ov".
+        broken = json.loads(json.dumps(npl[0]))
+        broken["scores"]["isBreak"] = True
+        watch = wmod._watches[(777, "771678099")]
+        watch["last_panel_edit"] = time.monotonic() - 2
+        await wmod.on_tick(self.bot, [broken])
+        # The break also sends its own notification, as before.
+        self.assertEqual(len(self.channel.sent), 2)
+        self.assertIn("Innings break", self.channel.sent[1].content)
+        self.assertEqual(len(panel.edits), 1)
+        self.assertIn("Innings break", panel.edits[0])
+
+    async def test_unfollow_deletes_panel(self):
+        self._seed_watch(with_panel=True)
+        view = wmod.WatchAlertView("771747666")
+        interaction = FakeInteraction(
+            message=SimpleNamespace(content=""),
+            data={"custom_id": "panel:unfollow:771747666"})
+        interaction.client = self.bot
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        with patch.object(prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await view.children[7].callback(interaction)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        panel = self.channel.messages[2001]
+        self.assertTrue(panel.deleted)
+        self.assertEqual(
+            interaction.followup.sent,
+            ["🔕 Stopped watching **Republic of the Gambia vs Ivory Coast**."])
+
+    async def test_refresh_on_panel_edits_panel_in_place(self):
+        view = wmod.WatchAlertView("771747666")
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        panel_text = wmod.render_panel(detail, "67:00")
+        interaction = FakeInteraction(
+            message=SimpleNamespace(content=panel_text),
+            data={"custom_id": "panel:refresh:771747666"})
+        new_detail = dict(detail)
+        new_detail["home_score"] = 1
+        with patch.object(prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": new_detail})):
+            await view.children[2].callback(interaction)
+        self.assertEqual(len(interaction.edited), 1)
+        content, edited_view = interaction.edited[0]
+        self.assertIn("1 – 1", content)
+        self.assertIn("🔴 LIVE", content)
+        self.assertIsInstance(edited_view, wmod.WatchAlertView)
+
+    async def test_watch_command_reply_is_the_panel(self):
+        # The user confirmed it (18 Nov 2026): when they run
+        # /watch, the panel itself is what they see — one public
+        # message, ticking in place — not a separate static reply.
+        import bot as botmod
+
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        resolved = {"game_id": "771747666", "action": "follow",
+                    "detail": None, "candidates": [],
+                    "entry": {"id": "771747666",
+                              "home": "Republic of the Gambia",
+                              "away": "Ivory Coast",
+                              "league": "Africa Cup of Nations",
+                              "status": "2H"},
+                    "source": "id"}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)), \
+             patch.object(prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await botmod.cmd_watch.callback(interaction, "771747666")
+        # Exactly one message, and it is the live panel.
+        self.assertEqual(len(interaction.followup.sent), 1)
+        panel = interaction.followup.sent[0]
+        self.assertIn("🔴 LIVE", panel)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", panel)
+        self.assertIn("Game ID: 771747666", panel)
+        self.assertNotIn("Watching **", panel)
+        view = interaction.followup.sent_views[0]
+        self.assertIsInstance(view, wmod.WatchAlertView)
+        # The panel id is recorded, so the 1s tick edits this
+        # message instead of posting a new one.
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(watch["panel_body"], panel)
+
+    async def test_watch_upcoming_game_keeps_text_reply(self):
+        # A game that has not started yet has no live panel to
+        # show — the text reply stands, and the panel appears on
+        # the first tick once the game goes live.
+        import bot as botmod
+
+        resolved = {"game_id": "771747666", "action": "follow",
+                    "detail": None, "candidates": [],
+                    "entry": {"id": "771747666",
+                              "home": "Republic of the Gambia",
+                              "away": "Ivory Coast",
+                              "league": "Africa Cup of Nations",
+                              "status": "upcoming"},
+                    "source": "id"}
+        interaction = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)), \
+             patch.object(prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": None})):
+            await botmod.cmd_watch.callback(interaction, "771747666")
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Watching **", text)
+        self.assertNotIn("🔴 LIVE", text)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertIsNone(watch["panel_message_id"])
 
 
 if __name__ == "__main__":

@@ -791,6 +791,13 @@ def _onex_status(scores: dict) -> tuple[str, int | None]:
         return "HT", minute
     if "full time" in line or "finished" in line:
         return "FT", minute
+    if "in progress" in line:
+        # Live cricket (and other sports) often carry only
+        # "Event in progress" — no timer, no period. It is live;
+        # "?" would hide the game from every live list that
+        # filters on status (18 Nov 2026: 29 of 33 live cricket
+        # games read "?" this way).
+        return "Live", minute
     period = scores.get("currentPeriod")
     pname = (scores.get("currentPeriodName") or "").lower()
     if period == 1 or "1st half" in pname:
@@ -817,8 +824,14 @@ def _onex_parse_minute(raw: str) -> tuple[int | None, int | None]:
 
 
 def _onex_norm_match(g: dict, liga: dict | None = None) -> Match | None:
+    if not isinstance(g, dict):
+        return None
     o1 = g.get("opponent1") or {}
     o2 = g.get("opponent2") or {}
+    if not isinstance(o1, dict):
+        o1 = {}
+    if not isinstance(o2, dict):
+        o2 = {}
     home = o1.get("fullName") or ""
     away = o2.get("fullName") or ""
     gid = g.get("id") or g.get("mainGameId")
@@ -826,9 +839,22 @@ def _onex_norm_match(g: dict, liga: dict | None = None) -> Match | None:
         return None
 
     scores = g.get("scores") or {}
+    if not isinstance(scores, dict):
+        scores = {}
     status, minute = _onex_status(scores)
     liga = liga or g.get("liga") or {}
+    if not isinstance(liga, dict):
+        liga = {}
     liga_name = liga.get("name") or "Unknown"
+    # Sport, in 1xBet's own words ("Football", "Cricket", ...):
+    # the live list carries it on every entry. A cricket score
+    # shape is unambiguous; anything else stays unknown (never
+    # guessed). /live sorts football first on this field.
+    sport = (g.get("sport") or {}).get("name") if isinstance(
+        g.get("sport"), dict) else None
+    if not sport and ((_as_dict(scores.get("extendedScore"))).get(
+            "cricketScore") or {}).get("wicketScore") is not None:
+        sport = "Cricket"
 
     def _logo(opp: dict) -> str:
         opps = opp.get("opps") or []
@@ -863,8 +889,10 @@ def _onex_norm_match(g: dict, liga: dict | None = None) -> Match | None:
         "league":      liga_name,
         "league_id":   _onex_league_id(liga_name),
         "sofa_lid":    0,
+        "sport":       sport or None,
         "date":        date,
-        "stadium":     ((g.get("matchInfoObj") or {}).get("location") or ""),
+        "stadium":     (((g.get("matchInfoObj") if isinstance(
+            g.get("matchInfoObj"), dict) else None) or {}).get("location") or ""),
         "referee":     "",
         "provider":    "onexbet",
         "finished":    status == "FT",
@@ -997,13 +1025,19 @@ _NPL_LIGA_NAME = "nepal. premier league"
 _NPL_TOTAL_BALLS = 120  # T20
 
 
+def _as_dict(v) -> dict:
+    """A mapping or {} — a live-feed field that arrives as a
+    non-dict (string, list) must never raise on .get()."""
+    return v if isinstance(v, dict) else {}
+
+
 def _onex_cricket_clock(scores: dict) -> str | None:
     """Overs line for a live cricket game, e.g. "16.4 ov".
 
     Innings break (isBreak / "Half-time"): the overs read 0.0 for the
     innings that hasn't started — say so instead of "0.0 ov".
     """
-    ext = (scores or {}).get("extendedScore") or {}
+    ext = _as_dict((scores or {}).get("extendedScore"))
     inns = ext.get("innsStats") or {}
     if scores and scores.get("isBreak"):
         return "Innings break"
@@ -1056,7 +1090,7 @@ def _onex_norm_npl_match(g: dict) -> Match | None:
     if m is None:
         return None
     scores = g.get("scores") or {}
-    ext = scores.get("extendedScore") or {}
+    ext = _as_dict(scores.get("extendedScore"))
     wk = (ext.get("cricketScore") or {}).get("wicketScore") or {}
     if wk.get("opponent1") is not None:
         m["home_score"] = str(wk["opponent1"])
@@ -1190,7 +1224,7 @@ def _onex_cricket_run_rate(scores: dict) -> str | None:
 
 
 def _onex_cricket_raw(scores: dict) -> dict:
-    ext = (scores or {}).get("extendedScore") or {}
+    ext = _as_dict((scores or {}).get("extendedScore"))
     inns = ext.get("innsStats") or {}
     return {
         "is_break": bool((scores or {}).get("isBreak")),
@@ -1230,7 +1264,7 @@ def _onex_cricket_target_fmt(fmt: str, home_score: Any, away_score: Any,
 def _onex_apply_cricket(m: dict, scores: dict) -> None:
     """Override football scores with the cricket wicketScore and
     set the overs clock + cricket detail on a normalized match."""
-    ext = (scores or {}).get("extendedScore") or {}
+    ext = _as_dict((scores or {}).get("extendedScore"))
     wk = (ext.get("cricketScore") or {}).get("wicketScore") or {}
     if wk.get("opponent1") is not None:
         m["home_score"] = str(wk["opponent1"])
@@ -1256,7 +1290,10 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
     """Rich detail dict from one raw live-list entry (no network).
     Score, clock/overs, stats table, cricket detail. Venue/format/
     weather come from gameInfo via onex_game_detail()."""
-    liga_name = ((g.get("liga") or {}).get("name") or "")
+    if not isinstance(g, dict):
+        return None
+    liga = g.get("liga") if isinstance(g.get("liga"), dict) else None
+    liga_name = ((liga or {}).get("name") or "")
     if "nepal" in normalize(liga_name):
         m = _onex_norm_npl_match(g)
     else:
@@ -1264,7 +1301,9 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
     if m is None:
         return None
     scores = g.get("scores") or {}
-    ext = scores.get("extendedScore") or {}
+    if not isinstance(scores, dict):
+        scores = {}
+    ext = _as_dict(scores.get("extendedScore"))
     if (ext.get("cricketScore") or {}).get("wicketScore") is not None:
         _onex_apply_cricket(m, scores)
         if "nepal" not in normalize(liga_name):
@@ -1300,7 +1339,8 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
             m["clock"] = "Full-time"
     m["start_ts"] = g.get("startTs") if isinstance(
         g.get("startTs"), (int, float)) else None
-    info = g.get("matchInfoObj") or {}
+    info = g.get("matchInfoObj") if isinstance(
+        g.get("matchInfoObj"), dict) else {}
     m["venue"] = info.get("location") or ""
     m["format"] = info.get("matchFormat") or ""
     return m
@@ -1537,7 +1577,7 @@ def _onex_norm_line_game(g: dict, league: str, default_format: str = "",
         "timer_sec": None,
         "cricket": None,
     }
-    if scores and (scores.get("extendedScore") or {}).get("cricketScore"):
+    if scores and (_as_dict(scores.get("extendedScore"))).get("cricketScore"):
         _onex_apply_cricket(detail, scores)
         detail["cricket"].update({"target": None, "need": None,
                                  "balls_left": None})
@@ -1726,7 +1766,7 @@ async def onex_grounding() -> list[dict]:
 # Statuses that mean "live right now" in _onex_status /
 # currentPeriodName terms. FT and "?" are never live.
 _ONEX_LIVE_STATUSES = ("1H", "2H", "ET", "PEN", "HT", "Half-time",
-                       "1st innings", "2nd innings")
+                       "1st innings", "2nd innings", "Live")
 
 
 async def onex_top_live(limit: int = 5,

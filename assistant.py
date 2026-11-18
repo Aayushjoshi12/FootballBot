@@ -93,7 +93,8 @@ _LIVE_WORDS = ("what games are live", "show live matches",
                "show me live games", "show live games",
                "list live games", "live games right now",
                "what games are on", "show me whats live",
-               "show me what's live")
+               "show me what's live", "show me all live",
+               "live football", "live cricket")
 _MOST_GOALS_WORDS = ("most goals", "highest scoring", "most goals so far",
                      "highest-scoring", "most goals today")
 _MASS_WORDS = ("every live match", "all live matches",
@@ -502,11 +503,19 @@ async def _validate_intent(parsed: dict, live_games: list[dict],
 
 def _grounding_entries(raw: list[dict]) -> list[dict]:
     """Raw live entries -> normalized matches (id, teams, league,
-    sport, status, score, minute). Live games only."""
+    sport, status, score, minute). Live games only. One malformed
+    entry is skipped, never allowed to kill the whole reply
+    (18 Nov 2026: /ask failed twice with 'Something went wrong'
+    on a live list — a single bad entry must not do that)."""
     out: list[dict] = []
     seen: set[str] = set()
     for g in raw or []:
-        m = prov._onex_detail_from_raw(g)
+        try:
+            m = prov._onex_detail_from_raw(g)
+        except Exception as exc:
+            log.warning("[assistant] skipping malformed live entry (%s)",
+                        type(exc).__name__)
+            continue
         if m is None:
             continue
         gid = str(m["onex_id"])
@@ -517,15 +526,45 @@ def _grounding_entries(raw: list[dict]) -> list[dict]:
     return out
 
 
+def _live_pool(text: str | None, live_now: list[dict]) -> tuple[list[dict], str | None]:
+    """The live games the question actually asks about. A sport
+    word in the question ("show me all live football") narrows
+    the list to that sport instead of showing every sport —
+    that is also what keeps the reply short."""
+    sport = wmod._sport_from_words(text or "")
+    if not sport:
+        return live_now, None
+    pool = [g for g in live_now
+            if str(g.get("sport") or "").strip().lower() == sport.lower()]
+    return pool, sport
+
+
 def _is_live(m: dict) -> bool:
     return str(m.get("status") or "").lower() in _LIVE_STATUSES
 
 
-def _live_line_list(games: list[dict], limit: int = 15) -> str:
+def _live_line_list(games: list[dict], limit: int = 15,
+                    budget: int = 1750) -> str:
+    """Live games as a numbered list, capped so the whole reply
+    stays under Discord's 2000-character message limit: lines
+    are added until the budget runs out, then '…and N more'.
+    A 15-game list of long cricket names can pass 2000 chars on
+    its own — that is what made /ask fail twice on 18 Nov 2026
+    ('Something went wrong' on retry, same live data)."""
     lines = []
+    total = 0
+    shown = 0
     for i, g in enumerate(games[:limit], 1):
-        lines.append(f"{i}. {wmod.live_line(g)} · {g.get('league', '')} "
-                     f"· ID `{g.get('onex_id')}`")
+        line = (f"{i}. {wmod.live_line(g)} · {g.get('league', '')} "
+                f"· ID `{g.get('onex_id')}`")
+        if lines and total + 1 + len(line) > budget:
+            break
+        lines.append(line)
+        total += len(line) + 1
+        shown += 1
+    rest = len(games) - shown
+    if rest > 0:
+        lines.append(f"…and {rest} more live games.")
     return "\n".join(lines)
 
 
@@ -598,8 +637,39 @@ async def handle_ask(interaction, text: str, model,
             pass
 
 
+def _split_message(text: str, limit: int = 1900) -> list[str]:
+    """Split a reply into Discord-sized chunks (2000 chars max)
+    on line boundaries; a single over-long line is cut hard.
+    A reply that is too long raises on send and the whole answer
+    is lost — split instead."""
+    if len(text) <= limit:
+        return [text]
+    parts, current = [], ""
+    for line in text.split("\n"):
+        if current and len(current) + 1 + len(line) > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    out: list[str] = []
+    for part in parts:
+        while len(part) > limit:
+            out.append(part[:limit])
+            part = part[limit:]
+        if part:
+            out.append(part)
+    return out or [""]
+
+
 async def _send(interaction, content: str, view=None) -> None:
-    await interaction.followup.send(content, view=view, ephemeral=True)
+    parts = _split_message(content)
+    for i, part in enumerate(parts):
+        # The buttons belong with the last chunk.
+        await interaction.followup.send(
+            part, view=view if i == len(parts) - 1 else None,
+            ephemeral=True)
 
 
 async def _handle_ask(interaction, text: str, model,
@@ -637,12 +707,17 @@ async def _handle_ask(interaction, text: str, model,
         return
 
     if intent == "LIVE_MATCHES":
-        if not live_now:
+        pool, sport = _live_pool(text, live_now)
+        if sport and not pool:
+            await _send(interaction,
+                        f"No live {sport.lower()} right now.")
+            return
+        if not pool:
             await _send(interaction, "No games are live right now.")
             return
         await _send(interaction,
                     "⚽ **Live games right now — pick one:**\n"
-                    + _live_line_list(live_now, 15)
+                    + _live_line_list(pool, 15)
                     + "\n\nUse `/game <ID>` for the full detail, "
                       "or ask me to follow one.")
         return
@@ -656,10 +731,16 @@ async def _handle_ask(interaction, text: str, model,
                              f"for '{valid.get('team')}':"))
                 return
             if live_now:
+                pool, sport = _live_pool(text, live_now)
+                if sport and not pool:
+                    await _send(interaction,
+                                f"No live match for '{valid.get('team')}' "
+                                f"and no live {sport.lower()} right now.")
+                    return
                 await _send(interaction,
                             f"No live match for '{valid.get('team')}' "
                             f"— here are the live games right now:\n"
-                            + _live_line_list(live_now, 15))
+                            + _live_line_list(pool, 15))
                 return
             await _send(interaction,
                         f"No live match for '{valid.get('team')}' "
@@ -681,10 +762,16 @@ async def _handle_ask(interaction, text: str, model,
                          f"for '{valid.get('team') or game_id}':"))
             return
         if live_now:
+            pool, sport = _live_pool(text, live_now)
+            if sport and not pool:
+                await _send(interaction,
+                            f"No live match for '{valid.get('team') or game_id}' "
+                            f"and no live {sport.lower()} right now.")
+                return
             await _send(interaction,
                         f"No live match for '{valid.get('team') or game_id}' "
                         f"— here are the live games right now:\n"
-                        + _live_line_list(live_now, 15))
+                        + _live_line_list(pool, 15))
             return
         await _send(interaction,
                     f"No live match for '{valid.get('team') or game_id}' "

@@ -32,6 +32,12 @@ async def init() -> None:
             timezone TEXT    DEFAULT 'UTC',
             language TEXT    DEFAULT 'en'
         );
+        -- Bot-wide settings (key/value): maintenance mode lives
+        -- here so it survives restarts.
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS favorites (
             user_id INTEGER NOT NULL,
             team_id INTEGER NOT NULL,
@@ -47,6 +53,7 @@ async def init() -> None:
             detail     TEXT    NOT NULL DEFAULT 'simple',
             fmt        TEXT    NOT NULL DEFAULT '',
             snapshot   TEXT    NOT NULL DEFAULT '{}',
+            panel_message_id INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (channel_id, game_id)
         );
         -- Sent-event dedup keys (Feature 1): one row per alert
@@ -122,6 +129,17 @@ async def init() -> None:
         );
     """)
     await _conn.commit()
+    # Migration (18 Nov 2026): the live watch panel's message id, so
+    # a restart resumes editing the same panel instead of posting
+    # a new one. Old databases gain the column in place; no data
+    # is lost and no row is touched.
+    cur = await _conn.execute("PRAGMA table_info(watches)")
+    _cols = {row[1] for row in await cur.fetchall()}
+    if "panel_message_id" not in _cols:
+        await _conn.execute(
+            "ALTER TABLE watches ADD COLUMN "
+            "panel_message_id INTEGER NOT NULL DEFAULT 0")
+        await _conn.commit()
     log.info("[db] Initialized.")
 
 
@@ -130,6 +148,25 @@ async def close() -> None:
     if _conn:
         await _conn.close()
         _conn = None
+
+
+# ── Bot settings (key/value) ───────────────────────────────────────────────
+
+async def get_setting(key: str) -> str | None:
+    conn = _require_conn()
+    cur = await conn.execute(
+        "SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def set_setting(key: str, value: str) -> None:
+    conn = _require_conn()
+    await conn.execute(
+        "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value))
+    await conn.commit()
 
 
 # ── Guild settings ─────────────────────────────────────────────────────────
@@ -218,7 +255,8 @@ async def remove_watch(channel_id: int, game_id: str) -> None:
 async def list_watches(channel_id: int) -> list[dict]:
     conn = _require_conn()
     cur = await conn.execute(
-        "SELECT channel_id, game_id, home, away, league, detail, fmt, snapshot "
+        "SELECT channel_id, game_id, home, away, league, detail, fmt, "
+        "snapshot, panel_message_id "
         "FROM watches WHERE channel_id=?",
         (channel_id,),
     )
@@ -229,11 +267,25 @@ async def list_watches(channel_id: int) -> list[dict]:
 async def get_all_watches() -> list[dict]:
     conn = _require_conn()
     cur = await conn.execute(
-        "SELECT channel_id, game_id, home, away, league, detail, fmt, snapshot "
+        "SELECT channel_id, game_id, home, away, league, detail, fmt, "
+        "snapshot, panel_message_id "
         "FROM watches",
     )
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def set_watch_panel(channel_id: int, game_id: str,
+                          message_id: int | None) -> None:
+    """Remember (or clear) the live panel message for a watch, so a
+    restart resumes editing it instead of posting a new panel."""
+    conn = _require_conn()
+    await conn.execute(
+        "UPDATE watches SET panel_message_id=? "
+        "WHERE channel_id=? AND game_id=?",
+        (int(message_id) if message_id else 0, channel_id, str(game_id)),
+    )
+    await conn.commit()
 
 
 async def update_watch_snapshot(channel_id: int, game_id: str,

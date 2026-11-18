@@ -143,6 +143,16 @@ class TestParsePrechecks(unittest.IsolatedAsyncioTestCase):
         out = await amod.parse_intent("show live matches", None, CHANNELS)
         self.assertEqual(out["intent"], "LIVE_MATCHES")
 
+    async def test_live_football_precheck(self):
+        # 18 Nov 2026: "show me all live football" missed every
+        # _LIVE_WORDS phrase, went to Gemini, and /ask failed.
+        # A sport word + "live" is a live list, no model needed.
+        model = NeverCallModel()
+        out = await amod.parse_intent("show me all live football",
+                                      model, CHANNELS)
+        self.assertEqual(out["intent"], "LIVE_MATCHES")
+        self.assertEqual(model.calls, 0)
+
     async def test_highest_scoring_precheck(self):
         model = NeverCallModel()
         out = await amod.parse_intent(
@@ -391,6 +401,96 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         text = interaction.followup.sent[0]
         self.assertIn("Gambia", text)
         self.assertIn("771747666", text)
+
+    async def test_live_football_lists_football_only(self):
+        # 18 Nov 2026: /ask "show me all live football" failed
+        # twice ("Something went wrong") and would have listed
+        # every sport anyway. With a mixed live list, the football
+        # question lists football only — and never fails.
+        npl = json.loads((Path(__file__).resolve().parent
+                          / "fixtures" / "scoreboard"
+                          / "games1x2_npl.json").read_text(encoding="utf-8"))
+        mixed = self.games1x2 + npl
+        with patch.object(prov, "onex_live_raw",
+                          new=AsyncMock(return_value=mixed)):
+            interaction = FakeInteraction()
+            await amod.handle_ask(interaction,
+                                  "show me all live football",
+                                  None, CHANNELS)
+            text = interaction.followup.sent[0]
+            self.assertNotIn("Something went wrong", text)
+            self.assertIn("Gambia", text)
+            self.assertNotIn("Lumbini", text)
+            # Control: without the sport word, the cricket game
+            # IS listed (it is live) — the filter is what hides it.
+            interaction2 = FakeInteraction()
+            await amod.handle_ask(interaction2, "what games are live",
+                                  None, CHANNELS)
+            self.assertIn("Lumbini", interaction2.followup.sent[0])
+
+    async def test_live_list_stays_under_discord_limit(self):
+        # A 15-game list of long cricket names can pass Discord's
+        # 2000-character message limit on its own — the send then
+        # raises and the whole answer is lost ("Something went
+        # wrong", 18 Nov 2026). The list is budgeted, with an
+        # "…and N more" tail.
+        games = []
+        for i in range(15):
+            games.append({
+                "home": f"Royal Challengers Bengaluru Long Name {i}",
+                "away": f"Mumbai Indians Very Long Team Name {i}",
+                "home_score": 186, "away_score": 182,
+                "league": "Indian Premier League, Super Over Eliminator",
+                "onex_id": 771000000 + i, "status": "2H",
+                "clock": "19.2 ov",
+                "cricket": {"over_str": "19.2", "is_break": False}})
+        msg = ("⚽ **Live games right now — pick one:**\n"
+               + amod._live_line_list(games, 15)
+               + "\n\nUse `/game <ID>` for the full detail, "
+                 "or ask me to follow one.")
+        self.assertLess(len(msg), 2000)
+        self.assertIn("…and", msg)
+
+    def test_grounding_skips_malformed_entry(self):
+        # One entry the normalizer cannot handle must not kill
+        # the whole reply — it is skipped, the rest are listed.
+        good = self.games1x2[0]
+        real = prov._onex_detail_from_raw
+        calls = {"n": 0}
+
+        def flaky(g):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("malformed entry")
+            return real(g)
+
+        with patch.object(prov, "_onex_detail_from_raw",
+                          side_effect=flaky):
+            out = amod._grounding_entries([{"id": "bad"}, good])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(str(out[0]["onex_id"]), "771747666")
+
+    def test_event_in_progress_cricket_counts_live(self):
+        # Live cricket often carries only "Event in progress" —
+        # no timer, no period. It is live, not "?".
+        status, _minute = prov._onex_status(
+            {"statusLineStr": "Event in progress"})
+        self.assertEqual(status, "Live")
+        self.assertTrue(amod._is_live({"status": "Live"}))
+        # End to end: a raw cricket entry with that status line
+        # grounds to a live match instead of being filtered out.
+        npl = json.loads((Path(__file__).resolve().parent
+                          / "fixtures" / "scoreboard"
+                          / "games1x2_npl.json").read_text(encoding="utf-8"))
+        entry = json.loads(json.dumps(npl[0]))
+        entry["scores"]["statusLineStr"] = "Event in progress"
+        entry["scores"]["currentPeriod"] = None
+        entry["scores"]["currentPeriodName"] = ""
+        entry["scores"]["timer"] = None
+        detail = prov._onex_detail_from_raw(entry)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["status"], "Live")
+        self.assertTrue(amod._is_live(detail))
 
     async def test_valid_follow_match_starts_watch(self):
         model = FakeModel('{"intent": "FOLLOW_MATCH", "game_id": null, '

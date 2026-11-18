@@ -292,16 +292,19 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._orig_state_path = sb.STATE_PATH
         self._orig_state = dict(sb._state)
+        self._orig_stopped = set(sb._stopped)
         self._tmp = Path(__file__).resolve().parent / ".sb-test-tmp"
         self._tmp.mkdir(exist_ok=True)
         sb.STATE_PATH = self._tmp / "scoreboard.json"
         sb._state = {}
+        sb._stopped = set()
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
 
     def tearDown(self):
         sb.STATE_PATH = self._orig_state_path
         sb._state = self._orig_state
+        sb._stopped = self._orig_stopped
         for p in self._tmp.glob("*"):
             p.unlink()
         self._tmp.rmdir()
@@ -388,12 +391,14 @@ class TestGuardrails(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._orig_state_path = sb.STATE_PATH
         self._orig_state = dict(sb._state)
+        self._orig_stopped = set(sb._stopped)
         self._orig_fetch = sb._fetch_all
         self._orig_purged = sb._purged_disallowed
         self._tmp = Path(__file__).resolve().parent / ".sb-guard-test-tmp"
         self._tmp.mkdir(exist_ok=True)
         sb.STATE_PATH = self._tmp / "scoreboard.json"
         sb._state = {}
+        sb._stopped = set()
         sb._purged_disallowed = False
         # No network: start_for_channel's fetch returns nothing live.
         sb._fetch_all = lambda: asyncio.sleep(0, result=([], [], []))
@@ -403,6 +408,7 @@ class TestGuardrails(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         sb.STATE_PATH = self._orig_state_path
         sb._state = self._orig_state
+        sb._stopped = self._orig_stopped
         sb._fetch_all = self._orig_fetch
         sb._purged_disallowed = self._orig_purged
         for p in self._tmp.glob("*"):
@@ -490,6 +496,77 @@ class TestGuardrails(unittest.IsolatedAsyncioTestCase):
             sb.WATCH_SECONDS = orig_watch
         # Only the test channel got a post; general was skipped.
         self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_start_when_already_running_returns_true(self):
+        # 18 Nov 2026 (bug 2): /scoreboard reported "Could not post"
+        # three times while the scoreboard was already live — the
+        # start returned refresh_channel's False (no edit needed:
+        # text unchanged, 5s gap not passed). A running scoreboard
+        # is a successful start.
+        body = sb._split_body(sb.render_scoreboard([], []))[0]
+        msg = FakeMessage(555, "old body")
+        msg.channel = self.channel
+        self.channel.messages[555] = msg
+        sb._state[sb.TEST_CHANNEL_ID] = {
+            "message_id": 555, "body": body,
+            "last_edit": time.time(), "blocked_until": 0.0}
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        # No edit was needed, so nothing was sent.
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_stop_blocks_env_channel_repost(self):
+        # 18 Nov 2026 (bug 3): /stopscoreboard confirmed "stopped"
+        # and a new Live Scores message appeared right after —
+        # the loop re-added SCOREBOARD_CHANNEL_ID (set at deploy)
+        # on its next tick and refresh_channel resurrected the
+        # state. With the env channel set, a stop must stick.
+        orig_env = sb.SCOREBOARD_CHANNEL_ID
+        sb.SCOREBOARD_CHANNEL_ID = sb.TEST_CHANNEL_ID
+        orig_watch = sb.WATCH_SECONDS
+        sb.WATCH_SECONDS = 0.05
+        try:
+            self.assertTrue(
+                await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+            self.assertTrue(
+                await sb.stop_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+            sent_before = len(self.channel.sent)
+            task = asyncio.create_task(sb.scoreboard_loop(self.bot))
+            await asyncio.sleep(0.25)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            sb.SCOREBOARD_CHANNEL_ID = orig_env
+            sb.WATCH_SECONDS = orig_watch
+        self.assertEqual(len(self.channel.sent), sent_before)
+        self.assertNotIn(sb.TEST_CHANNEL_ID, sb._state)
+
+    async def test_stop_persists_across_reload(self):
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertTrue(
+            await sb.stop_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertIn(sb.TEST_CHANNEL_ID, sb._stopped)
+        # Simulate a restart: reload the saved file fresh.
+        sb._stopped = set()
+        sb._state = sb._load_state()
+        self.assertIn(sb.TEST_CHANNEL_ID, sb._stopped)
+        self.assertNotIn(sb.TEST_CHANNEL_ID, sb._state)
+        # And a refresh in a stopped channel does nothing.
+        self.assertFalse(await sb.refresh_channel(
+            self.bot, sb.TEST_CHANNEL_ID, "📊 **Live Scores**"))
+        self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_start_after_stop_clears_stop(self):
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertTrue(
+            await sb.stop_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertNotIn(sb.TEST_CHANNEL_ID, sb._stopped)
+        self.assertIn(sb.TEST_CHANNEL_ID, sb._state)
+        self.assertEqual(len(self.channel.sent), 2)
 
     async def test_stop_removes_channel_and_deletes_message(self):
         self.assertTrue(

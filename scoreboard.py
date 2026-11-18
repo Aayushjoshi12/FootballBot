@@ -39,6 +39,7 @@ import discord
 
 import db
 import history
+import maintenance
 import providers as prov
 from providers import onex_fetch_tick
 import watch
@@ -105,6 +106,17 @@ _start_lock = asyncio.Lock()
 # saved file; ensure_running() persists the cleaned state at boot.
 _purged_disallowed = False
 
+# Channels explicitly stopped from Discord (/stopscoreboard).
+# A stopped channel is NEVER re-posted — not by the loop's
+# env-channel auto-add, not by a 404 re-post, not by a tick
+# already in flight when the stop landed (18 Nov 2026: stop
+# confirmed 'stopped' and a new Live Scores message appeared
+# right after, because the loop re-added the env channel on
+# its next tick and refresh_channel's setdefault resurrected
+# the state). Persisted in scoreboard.json so a restart does
+# not silently undo a stop either; /scoreboard clears it.
+_stopped: set[int] = set()
+
 
 def _load_state() -> dict[int, dict]:
     global _purged_disallowed
@@ -118,8 +130,15 @@ def _load_state() -> dict[int, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
+    for cid in data.get("stopped") or []:
+        try:
+            _stopped.add(int(cid))
+        except (TypeError, ValueError):
+            continue
     out: dict[int, dict] = {}
     for key, value in data.items():
+        if key == "stopped":
+            continue
         try:
             cid = int(key)
         except (TypeError, ValueError):
@@ -146,7 +165,8 @@ def _load_state() -> dict[int, dict]:
 
 def _save_state() -> None:
     """Durably replace the state file without leaving a partial JSON file."""
-    payload = {str(k): v for k, v in _state.items()}
+    payload = {"stopped": sorted(_stopped)}
+    payload.update({str(k): v for k, v in _state.items()})
     fd, name = tempfile.mkstemp(prefix=".scoreboard-", dir=STATE_PATH.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -279,7 +299,12 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
                           text: str) -> bool:
     """Post or edit the scoreboard in one channel, per the edit rule.
     Returns True when a send/edit happened. Never raises for Discord
-    errors — a 429 backs off, a deleted message is re-posted once."""
+    errors — a 429 backs off, a deleted message is re-posted once.
+    Never posts in a channel that was stopped: a stop is checked
+    here, not just in the loop, so a tick already in flight when
+    the stop lands cannot resurrect the scoreboard."""
+    if channel_id in _stopped:
+        return False
     now = time.time()
     body, _ = _split_body(text)
     entry = _state.setdefault(channel_id, _new_entry())
@@ -289,6 +314,11 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
         return False
     channel = await _get_channel(bot, channel_id)
     if channel is None:
+        return False
+    if (channel_id in _stopped
+            or _state.get(channel_id) is not entry):
+        # Stopped while this tick was fetching the channel, or the
+        # entry was replaced by a fresh start — do not touch it.
         return False
     message = None
     if entry["message_id"] is not None:
@@ -302,6 +332,9 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
             log.warning("[scoreboard] cannot fetch message in %s (%s)",
                         channel_id, exc)
             return False
+    if (channel_id in _stopped
+            or _state.get(channel_id) is not entry):
+        return False
     try:
         if message is not None:
             await message.edit(content=text,
@@ -310,7 +343,10 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
             message = await channel.send(
                 text, allowed_mentions=discord.AllowedMentions.none())
     except discord.NotFound:
-        # Deleted between fetch and edit — post a fresh one once.
+        # Deleted between fetch and edit — post a fresh one once,
+        # unless the channel was stopped in the meantime.
+        if channel_id in _stopped or _state.get(channel_id) is not entry:
+            return False
         try:
             message = await channel.send(
                 text, allowed_mentions=discord.AllowedMentions.none())
@@ -359,6 +395,14 @@ async def scoreboard_loop(bot: discord.Client) -> None:
     empty_ticks = 0
     while not bot.is_closed():
         try:
+            if await maintenance.is_on():
+                # Silent: no fetch, no edits, no watches. The loop
+                # keeps sleeping so a resume picks up at once; the
+                # tick timestamp still moves so /health does not
+                # report a false stale episode after a resume.
+                last_tick_ts = time.monotonic()
+                await asyncio.sleep(interval)
+                continue
             npl, games, raw = await _fetch_all()
             last_tick_ts = time.monotonic()
             if last_tick_ts - _last_cleanup_ts >= _CLEANUP_EVERY_S:
@@ -408,8 +452,9 @@ async def scoreboard_loop(bot: discord.Client) -> None:
                 empty_ticks = 0
             channels = {cid for cid in _state
                         if is_scoreboard_channel(cid)}
-            if SCOREBOARD_CHANNEL_ID and is_scoreboard_channel(
-                    SCOREBOARD_CHANNEL_ID):
+            if (SCOREBOARD_CHANNEL_ID
+                    and is_scoreboard_channel(SCOREBOARD_CHANNEL_ID)
+                    and SCOREBOARD_CHANNEL_ID not in _stopped):
                 channels.add(SCOREBOARD_CHANNEL_ID)
             for cid in list(channels):
                 try:
@@ -453,10 +498,23 @@ def ensure_running(bot: discord.Client) -> None:
             scoreboard_loop(bot), name="scoreboard")
 
 
+def is_running(channel_id: int) -> bool:
+    """True when the scoreboard is currently registered in a channel."""
+    return int(channel_id) in _state
+
+
 async def start_for_channel(bot: discord.Client, channel_id: int) -> bool:
     """Register a channel and post/resume its scoreboard immediately.
 
-    Returns True only when a message was actually posted or edited.
+    Returns True when the scoreboard is running in the channel
+    after this call — including when it was ALREADY running and
+    no edit was needed. The old code returned refresh_channel's
+    result in that case, and refresh_channel returns False when
+    the text has not changed (or the 5s edit gap has not passed),
+    so /scoreboard reported 'Could not post' for a scoreboard
+    that was already live (18 Nov 2026: three times in the test
+    channel). A start that finds a running scoreboard is a
+    success, not a failure.
     The channel is registered ONLY after a first successful post, so
     a failed start can never leave a live scoreboard behind. The old
     code registered + saved the channel first and then posted — and
@@ -475,20 +533,18 @@ async def start_for_channel(bot: discord.Client, channel_id: int) -> bool:
         text = render_scoreboard(npl, games)
         if channel_id in _state:
             # Already running here: resume/edit via the normal path.
+            # A no-edit-needed result is still a running scoreboard.
             try:
-                posted = await refresh_channel(bot, channel_id, text)
+                await refresh_channel(bot, channel_id, text)
             except Exception as exc:
                 # refresh_channel only catches NotFound/HTTPException,
                 # so a transient transport error (aiohttp/timeout) can
-                # still escape — report it honestly instead of
-                # letting the caller think the start itself failed
-                # while a scoreboard appears anyway.
+                # still escape — log it, but the scoreboard is still
+                # running (the loop keeps editing it).
                 log.warning("[scoreboard] start edit failed in %s (%s)",
                             channel_id, type(exc).__name__)
-                return False
-            if posted:
-                ensure_running(bot)
-            return posted
+            ensure_running(bot)
+            return True
         # First start here: post ONCE without registering. Only a
         # successful send creates the state entry, so the loop cannot
         # pick this channel up before the command has succeeded.
@@ -510,6 +566,9 @@ async def start_for_channel(bot: discord.Client, channel_id: int) -> bool:
             "last_edit": time.time(),
             "blocked_until": 0.0,
         }
+        # A successful start clears any earlier stop (persisted
+        # with the state, so a restart cannot bring it back).
+        _stopped.discard(channel_id)
         _save_state()
         ensure_running(bot)
         return True
@@ -526,13 +585,19 @@ async def stop_for_channel(bot: discord.Client, channel_id: int) -> bool:
     Deletion failures are ignored: state removal is what stops the
     edits, and the message is the bot's own so no special permission
     is needed to delete it.
+    The channel is marked stopped FIRST (under the lock, before
+    the state is removed), so a tick already in flight — or the
+    loop's env-channel auto-add on its next tick — cannot post a
+    fresh message after the stop. The stop is persisted, so a
+    restart does not silently undo it; only /scoreboard clears it.
     """
     entry = None
     async with _start_lock:
+        _stopped.add(channel_id)
         entry = _state.get(channel_id)
         if entry is not None:
             del _state[channel_id]
-            _save_state()
+        _save_state()
     if entry is None:
         return False
     msg_id = entry.get("message_id")

@@ -1,9 +1,8 @@
 """Football Discord Bot using verified public football-data sources."""
 import asyncio
 import logging
-import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -15,18 +14,19 @@ import health
 import history
 import http_client as hc
 import barcelona_reminder
+import maintenance
 import notify_manager
 import scoreboard
 from config import (
-    DISCORD_BOT_TOKEN, TRACKED_LEAGUES,
-    GEMINI_API_KEY, GEMINI_MODEL, SPORTSDB_LEAGUE_MAP, ESPN_LEAGUE_MAP,
+    DISCORD_BOT_TOKEN,
+    GEMINI_API_KEY, GEMINI_MODEL, ESPN_LEAGUE_MAP,
 )
 from embeds import (
-    match_embed, fixtures_embed, MatchView,
+    match_embed, MatchView,
 )
 from providers import (
-    apf_upcoming, free_fixtures_for_day,
-    sportsdb_day, sportsdb_live_matches,
+    free_fixtures_for_day,
+    sportsdb_live_matches,
     sofa_live_matches, apf_live, espn_live, onex_live_matches,
     onex_all_live_matches,
     onex_search,
@@ -64,12 +64,75 @@ def _crosslink_apf(matches: list[dict], apf_matches: list[dict]) -> None:
                 m["apf_id"] = apf_id
 
 
-def _league_choices() -> list[app_commands.Choice[str]]:
-    return [
-        app_commands.Choice(name=name, value=str(lid))
-        for lid, name in TRACKED_LEAGUES.items()
-        if lid in SPORTSDB_LEAGUE_MAP
-    ]
+async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+    """Global command gate for maintenance mode. /maintenance and
+    /shutdown always work (they are how the owner ends it);
+    autocomplete has no message response, so it is refused
+    silently. Every other command is answered with the short
+    maintenance notice and does not run. NOTE: discord.py's tree
+    silently drops the interaction when this returns False
+    (no on_error call), so the notice MUST be sent here."""
+    data = getattr(interaction, "data", None) or {}
+    name = data.get("name") if isinstance(data, dict) else None
+    if name in ("maintenance", "shutdown"):
+        return True
+    if interaction.type is not discord.InteractionType.application_command:
+        return not await maintenance.is_on()
+    if await maintenance.is_on():
+        try:
+            await interaction.response.send_message(
+                maintenance.NOTICE, ephemeral=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _schedule_shutdown(client, delay: float = 2.0) -> None:
+    """Stop the bot process cleanly, after letting the reply
+    flush. A clean exit (code 0) is NOT restarted by the systemd
+    unit (Restart=on-failure, RestartSec=10 — recorded from the
+    17 Nov 2026 deploy), so the bot stays off until the service
+    is started again. os._exit(0) is the backstop: even if a
+    cleanup step stumbles, the process still exits 0."""
+    import os
+
+    async def _shutdown():
+        await asyncio.sleep(delay)
+        try:
+            await client.close()
+        finally:
+            os._exit(0)
+
+    asyncio.create_task(_shutdown())
+
+
+class ShutdownConfirmView(discord.ui.View):
+    """One-shot confirm for /shutdown. Not persistent: if the bot
+    restarts, the buttons die and the owner just runs /shutdown
+    again."""
+
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Yes, shut down", style=discord.ButtonStyle.danger,
+                       custom_id="shutdown:confirm")
+    async def confirm(self, interaction: discord.Interaction,
+                      button: discord.ui.Button):
+        if not maintenance.is_owner(interaction):
+            await interaction.response.send_message(
+                maintenance.OWNER_NOTICE, ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🛑 Shutting down…", ephemeral=True)
+        _schedule_shutdown(interaction.client)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary,
+                       custom_id="shutdown:cancel")
+    async def cancel(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Shutdown cancelled.", ephemeral=True)
 
 
 class FootballBot(discord.Client):
@@ -82,6 +145,9 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         await watch.load_watches()
+        # Maintenance gate for every slash command (see
+        # _tree_interaction_check).
+        self.tree.interaction_check = _tree_interaction_check
         # Persistent alert buttons: one static view covers every
         # 📊 Detail / 🔄 Live button — the game id is resolved from
         # the message each button sits on, so old buttons keep
@@ -178,46 +244,35 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Live scores for game search and watches; "
-            "**SofaScore 🟡** + **ESPN 🟢** + **TheSportsDB** for fixtures and /live.\n"
+            "Follow a game and its live panel ticks every second; "
+            "goals and big moments send you a notification."
         ),
         color=0x00C851,
     )
     embed.add_field(name="📡 Live", value=(
-        "`/live` — all live matches\n"
+        "`/live` — all live matches right now\n"
+        "`/game` — detail for one game (ID or team name)\n"
         "`/scoreboard` — live scoreboard (test channel only)\n"
-        "`/stopscoreboard` — stop the scoreboard in this channel\n"
-        "`/game` — detail for one game (ID or team name)"
-    ), inline=True)
-    embed.add_field(name="🔍 Follow a game", value=(
-        "`/watch` — follow one game, alerts on goals/wickets/cards\n"
+        "`/stopscoreboard` — stop the scoreboard in this channel"
+    ), inline=False)
+    embed.add_field(name="👀 Follow a game", value=(
+        "`/watch` — follow a game; its panel ticks live, alerts on goals, wickets and cards\n"
         "`/unwatch` — stop following a game\n"
         "`/watching` — games this channel follows\n"
         "`/notifications` — manage alerts for watched games\n"
         "`/history` — past matches and alerts that were sent"
-    ), inline=True)
-    embed.add_field(name="📅 Fixtures", value=(
-        "`/today` — today's fixtures\n"
-        "`/tomorrow` — tomorrow's fixtures\n"
-        "`/fixtures` — upcoming games"
-    ), inline=True)
-    embed.add_field(name="🛠 Tools", value=(
-        "`/ping` — bot connection health\n"
-        "`/health` — service and reminder status\n"
-        "`/nextbarca` — Barcelona's next match\n"
-        "`/ai` — ask Gemini a question\n"
-        "`/ask` — ask about live matches in plain words"
-    ), inline=True)
-    leagues = "\n".join(f"`{lid}` {name}" for lid, name in TRACKED_LEAGUES.items() if lid in SPORTSDB_LEAGUE_MAP)
-    embed.add_field(name="🏆 Available Leagues", value=leagues, inline=False)
+    ), inline=False)
+    embed.add_field(name="💬 Ask", value=(
+        "`/ask` — plain words: follow a game, list live games, Barcelona's next match\n"
+        "`/nextbarca` — Barcelona's next match and reminder time"
+    ), inline=False)
+    embed.add_field(name="🛠 Bot", value=(
+        "`/health` — is the bot OK: connection, live data, watches\n"
+        "`/maintenance` — silence or resume the bot (server owner)\n"
+        "`/shutdown` — stop the bot (server owner)\n"
+        "`/help` — this list"
+    ), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="ping", description="Check whether the bot is online")
-async def cmd_ping(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        f"🏓 Pong — {round(bot.latency * 1000)} ms", ephemeral=True
-    )
 
 
 @bot.tree.command(name="health", description="Check bot, providers, and Barcelona reminders")
@@ -276,145 +331,40 @@ async def cmd_nextbarca(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-async def _ask_gemini(prompt: str) -> str:
-    if ai_model is None:
-        raise RuntimeError("Gemini is not configured on this bot.")
-    response = await asyncio.to_thread(ai_model.generate_content, prompt)
-    text = getattr(response, "text", "").strip()
-    if not text:
-        raise RuntimeError("Gemini returned no text for that request.")
-    return text
-
-
-# ── /ai fixture grounding ─────────────────────────────────────────────────
-# 18 Nov 2026: /ai answered "When is FC Barcelona's next match?"
-# with "Rayo Vallecano, Sunday May 19th" — a stale fixture from
-# Gemini's training data (May 2024), because the raw question went
-# straight to the model with no live data. Fixture questions are
-# now answered from the provider instead (the same lookup
-# /nextbarca uses); Gemini only words the grounded facts, and the
-# plain grounded answer is sent if wording fails. Any other team's
-# fixture question is answered honestly as unavailable rather than
-# guessed — the bot only has fixtures for Barcelona.
-_AI_FIXTURE_RES = [
-    re.compile(r"\bnext\s+(match|game|fixture|opponent)\b"),
-    re.compile(r"\bwhen\s+(do|does|is|are|will)\b.{0,50}\b(play|match|game)\b"),
-    re.compile(r"\bwhen'?s\b.{0,30}\b(match|game)\b"),
-    re.compile(r"\bwho\s+(do|does|are|is)\b.{0,50}\b(play|playing)\b"),
-    re.compile(r"\b(play|playing)\s+(next|against|today|tonight|tomorrow)\b"),
-    re.compile(r"\b(is|are)\b.{0,40}\bplaying\s+(today|tonight|tomorrow)\b"),
-]
-
-
-def _ai_fixture_team(prompt: str) -> str | None:
-    """'barcelona' / 'other' when the prompt asks about a team's
-    next fixture, None when it is not a fixture question at all."""
-    text = prompt.lower()
-    if not any(rx.search(text) for rx in _AI_FIXTURE_RES):
-        return None
-    if "barcelona" in text or "barca" in text or "barça" in text:
-        return "barcelona"
-    return "other"
-
-
-async def _ai_next_barca_fixture() -> tuple[datetime, dict] | None:
-    """Barcelona's next fixture from the provider (the exact
-    /nextbarca lookup: LaLiga fixtures, next 9 days, kickoff in
-    the future). None when the provider has none — the caller says
-    so instead of inventing one."""
-    now = datetime.now(barcelona_reminder.NEPAL)
-    candidates = []
-    for offset in range(9):
-        day = (now.date() + timedelta(days=offset)).isoformat()
-        try:
-            fixtures = await free_fixtures_for_day(140, day)
-        except Exception:
-            log.warning("[ai] Barca fixture lookup failed",
-                        exc_info=True)
-            return None
-        for match in fixtures or []:
-            if not barcelona_reminder._is_barcelona(match):
-                continue
-            kickoff = barcelona_reminder._kickoff(match)
-            if kickoff and kickoff > now:
-                candidates.append((kickoff, match))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: item[0])
-
-
-async def _ai_barca_fixture_answer(prompt: str) -> str | None:
-    """Grounded answer to a Barcelona fixture question, or None
-    when the provider has no fixture. Never invents a date, a
-    team, or a kickoff time."""
-    found = await _ai_next_barca_fixture()
-    if found is None:
-        return ("No upcoming Barcelona fixture is available from the "
-                "provider yet — check back closer to the next match.")
-    kickoff, match = found
-    local = kickoff.astimezone(barcelona_reminder.NEPAL)
-    home = match.get("home", "TBD")
-    away = match.get("away", "TBD")
-    line = (f"🔵🔴 Next Barcelona match: **{home} vs {away}**\n"
-            f"Kickoff: <t:{int(kickoff.timestamp())}:F> "
-            f"({local.strftime('%A %d %B, %I:%M %p')} Nepal time)")
-    if re.search(r"\bplaying\s+(today|tonight)\b", prompt.lower()):
-        if local.date() == datetime.now(barcelona_reminder.NEPAL).date():
-            return f"Yes — Barcelona play today.\n{line}"
-        return (f"No — Barcelona don't play today.\n{line}")
-    if re.search(r"\bplaying\s+tomorrow\b", prompt.lower()):
-        tomorrow = datetime.now(barcelona_reminder.NEPAL).date() + timedelta(days=1)
-        if local.date() == tomorrow:
-            return f"Yes — Barcelona play tomorrow.\n{line}"
-        return (f"No — Barcelona don't play tomorrow.\n{line}")
-    return line
-
-
-@bot.tree.command(name="ai", description="Ask Gemini a question")
-@app_commands.describe(prompt="Your question or request")
-async def cmd_ai(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer(thinking=True)
-    # Fixture questions are answered from the provider, never from
-    # the model's memory: see _ai_fixture_team above.
-    fixture_team = _ai_fixture_team(prompt)
-    if fixture_team == "other":
-        await interaction.followup.send(
-            "I only have live fixtures for Barcelona, so I can't tell "
-            "you another team's next match without guessing. Ask "
-            "'when do Barcelona play next?' or use /ask for live games.",
-            ephemeral=True,
-        )
+# ── /maintenance + /shutdown ───────────────────────────────────────────────────
+@bot.tree.command(name="maintenance", description="Silence or resume the bot (server owner only)")
+@app_commands.describe(mode="off = silence the bot, on = resume the bot")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="off — silence the bot", value="off"),
+    app_commands.Choice(name="on — resume the bot", value="on"),
+])
+async def cmd_maintenance(interaction: discord.Interaction, mode: str):
+    if not maintenance.is_owner(interaction):
+        await interaction.response.send_message(
+            maintenance.OWNER_NOTICE, ephemeral=True)
         return
-    if fixture_team == "barcelona":
-        grounded = await _ai_barca_fixture_answer(prompt)
-        if grounded is None:
-            grounded = ("No upcoming Barcelona fixture is available from "
-                        "the provider yet — check back closer to the next "
-                        "match.")
-        try:
-            answer = await _ask_gemini(
-                "Reword this answer in one or two friendly sentences. "
-                "Use ONLY the facts below — do not add, change or guess "
-                "any team, date or time, and keep the kickoff line "
-                "exactly as written:\n" + grounded)
-        except Exception:
-            log.warning("[ai] Grounded rewording failed, sending "
-                        "provider answer directly", exc_info=True)
-            answer = grounded
-        for start in range(0, len(answer), 2000):
-            await interaction.followup.send(answer[start:start + 2000])
-        return
-    try:
-        answer = await _ask_gemini(prompt)
-    except Exception:
-        log.exception("[ai] Request failed")
-        await interaction.followup.send(
-            "❌ AI is temporarily unavailable. Please try again shortly.", ephemeral=True
-        )
-        return
+    on = (mode == "off")
+    await maintenance.set_on(on)
+    if on:
+        await interaction.response.send_message(
+            "🔧 Maintenance mode ON — the bot is silent now: no "
+            "scoreboard, no watch alerts, no reminders. Use "
+            "/maintenance on to resume.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "✅ Maintenance mode OFF — the bot is back to normal.",
+            ephemeral=True)
 
-    for start in range(0, len(answer), 2000):
-        await interaction.followup.send(answer[start:start + 2000])
+
+@bot.tree.command(name="shutdown", description="Stop the bot (server owner only)")
+async def cmd_shutdown(interaction: discord.Interaction):
+    if not maintenance.is_owner(interaction):
+        await interaction.response.send_message(
+            maintenance.OWNER_NOTICE, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "🛑 Shut the bot down? It stays off until the service is "
+        "started again.", view=ShutdownConfirmView(), ephemeral=True)
 
 
 # ── /live ────────────────────────────────────────────────────────────────────────
@@ -465,6 +415,16 @@ def _match_is_live(m: dict) -> bool:
     return False
 
 
+def _is_football_match(m: dict) -> bool:
+    """Football-first sort for /live: the football-only providers
+    (SportsDB / SofaScore / API-Football / ESPN) are football by
+    construction; a 1xBet match is football only when it says so
+    (unknown sport sorts after football, never guessed)."""
+    if m.get("provider") != "onexbet":
+        return True
+    return str(m.get("sport") or "").strip().lower() == "football"
+
+
 def merge_live_matches(sportsdb: list[dict], sofa: list[dict],
                        apf: list[dict], onex: list[dict],
                        espn: list[dict]) -> list[dict]:
@@ -473,7 +433,10 @@ def merge_live_matches(sportsdb: list[dict], sofa: list[dict],
     with a score/minute — a scoreless game never pushes a live
     score off the cap. LIVE ONLY: every list is passed through
     _match_is_live first, so a scheduled or finished fixture from
-    any provider can never appear in /live. Pure: no network, no
+    any provider can never appear in /live. FOOTBALL FIRST:
+    football matches sort before other sports (18 Nov 2026: /live
+    showed 15 games, all cricket, zero football — 1xBet's feed
+    is cricket-heavy and filled the cap). Pure: no network, no
     Discord. The caller slices [:LIVE_RENDER_CAP]."""
     sportsdb = [m for m in sportsdb if _match_is_live(m)]
     sofa = [m for m in sofa if _match_is_live(m)]
@@ -494,9 +457,10 @@ def merge_live_matches(sportsdb: list[dict], sofa: list[dict],
         if pair not in seen_pairs:
             combined.append(m)
             seen_pairs.add(pair)
-    # Stable sort: scored games first, merge order kept inside
-    # each group.
-    combined.sort(key=lambda m: 0 if _live_has_score(m) else 1)
+    # Stable sort: football first, then scored games first;
+    # merge order kept inside each group.
+    combined.sort(key=lambda m: (0 if _is_football_match(m) else 1,
+                                 0 if _live_has_score(m) else 1))
     return combined
 
 
@@ -554,6 +518,7 @@ async def cmd_scoreboard(interaction: discord.Interaction):
             ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
+    already = scoreboard.is_running(interaction.channel_id)
     try:
         posted = await scoreboard.start_for_channel(bot, interaction.channel_id)
     except Exception:
@@ -563,13 +528,21 @@ async def cmd_scoreboard(interaction: discord.Interaction):
             ephemeral=True)
         return
     if posted:
-        await interaction.followup.send(
-            "📊 Live scoreboard started in this channel — it updates when "
-            "a score changes.", ephemeral=True)
+        if already:
+            await interaction.followup.send(
+                "📊 The live scoreboard is already running in this "
+                "channel — it updates when a score changes.",
+                ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "📊 Live scoreboard started in this channel — it updates when "
+                "a score changes.", ephemeral=True)
     else:
+        # No blame assigned: a failed first post is usually the
+        # live feed not answering, not a permissions problem.
         await interaction.followup.send(
-            "Could not post the scoreboard here — check the bot can send "
-            "messages in this channel.", ephemeral=True)
+            "Could not start the scoreboard here — the live feed "
+            "didn't answer. Please try again shortly.", ephemeral=True)
 
 
 # ── /stopscoreboard ─────────────────────────────────────────────────────────
@@ -586,83 +559,6 @@ async def cmd_stopscoreboard(interaction: discord.Interaction):
         await interaction.followup.send(
             "No live scoreboard is running in this channel.",
             ephemeral=True)
-
-
-# ── /today ──────────────────────────────────────────────────────────────────────
-@bot.tree.command(name="today", description="Today's fixtures for a league")
-@app_commands.describe(league="Pick a league")
-@app_commands.choices(league=_league_choices())
-async def cmd_today(interaction: discord.Interaction, league: str):
-    if not await _defer(interaction):
-        return
-    lid      = int(league)
-    fixtures = await free_fixtures_for_day(lid, date.today().isoformat())
-    embeds   = fixtures_embed(fixtures, lid, f"📅 Today — {TRACKED_LEAGUES[lid]}")
-    await _send_paginated(interaction, embeds)
-
-
-# ── /tomorrow ───────────────────────────────────────────────────────────────────
-@bot.tree.command(name="tomorrow", description="Tomorrow's fixtures for a league")
-@app_commands.describe(league="Pick a league")
-@app_commands.choices(league=_league_choices())
-async def cmd_tomorrow(interaction: discord.Interaction, league: str):
-    if not await _defer(interaction):
-        return
-    lid      = int(league)
-    fixtures = await free_fixtures_for_day(lid, (date.today() + timedelta(days=1)).isoformat())
-    embeds   = fixtures_embed(fixtures, lid, f"📅 Tomorrow — {TRACKED_LEAGUES[lid]}")
-    await _send_paginated(interaction, embeds)
-
-
-# ── /fixtures ───────────────────────────────────────────────────────────────────
-@bot.tree.command(name="fixtures", description="Upcoming fixtures for a league")
-@app_commands.describe(league="Pick a league")
-@app_commands.choices(league=_league_choices())
-async def cmd_fixtures(interaction: discord.Interaction, league: str):
-    await interaction.response.defer()
-    lid      = int(league)
-    fixtures = []
-    for offset in range(7):
-        fixtures.extend(await sportsdb_day(lid, (date.today() + timedelta(days=offset)).isoformat()))
-        if len(fixtures) >= 10:
-            break
-    if not fixtures:
-        fixtures = await apf_upcoming(lid, next_n=10)
-    embeds   = fixtures_embed(fixtures, lid, f"📆 Upcoming — {TRACKED_LEAGUES[lid]}")
-    await _send_paginated(interaction, embeds)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ── /stats (bot performance) ──────────────────────────────────────────────────────
-@bot.tree.command(name="stats", description="Bot performance stats (provider latency)")
-async def cmd_stats(interaction: discord.Interaction):
-    from http_client import stats_summary
-    embed = discord.Embed(title="📈 Bot Performance Stats", color=0x9C27B0)
-    embed.description = f"```\n{stats_summary()}\n```"
-    embed.add_field(name="Games watched", value=len(watch._watches), inline=True)
-    embed.add_field(name="Scoreboard channels", value=len(scoreboard._state), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── /game ─────────────────────────────────────────────────────────────────────
@@ -816,6 +712,9 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             await interaction.followup.send(msg, ephemeral=True)
         return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
+        await watch.delete_panel_message(
+            getattr(interaction, "client", None), target.id,
+            str(resolved["game_id"]))
         removed = await watch.remove_watch(target.id, str(resolved["game_id"]))
         if removed:
             await interaction.followup.send(
@@ -863,10 +762,39 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         await interaction.followup.send(
             "Could not find that game right now.", ephemeral=True)
         return
+    # The panel IS the reply when the game is live: one public
+    # message in the target channel, ticking in place every
+    # second — not a separate static confirmation. A game that
+    # has not started yet gets the text reply instead, and its
+    # panel appears on the first tick once it goes live.
+    detail = started.get("live_detail")
+    live_status = (str(detail.get("status") or "")
+                   if isinstance(detail, dict) else "")
+    if detail is not None and live_status in (
+            "1H", "2H", "ET", "PEN", "HT", "Live",
+            "1st innings", "2nd innings"):
+        panel = watch.render_panel(detail)
+        view = watch.WatchAlertView(str(started["game_id"]))
+        if target.id == interaction.channel_id:
+            msg = await interaction.followup.send(
+                panel, view=view, wait=True)
+            if msg is not None:
+                await watch.set_panel_message(
+                    target.id, str(started["game_id"]), msg.id, panel)
+            return
+        await watch.post_panel_now(
+            getattr(interaction, "client", None), target.id,
+            str(started["game_id"]), detail)
+        await interaction.followup.send(
+            f"👀 Watching **{started['home']} vs {started['away']}** "
+            f"({started['league']}) in <#{target.id}> — the live panel "
+            f"is there now.{channel_note}", ephemeral=True)
+        return
     await interaction.followup.send(
         f"👀 Watching **{started['home']} vs {started['away']}** "
-        f"({started['league']}) in <#{target.id}> — {level} alerts, "
-        f"only when the game changes.{channel_note}", ephemeral=True)
+        f"({started['league']}) in <#{target.id}> — a live panel there "
+        f"updates every second; {level} alerts only for goals, wickets "
+        f"and cards.{channel_note}", ephemeral=True)
 
 
 # ── /unwatch ──────────────────────────────────────────────────────────────────
@@ -896,6 +824,11 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
             f"No watched game matches '{game}' in this channel. "
             "Use `/watching` to see what is watched here.", ephemeral=True)
         return
+    # Stopping on purpose also removes the live panel, so no frozen
+    # panel is left behind in the channel.
+    await watch.delete_panel_message(
+        getattr(interaction, "client", None), interaction.channel_id,
+        picked["game_id"])
     removed = await watch.remove_watch(interaction.channel_id, picked["game_id"])
     if removed:
         await interaction.followup.send(
@@ -951,6 +884,11 @@ class HistoryView(discord.ui.View):
     """◀ ▶ pagination for /history. Short-lived (3 min) and
     non-persistent: the pages live only in this view, so after a
     restart the user just runs /history again."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Maintenance mode: a press answers with the short notice
+        # and the pages do not turn.
+        return not await maintenance.view_blocked(interaction)
 
     def __init__(self, pages: list[str]):
         super().__init__(timeout=180)

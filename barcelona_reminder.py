@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import discord
+import maintenance
 from providers import free_fixtures_for_day
 
 log = logging.getLogger("barcelona_reminder")
@@ -94,6 +95,11 @@ async def _general_channels(bot: discord.Client) -> list[discord.abc.Messageable
     return []
 
 async def _deliver(bot, match, kickoff, now) -> str:
+    # Maintenance mode: do not send, and do not mark sent or
+    # pending — the next poll retries after the resume, so the
+    # reminder is deferred, not lost.
+    if await maintenance.is_on():
+        return "deferred"
     state = _load_state()
     marker = _stable_key(match, kickoff)
     if marker in state["sent"] or _key(match, kickoff) in state["sent"]:
@@ -136,7 +142,7 @@ async def _deliver(bot, match, kickoff, now) -> str:
 async def poll_once(bot, now=None) -> dict:
     fixed_now = now
     now = now or datetime.now(NEPAL)
-    result = {"fixtures": 0, "due": 0, "sent": 0, "already_sent": 0, "reconciled": 0, "errors": 0}
+    result = {"fixtures": 0, "due": 0, "sent": 0, "already_sent": 0, "reconciled": 0, "errors": 0, "deferred": 0}
     # UTC provider dates can be yesterday for an early-morning Nepal kickoff.
     days = [(now.date() + timedelta(days=i)).isoformat() for i in range(-1, LOOKAHEAD_DAYS)]
     async def fetch(day):

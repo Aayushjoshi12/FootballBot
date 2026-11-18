@@ -144,12 +144,36 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
 
     def test_help_lists_new_commands(self):
         # /help text is built inline in cmd_help; the command
-        # descriptions are the contract — new commands must exist.
+        # descriptions are the contract — the kept commands must
+        # exist, and the removed ones must not.
         names = {c.name for c in botmod.bot.tree.get_commands()}
         for expected in ("ask", "notifications", "history", "health",
                          "watch", "game", "live", "scoreboard",
-                         "stopscoreboard"):
+                         "stopscoreboard", "unwatch", "watching",
+                         "nextbarca", "help", "maintenance", "shutdown"):
             self.assertIn(expected, names)
+        for removed in ("ai", "today", "tomorrow", "fixtures",
+                        "stats", "ping"):
+            self.assertNotIn(removed, names)
+        for removed in ("cmd_ai", "cmd_today", "cmd_tomorrow",
+                        "cmd_fixtures", "cmd_stats", "cmd_ping"):
+            self.assertFalse(hasattr(botmod, removed))
+
+    async def test_help_embed_lists_only_kept_commands(self):
+        interaction = _Interaction(channel_id=777)
+        await botmod.cmd_help.callback(interaction)
+        self.assertEqual(len(interaction.response.sent), 1)
+        content, embed, view = interaction.response.sent[0]
+        text = "".join(
+            (field.name + " " + field.value) for field in embed.fields)
+        for kept in ("/watch", "/unwatch", "/watching", "/game", "/live",
+                     "/scoreboard", "/stopscoreboard", "/ask",
+                     "/notifications", "/history", "/nextbarca",
+                     "/health", "/help", "/maintenance", "/shutdown"):
+            self.assertIn(kept, text)
+        for removed in ("/ai ", "/today", "/tomorrow", "/fixtures",
+                        "/stats", "/ping"):
+            self.assertNotIn(removed, text)
 
     async def test_scoreboard_refused_in_general(self):
         # 18 Nov 2026 incident: /scoreboard must never start outside

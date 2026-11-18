@@ -63,6 +63,15 @@ async def init() -> None:
             panel_kind TEXT    NOT NULL DEFAULT 'compact',
             PRIMARY KEY (channel_id, game_id)
         );
+        -- One live board per channel (the single message that
+        -- carries every watched game's ticking row, edited once
+        -- a second). The board message id survives restarts, so
+        -- the tick resumes editing the SAME message instead of
+        -- posting a new one.
+        CREATE TABLE IF NOT EXISTS live_boards (
+            channel_id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL DEFAULT 0
+        );
         -- Sent-event dedup keys (Feature 1): one row per alert
         -- actually sent, so a restart never re-sends an old event.
         CREATE TABLE IF NOT EXISTS match_events (
@@ -337,6 +346,35 @@ async def update_watch_snapshot(channel_id: int, game_id: str,
         "UPDATE watches SET snapshot=? WHERE channel_id=? AND game_id=?",
         (_json.dumps(snapshot), channel_id, str(game_id)),
     )
+    await conn.commit()
+
+
+# ── Live boards ───────────────────────────────────────────────────────
+async def get_live_boards() -> list[dict]:
+    """Every stored live-board message id, for resume on boot."""
+    conn = _require_conn()
+    cur = await conn.execute(
+        "SELECT channel_id, message_id FROM live_boards",
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def set_live_board(channel_id: int, message_id: int | None) -> None:
+    """Remember (or clear) the live board message for a channel,
+    so the 1s tick edits this message instead of posting a new one."""
+    conn = _require_conn()
+    if message_id:
+        await conn.execute(
+            "INSERT INTO live_boards (channel_id, message_id) "
+            "VALUES (?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET message_id=excluded.message_id",
+            (channel_id, int(message_id)),
+        )
+    else:
+        await conn.execute(
+            "DELETE FROM live_boards WHERE channel_id=?", (channel_id,),
+        )
     await conn.commit()
 
 # ══════════════════════════════════════════════════════════════════════════

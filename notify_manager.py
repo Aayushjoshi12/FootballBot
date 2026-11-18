@@ -290,10 +290,10 @@ class NotifyManagerView(discord.ui.View):
             return
         game_id = str(row["game_id"])
         try:
-            # Unfollow stops the alerts; the live panel keeps
-            # ticking in place while the game is live (same rule
-            # as the 🔕 button on a panel). The prefs go with the
-            # subscription, as before.
+            # Unfollow stops the alerts and takes the game off
+            # the live board (same rule as the 🔕 button on a
+            # panel). The prefs go with the subscription, as
+            # before.
             entry = await watch.set_notify(self.channel_id, game_id, False)
             await db.delete_prefs(self.channel_id, game_id)
         except Exception as exc:
@@ -311,8 +311,8 @@ class NotifyManagerView(discord.ui.View):
         name = (f"**{entry['home']} vs {entry['away']}**" if entry
                 else f"game `{game_id}`")
         await interaction.response.send_message(
-            f"🔕 Notifications off for {name} — the live panel keeps "
-            f"ticking here.", ephemeral=True)
+            f"🔕 Notifications off for {name} — it is off the live "
+            f"board now.", ephemeral=True)
 
 
 async def show_notifications(interaction: discord.Interaction) -> None:

@@ -12,6 +12,7 @@ patched out in the shutdown test.
 import asyncio
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,13 +38,39 @@ def _load(name):
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-async def _drain_panel_workers(timeout=5.0):
-    """The tick hands panel edits to background workers — wait
-    for them before asserting on a panel."""
-    tasks = [t for t in list(wmod._panel_workers.values()) if not t.done()]
+async def _drain_board_workers(timeout=5.0):
+    """The tick hands the board edit to a background worker — wait
+    for it before asserting on the board."""
+    tasks = [t for t in list(wmod._board_workers.values()) if not t.done()]
     if tasks:
         await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), timeout)
+
+
+async def _cancel_board_workers():
+    for task in list(wmod._board_workers.values()):
+        task.cancel()
+    if wmod._board_workers:
+        await asyncio.gather(*wmod._board_workers.values(),
+                             return_exceptions=True)
+    wmod._board_workers.clear()
+    wmod._boards = {}
+    wmod._board_finals = {}
+
+
+def _seed_board(channel, rows, message_id=2003, last_edit_ago=0.0):
+    """Seed the live board for channel 777 with rows rendered
+    from (detail, clock) pairs."""
+    body = wmod.render_board(rows, updated=None)
+    msg = FakeMessage(message_id, body)
+    channel.messages[message_id] = msg
+    wmod._boards[777] = {
+        "message_id": message_id, "body": body, "base_body": body,
+        "last_edit": time.monotonic() - last_edit_ago,
+        "blocked_until": 0.0, "_pending_text": None,
+        "_pending_base": None,
+    }
+    return msg
 
 
 class FakeMessage:
@@ -150,6 +177,8 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
+        wmod._boards = {}
+        wmod._board_finals = {}
         wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
@@ -159,6 +188,7 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         await db.init()
 
     async def asyncTearDown(self):
+        await _cancel_board_workers()
         await db.close()
         db._DB = self._orig_db
         wmod._watches = self._orig_watches
@@ -168,6 +198,7 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self._tmp.rmdir()
 
     def _seed_watch(self, with_panel=True):
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
         snap = wmod.snapshot_from_detail(
             {"home": "Republic of the Gambia", "away": "Ivory Coast",
              "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
@@ -176,7 +207,6 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         panel_id = 2001 if with_panel else None
         panel_body = None
         if with_panel:
-            detail = prov._onex_detail_from_raw(self.games1x2[0])
             panel_body = wmod.render_panel(detail, "67:00")
             self.channel.messages[2001] = FakeMessage(2001, panel_body)
         wmod._watches[(777, "771747666")] = {
@@ -186,7 +216,10 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
             "panel_message_id": panel_id, "panel_body": panel_body,
             "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
+            "_last_board_detail": detail,
         }
+        _seed_board(self.channel, [(detail, "67:00", False)],
+                    last_edit_ago=2.0)
 
     async def test_flag_defaults_off(self):
         self.assertFalse(await maintenance.is_on())
@@ -212,12 +245,16 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.sent), 0)
         await maintenance.set_on(False)
         await wmod.on_tick(self.bot, [changed])
-        await _drain_panel_workers()
-        # Resumed: the goal alert goes out and the panel ticks.
+        await _drain_board_workers()
+        # Resumed: the goal alert goes out and the board ticks;
+        # the per-game panel stays frozen.
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("GOAL", self.channel.sent[0].content)
         panel = self.channel.messages[2001]
-        self.assertEqual(len(panel.edits), 1)
+        self.assertEqual(len(panel.edits), 0)
+        board = self.channel.messages[2003]
+        self.assertEqual(len(board.edits), 1)
+        self.assertIn("1 – 1", board.edits[0])
 
     async def test_flag_persists_across_restart(self):
         await maintenance.set_on(True)

@@ -1542,6 +1542,109 @@ class TestLiveMerge(unittest.TestCase):
         out = botmod.merge_live_matches([], [], [], [plain, nil], [])
         self.assertEqual(out[0]["home"], "Nil")
 
+    # ── 18 Nov 2026 regression: /live showed 15 scheduled fixtures
+    # (Man City vs Fulham, Bournemouth vs Sunderland, ...) with
+    # "...and 95 more live matches" — every one dated Nov 20–24.
+    # /live must list ONLY genuinely live games.
+    def test_scheduled_match_dropped(self):
+        sched = _live_match("Man City", "Fulham", provider="espn")
+        sched["status"] = "Scheduled"
+        sched["date"] = "2026-11-22"
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [], [sched])
+        self.assertEqual(out, [])
+
+    def test_scheduled_date_status_dropped(self):
+        # ESPN's shortDetail for a pre-game event is a date string,
+        # not the word "Scheduled" — the gate must still drop it.
+        sched = _live_match("Bournemouth", "Sunderland", provider="espn")
+        sched["status"] = "Sat, Nov 22"
+        sched["date"] = "2026-11-22"
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [], [sched])
+        self.assertEqual(out, [])
+
+    def test_finished_match_dropped(self):
+        done = _live_match("Done", "Team", 2, 1, 90, provider="apifootball")
+        done["finished"] = True
+        done["status"] = "FT"
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [done], [], [])
+        self.assertEqual(out, [])
+
+    def test_live_match_kept(self):
+        live = _live_match("Live", "Team", 1, 0, 67, provider="espn")
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [], [live])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["home"], "Live")
+
+    def test_onex_feed_match_without_minute_kept(self):
+        # The 1xBet live feed is live-only by construction, so a
+        # match from it passes even before a minute/score exists.
+        plain = _live_match("Plain", "Team")
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [plain], [])
+        self.assertEqual(len(out), 1)
+
+    def test_all_scheduled_incident_reproduced(self):
+        # The 18 Nov incident: 15 scheduled ESPN fixtures, nothing
+        # live anywhere — /live must answer with an empty list (the
+        # command then says "No live matches right now").
+        scheduled = []
+        for i in range(15):
+            m = _live_match(f"Home{i:02d}", f"Away{i:02d}", provider="espn")
+            m["status"] = "Scheduled"
+            m["date"] = "2026-11-22"
+            scheduled.append(m)
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [], scheduled)
+        self.assertEqual(out, [])
+
+
+class TestEspnLive(unittest.IsolatedAsyncioTestCase):
+    """espn_live returns live games only — the scoreboard's
+    scheduled ("pre") and finished ("post") events are dropped at
+    the source (18 Nov 2026 regression)."""
+
+    def _espn_event(self, eid, home, away, state, detail, hs=None, aws=None):
+        return {"id": str(eid), "name": "Premier League",
+                "competitions": [{"date": "2026-11-22T13:00Z",
+                    "status": {"type": {"state": state,
+                                        "shortDetail": detail,
+                                        "completed": state == "post"}},
+                    "competitors": [
+                        {"homeAway": "home", "score": hs,
+                         "team": {"id": "1", "displayName": home,
+                                  "logo": ""}},
+                        {"homeAway": "away", "score": aws,
+                         "team": {"id": "2", "displayName": away,
+                                  "logo": ""}}],
+                    "venue": {"fullName": ""}, "details": []}]}
+
+    async def test_only_in_progress_returned(self):
+        data = {"events": [
+            self._espn_event(1, "Man City", "Fulham", "pre", "Sat, Nov 22"),
+            self._espn_event(2, "Arsenal", "Chelsea", "in", "67'", 2, 1),
+            self._espn_event(3, "Liverpool", "Everton", "post",
+                             "Full Time", 3, 0),
+        ]}
+        orig_get = prov.hc.get
+
+        async def stub(url, headers, params=None, cache_key="",
+                       provider="x", refresh_fn=None):
+            return data
+
+        prov.hc.get = stub
+        try:
+            matches, events = await prov.espn_live("eng.1", 39)
+        finally:
+            prov.hc.get = orig_get
+        self.assertEqual([m["home"] for m in matches], ["Arsenal"])
+        self.assertEqual(matches[0]["minute"], 67)
+        self.assertEqual(matches[0]["home_score"], 2)
+        self.assertEqual(matches[0]["away_score"], 1)
+
 
 class _RecordingFollowup:
     """FakeFollowup that also keeps embeds (FakeFollowup drops them)."""

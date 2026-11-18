@@ -451,12 +451,25 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
                           '"detail": null, "channel": null, '
                           '"note": "Barca next"}')
         from datetime import datetime, timezone
-        kickoff = datetime(2026, 11, 22, 18, 45, tzinfo=timezone.utc)
+        from zoneinfo import ZoneInfo
+
+        class _FrozenDatetime(datetime):
+            """now() is always Wed 18 Nov 2026, 12:00 NPT, so the
+            Villarreal 22 Nov fixture is always in the future."""
+
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 11, 18, 12, 0,
+                                tzinfo=ZoneInfo("Asia/Kathmandu"))
+
+        # Real kickoff: Sun 22 Nov 2026, 18:45 Nepal time = 13:00 UTC.
+        kickoff = datetime(2026, 11, 22, 13, 0, tzinfo=timezone.utc)
         fixture = {"home": "FC Barcelona", "away": "Villarreal",
                    "kickoff": kickoff.isoformat()}
         interaction = FakeInteraction()
-        with patch.object(prov, "free_fixtures_for_day",
-                          new=AsyncMock(return_value=[fixture])):
+        with patch.object(amod, "datetime", _FrozenDatetime), \
+                patch.object(prov, "free_fixtures_for_day",
+                             new=AsyncMock(return_value=[fixture])):
             await amod.handle_ask(interaction,
                                   "when do Barcelona play next?",
                                   model, CHANNELS)
@@ -464,6 +477,10 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         text = interaction.followup.sent[0]
         self.assertIn("FC Barcelona vs Villarreal", text)
         self.assertIn("Kickoff:", text)
+        # The reply carries the provider's real kickoff timestamp —
+        # never the stale Rayo Vallecano / May 19 answer /ai gave.
+        self.assertIn(f"<t:{int(kickoff.timestamp())}:F>", text)
+        self.assertNotIn("Rayo", text)
 
 
 if __name__ == "__main__":

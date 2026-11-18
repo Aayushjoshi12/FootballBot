@@ -662,12 +662,22 @@ async def espn_live(espn_slug: str, apf_lid: int) -> tuple[list[Match], dict[str
     Returns (matches, events_by_team_pair_key) for one league's scoreboard.
     events_by_team_pair_key is keyed by "home_norm|away_norm" so the caller
     can cross-link it to whatever it already knows this match as.
+
+    LIVE ONLY: ESPN's scoreboard lists the whole week's fixtures, so
+    events whose status state is not "in" (scheduled "pre" and
+    finished "post") are skipped here — a scheduled fixture must
+    never reach /live (18 Nov 2026: 110 scheduled ESPN fixtures
+    filled /live because nothing filtered them).
     """
     data = await hc.get(f"{_ESPN}/{espn_slug}/scoreboard", _ESPN_HDR,
                         cache_key=f"espn_live_{espn_slug}", provider="espn")
     matches: list[Match] = []
     events_by_key: dict[str, list[Event]] = {}
     for ev in (data or {}).get("events", []):
+        comp = (ev.get("competitions") or [{}])[0]
+        state = ((comp.get("status") or {}).get("type") or {}).get("state")
+        if state != "in":
+            continue
         try:
             m, evs = _espn_norm(ev, apf_lid)
         except (KeyError, StopIteration, TypeError):

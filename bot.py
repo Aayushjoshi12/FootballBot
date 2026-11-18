@@ -1,6 +1,7 @@
 """Football Discord Bot using verified public football-data sources."""
 import asyncio
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta
 
@@ -284,10 +285,124 @@ async def _ask_gemini(prompt: str) -> str:
     return text
 
 
+# ── /ai fixture grounding ─────────────────────────────────────────────────
+# 18 Nov 2026: /ai answered "When is FC Barcelona's next match?"
+# with "Rayo Vallecano, Sunday May 19th" — a stale fixture from
+# Gemini's training data (May 2024), because the raw question went
+# straight to the model with no live data. Fixture questions are
+# now answered from the provider instead (the same lookup
+# /nextbarca uses); Gemini only words the grounded facts, and the
+# plain grounded answer is sent if wording fails. Any other team's
+# fixture question is answered honestly as unavailable rather than
+# guessed — the bot only has fixtures for Barcelona.
+_AI_FIXTURE_RES = [
+    re.compile(r"\bnext\s+(match|game|fixture|opponent)\b"),
+    re.compile(r"\bwhen\s+(do|does|is|are|will)\b.{0,50}\b(play|match|game)\b"),
+    re.compile(r"\bwhen'?s\b.{0,30}\b(match|game)\b"),
+    re.compile(r"\bwho\s+(do|does|are|is)\b.{0,50}\b(play|playing)\b"),
+    re.compile(r"\b(play|playing)\s+(next|against|today|tonight|tomorrow)\b"),
+    re.compile(r"\b(is|are)\b.{0,40}\bplaying\s+(today|tonight|tomorrow)\b"),
+]
+
+
+def _ai_fixture_team(prompt: str) -> str | None:
+    """'barcelona' / 'other' when the prompt asks about a team's
+    next fixture, None when it is not a fixture question at all."""
+    text = prompt.lower()
+    if not any(rx.search(text) for rx in _AI_FIXTURE_RES):
+        return None
+    if "barcelona" in text or "barca" in text or "barça" in text:
+        return "barcelona"
+    return "other"
+
+
+async def _ai_next_barca_fixture() -> tuple[datetime, dict] | None:
+    """Barcelona's next fixture from the provider (the exact
+    /nextbarca lookup: LaLiga fixtures, next 9 days, kickoff in
+    the future). None when the provider has none — the caller says
+    so instead of inventing one."""
+    now = datetime.now(barcelona_reminder.NEPAL)
+    candidates = []
+    for offset in range(9):
+        day = (now.date() + timedelta(days=offset)).isoformat()
+        try:
+            fixtures = await free_fixtures_for_day(140, day)
+        except Exception:
+            log.warning("[ai] Barca fixture lookup failed",
+                        exc_info=True)
+            return None
+        for match in fixtures or []:
+            if not barcelona_reminder._is_barcelona(match):
+                continue
+            kickoff = barcelona_reminder._kickoff(match)
+            if kickoff and kickoff > now:
+                candidates.append((kickoff, match))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])
+
+
+async def _ai_barca_fixture_answer(prompt: str) -> str | None:
+    """Grounded answer to a Barcelona fixture question, or None
+    when the provider has no fixture. Never invents a date, a
+    team, or a kickoff time."""
+    found = await _ai_next_barca_fixture()
+    if found is None:
+        return ("No upcoming Barcelona fixture is available from the "
+                "provider yet — check back closer to the next match.")
+    kickoff, match = found
+    local = kickoff.astimezone(barcelona_reminder.NEPAL)
+    home = match.get("home", "TBD")
+    away = match.get("away", "TBD")
+    line = (f"🔵🔴 Next Barcelona match: **{home} vs {away}**\n"
+            f"Kickoff: <t:{int(kickoff.timestamp())}:F> "
+            f"({local.strftime('%A %d %B, %I:%M %p')} Nepal time)")
+    if re.search(r"\bplaying\s+(today|tonight)\b", prompt.lower()):
+        if local.date() == datetime.now(barcelona_reminder.NEPAL).date():
+            return f"Yes — Barcelona play today.\n{line}"
+        return (f"No — Barcelona don't play today.\n{line}")
+    if re.search(r"\bplaying\s+tomorrow\b", prompt.lower()):
+        tomorrow = datetime.now(barcelona_reminder.NEPAL).date() + timedelta(days=1)
+        if local.date() == tomorrow:
+            return f"Yes — Barcelona play tomorrow.\n{line}"
+        return (f"No — Barcelona don't play tomorrow.\n{line}")
+    return line
+
+
 @bot.tree.command(name="ai", description="Ask Gemini a question")
 @app_commands.describe(prompt="Your question or request")
 async def cmd_ai(interaction: discord.Interaction, prompt: str):
     await interaction.response.defer(thinking=True)
+    # Fixture questions are answered from the provider, never from
+    # the model's memory: see _ai_fixture_team above.
+    fixture_team = _ai_fixture_team(prompt)
+    if fixture_team == "other":
+        await interaction.followup.send(
+            "I only have live fixtures for Barcelona, so I can't tell "
+            "you another team's next match without guessing. Ask "
+            "'when do Barcelona play next?' or use /ask for live games.",
+            ephemeral=True,
+        )
+        return
+    if fixture_team == "barcelona":
+        grounded = await _ai_barca_fixture_answer(prompt)
+        if grounded is None:
+            grounded = ("No upcoming Barcelona fixture is available from "
+                        "the provider yet — check back closer to the next "
+                        "match.")
+        try:
+            answer = await _ask_gemini(
+                "Reword this answer in one or two friendly sentences. "
+                "Use ONLY the facts below — do not add, change or guess "
+                "any team, date or time, and keep the kickoff line "
+                "exactly as written:\n" + grounded)
+        except Exception:
+            log.warning("[ai] Grounded rewording failed, sending "
+                        "provider answer directly", exc_info=True)
+            answer = grounded
+        for start in range(0, len(answer), 2000):
+            await interaction.followup.send(answer[start:start + 2000])
+        return
     try:
         answer = await _ask_gemini(prompt)
     except Exception:
@@ -312,14 +427,58 @@ def _live_has_score(m: dict) -> bool:
             or isinstance(m.get("minute"), int))
 
 
+# Statuses that prove a match is in progress / not started yet.
+# Providers use different vocabularies, so the gate is deliberately
+# default-deny: a match with no live signal at all is dropped rather
+# than shown as "live" (18 Nov 2026: scheduled fixtures filled /live).
+_LIVE_STATUSES = {"1h", "2h", "ht", "et", "live", "in progress",
+                  "half time", "half-time", "1st half", "2nd half",
+                  "extra time", "break time", "bt"}
+_NOT_LIVE_STATUSES = {"", "scheduled", "ns", "not started", "tbd",
+                      "postponed", "pst", "canc", "cancelled",
+                      "abandoned", "abd", "ft", "aet",
+                      "match finished", "finished"}
+
+
+def _match_is_live(m: dict) -> bool:
+    """Live-only gate for /live: True only for a genuinely
+    in-progress match. A minute or a live status proves it; the
+    1xBet and SofaScore live feeds are live-only by construction,
+    so their matches pass even before a minute/score exists; a
+    score with no not-started/finished flag also proves it. Anything
+    else (scheduled, finished, or an unrecognised status with no
+    minute and no score) is dropped."""
+    if m.get("finished"):
+        return False
+    status = str(m.get("status") or "").strip().lower()
+    if status in _NOT_LIVE_STATUSES:
+        return False
+    if isinstance(m.get("minute"), int):
+        return True
+    if status in _LIVE_STATUSES:
+        return True
+    if m.get("provider") in ("onexbet", "sofascore"):
+        return True
+    if m.get("home_score") is not None or m.get("away_score") is not None:
+        return True
+    return False
+
+
 def merge_live_matches(sportsdb: list[dict], sofa: list[dict],
                        apf: list[dict], onex: list[dict],
                        espn: list[dict]) -> list[dict]:
     """Merge + dedup the /live providers (SportsDB/SofaScore/
     API-Football first, then ESPN, then 1xBet), preferring games
     with a score/minute — a scoreless game never pushes a live
-    score off the cap. Pure: no network, no Discord. The caller
-    slices [:LIVE_RENDER_CAP]."""
+    score off the cap. LIVE ONLY: every list is passed through
+    _match_is_live first, so a scheduled or finished fixture from
+    any provider can never appear in /live. Pure: no network, no
+    Discord. The caller slices [:LIVE_RENDER_CAP]."""
+    sportsdb = [m for m in sportsdb if _match_is_live(m)]
+    sofa = [m for m in sofa if _match_is_live(m)]
+    apf = [m for m in apf if _match_is_live(m)]
+    onex = [m for m in onex if _match_is_live(m)]
+    espn = [m for m in espn if _match_is_live(m)]
     seen_pairs = ({(m["home"], m["away"]) for m in sportsdb}
                   | {(m["home"], m["away"]) for m in sofa}
                   | {(m["home"], m["away"]) for m in apf})

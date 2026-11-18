@@ -571,8 +571,19 @@ async def _send_game_detail(interaction: discord.Interaction,
     the reply stays a static detail card."""
     body = watch.render_detail(detail, level,
                                updated=watch.now_npt_str())
+    # The 👀 Watching label counts this game too when it is
+    # live: the reply is about to become its live panel (see
+    # register_game_panel below), so the count at send time is
+    # the live games already watched here, plus this one.
+    _live_now = str(detail.get("status") or "") in (
+        "1H", "2H", "ET", "PEN", "HT", "Live",
+        "1st innings", "2nd innings")
     msg = await interaction.followup.send(
-        body, view=watch.WatchAlertView(), wait=True)
+        body,
+        view=watch.WatchAlertView(
+            live_count=watch.live_watch_count(interaction.channel_id)
+            + (1 if _live_now else 0)),
+        wait=True)
     status = str(detail.get("status") or "")
     if status not in ("1H", "2H", "ET", "PEN", "HT", "Live",
                       "1st innings", "2nd innings"):
@@ -712,7 +723,9 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         if result.get("detail"):
             await interaction.followup.send(
                 watch.render_detail(result["detail"], level),
-                ephemeral=True, view=watch.WatchAlertView())
+                ephemeral=True,
+                view=watch.WatchAlertView(
+                    channel_id=interaction.channel_id))
             return
     if resolved.get("action") == "list":
         games = resolved.get("games") or []
@@ -801,7 +814,9 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             "1H", "2H", "ET", "PEN", "HT", "Live",
             "1st innings", "2nd innings"):
         panel = watch.render_panel(detail, updated=watch.now_npt_str())
-        view = watch.WatchAlertView(str(started["game_id"]))
+        view = watch.WatchAlertView(
+            str(started["game_id"]),
+            live_count=watch.live_watch_count(target.id))
         if target.id == interaction.channel_id:
             msg = await interaction.followup.send(
                 panel, view=view, wait=True)
@@ -874,52 +889,12 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
 # ── /watching ─────────────────────────────────────────────────────────────────
 @bot.tree.command(name="watching", description="Games this channel is following")
 async def cmd_watching(interaction: discord.Interaction):
-    rows = await watch.list_channel_watches(interaction.channel_id,
-                                            include_view_only=True)
-    if not rows:
-        await interaction.response.send_message(
-            "No games watched in this channel. Use `/watch <game>` to follow one.",
-            ephemeral=True)
-        return
-    # How many are actually refreshing: the live panels share
-    # Discord's ~1 edit/sec channel budget evenly — 1 game
-    # refreshes every second, 2 every 2s each, and so on.
-    live = [r for r in rows
-            if watch.is_panel_live((r.get("snapshot") or {}).get("status"))]
-    n = len(live)
-    if n:
-        each = "every second" if n == 1 else f"every {n}s"
-        lines = [f"👀 **{n} game{'s' if n > 1 else ''} refreshing in this "
-                 f"channel — each about {each}**\n"]
-    else:
-        lines = [f"👀 **No games refreshing yet** — {len(rows)} watched, "
-                 f"starting later\n"]
-    for r in rows:
-        snap = r.get("snapshot") or {}
-        score = ""
-        hs, aws = snap.get("home_score"), snap.get("away_score")
-        if hs not in (None, "") or aws not in (None, ""):
-            score = f" — {hs or '?'}–{aws or '?'}"
-        cricket = snap.get("cricket") or {}
-        if cricket.get("is_break"):
-            clock = " · Innings break"
-        elif cricket.get("over_str"):
-            clock = f" · {cricket['over_str']} ov"
-        elif snap.get("clock"):
-            clock = f" · {snap['clock']}"
-        else:
-            clock = ""
-        alerts = "🔔 alerts on" if r.get("notify") else "🔕 alerts off"
-        if watch.is_panel_live(snap.get("status")):
-            each = "every second" if n == 1 else f"every {n}s"
-            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
-                         f"{each} · {alerts} "
-                         f"({r['detail']}, ID `{r['game_id']}`)")
-        else:
-            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
-                         f"not refreshing yet · {alerts} "
-                         f"({r['detail']}, ID `{r['game_id']}`)")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    # The text lives in watch.render_watching — the 👀 Watching
+    # button shows exactly this, from the same helper, so the
+    # command and the button can never drift apart.
+    await interaction.response.send_message(
+        await watch.render_watching(interaction.channel_id),
+        ephemeral=True)
 
 
 # ── /ask ────────────────────────────────────────────────────────────────────

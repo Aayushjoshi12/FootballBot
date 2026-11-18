@@ -659,11 +659,13 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         labels = [b.label for b in msg.view.children]
         self.assertEqual(labels, ["📊 Detail", "🔄 Live", "🔄 Refresh",
                                   "📜 Timeline", "🟢 Simple", "🔵 Advanced",
-                                  "🔔 Follow", "🔕 Unfollow"])
+                                  "🔔 Follow", "🔕 Unfollow",
+                                  "👀 Watching: 1 · 1s"])
         self.assertEqual([b.custom_id for b in msg.view.children],
                          ["watch:detail", "watch:live", "panel:refresh",
                           "panel:timeline", "panel:simple", "panel:advanced",
-                          "panel:follow", "panel:unfollow"])
+                          "panel:follow", "panel:unfollow",
+                          "panel:watching"])
         self.assertIn("Game ID: 771747666", msg.content)
 
     async def test_event_line_shows_mmss_clock(self):
@@ -1412,7 +1414,8 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([b.custom_id for b in view.children],
                          ["watch:detail", "watch:live", "panel:refresh",
                           "panel:timeline", "panel:simple", "panel:advanced",
-                          "panel:follow", "panel:unfollow"])
+                          "panel:follow", "panel:unfollow",
+                          "panel:watching"])
 
     async def test_detail_button_resolves_game_from_message(self):
         # Static custom_id: the game comes from the message's
@@ -1481,7 +1484,9 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
         for child in view.children:
             # Unfollow never fetches the game — it only flips the
             # notification flag, and with no watch here it says so.
-            if child.custom_id == "panel:unfollow":
+            # Watching never fetches a game either — it shows the
+            # channel's watching list, not this game's detail.
+            if child.custom_id in ("panel:unfollow", "panel:watching"):
                 continue
             interaction = self._interaction(child.custom_id)
             with self._mock_search(None):
@@ -1589,11 +1594,12 @@ class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._labels(view),
                          ["📊 Detail", "🔄 Live", "🔄 Refresh", "📜 Timeline",
                           "🟢 Simple", "🔵 Advanced", "🔔 Follow",
-                          "🔕 Unfollow"])
+                          "🔕 Unfollow", "👀 Watching: 1 · 1s"])
         self.assertEqual(self._ids(view),
                          ["watch:detail", "watch:live", "panel:refresh",
                           "panel:timeline", "panel:simple", "panel:advanced",
-                          "panel:follow", "panel:unfollow"])
+                          "panel:follow", "panel:unfollow",
+                          "panel:watching"])
 
     async def test_watch_detail_action_reply_has_buttons(self):
         import bot as botmod
@@ -1622,11 +1628,12 @@ class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._labels(view),
                          ["📊 Detail", "🔄 Live", "🔄 Refresh", "📜 Timeline",
                           "🟢 Simple", "🔵 Advanced", "🔔 Follow",
-                          "🔕 Unfollow"])
+                          "🔕 Unfollow", "👀 Watching: 0"])
         self.assertEqual(self._ids(view),
                          ["watch:detail", "watch:live", "panel:refresh",
                           "panel:timeline", "panel:simple", "panel:advanced",
-                          "panel:follow", "panel:unfollow"])
+                          "panel:follow", "panel:unfollow",
+                          "panel:watching"])
 
 
 class TestMmssClock(unittest.TestCase):
@@ -2917,7 +2924,8 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         labels = [b.label for b in panel.view.children]
         self.assertEqual(labels, ["📊 Detail", "🔄 Live", "🔄 Refresh",
                                   "📜 Timeline", "🟢 Simple", "🔵 Advanced",
-                                  "🔔 Follow", "🔕 Unfollow"])
+                                  "🔔 Follow", "🔕 Unfollow",
+                                  "👀 Watching: 1 · 1s"])
         watch = wmod._watches[(777, "771747666")]
         self.assertEqual(watch["panel_message_id"], panel.id)
         self.assertEqual(watch["panel_body"], panel.content)
@@ -4499,6 +4507,21 @@ class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(count, 36)
         self.assertEqual(sb_edits, 6)
 
+    async def test_three_panels_plus_scoreboard_divide_evenly(self):
+        counts, sb_edits, denied = await self._run_scenario(3)
+        total = sum(counts) + sb_edits
+        print(f"[shared-budget] 3 panels + scoreboard: "
+              f"panels={counts}, scoreboard={sb_edits}, "
+              f"total={total}, 429s={denied}")
+        self.assertEqual(denied, 0)
+        self.assertGreaterEqual(total, 55)
+        self.assertLessEqual(total, 65)
+        # 3 games: every ~3s each, even split.
+        for count in counts:
+            self.assertGreaterEqual(count, 15)
+            self.assertLessEqual(count, 25)
+        self.assertEqual(sb_edits, 6)
+
     async def test_four_panels_plus_scoreboard_divide_evenly(self):
         counts, sb_edits, denied = await self._run_scenario(4)
         total = sum(counts) + sb_edits
@@ -4840,6 +4863,237 @@ class TestRawPatchMapping(unittest.IsolatedAsyncioTestCase):
             bot, msg, {"content": "v2"})
         self.assertEqual(status, 429)
         self.assertEqual(data, {"retry_after": 3.0})
+
+
+class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
+    """The 9th button — 👀 Watching: how many games are live in
+    this channel and each one's refresh speed (1 game -> every
+    1s, 2 -> every 2s each, ...). The label updates as games go
+    live and end, and tapping it shows the /watching list,
+    ephemeral, to the tapper only."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp8"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._panel_log_window_start = 0.0
+        wmod._panel_log_edits = 0
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _watching_button(self, view):
+        return next(b for b in view.children
+                    if b.custom_id.startswith("panel:watching"))
+
+    def _seed_live_panel(self, idx, mid, game_id):
+        detail = prov._onex_detail_from_raw(self.games1x2[idx])
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        snap["status"] = "2H"
+        body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(mid, body)
+        self.channel.messages[mid] = msg
+        wmod._watches[(777, game_id)] = {
+            "home": detail["home"], "away": detail["away"],
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": str(detail.get("format") or ""), "snapshot": snap,
+            "missing": 0, "missing_since": 0.0, "notify": True,
+            "panel_kind": "compact", "panel_message_id": mid,
+            "panel_body": body, "panel_base_body": body,
+            "panel_static": {}, "panel_momentum": None,
+            "panel_momentum_ts": 0.0, "last_panel_edit": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        return msg
+
+    async def _add_row(self, idx, game_id, notify=True, level="simple",
+                       kind="compact", snapshot=None):
+        detail = prov._onex_detail_from_raw(self.games1x2[idx])
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        await db.add_watch(777, game_id, detail["home"], detail["away"],
+                           detail.get("league", ""), level, "",
+                           snapshot if snapshot is not None else snap,
+                           notify=notify, panel_kind=kind)
+        return detail, snap
+
+    def test_label_and_interval_divide(self):
+        # 1 game -> every 1s, 2 -> every 2s each, 3 -> 3s, 4 -> 4s.
+        self.assertEqual(wmod.watching_label(None), "👀 Watching")
+        self.assertEqual(wmod.watching_label(0), "👀 Watching: 0")
+        self.assertEqual(wmod.watching_label(1), "👀 Watching: 1 · 1s")
+        self.assertEqual(wmod.watching_label(2), "👀 Watching: 2 · 2s each")
+        self.assertEqual(wmod.watching_label(3), "👀 Watching: 3 · 3s each")
+        self.assertEqual(wmod.watching_label(4), "👀 Watching: 4 · 4s each")
+        self.assertEqual(wmod.refresh_interval_s(1), 1)
+        self.assertEqual(wmod.refresh_interval_s(2), 2)
+        self.assertEqual(wmod.refresh_interval_s(3), 3)
+        self.assertEqual(wmod.refresh_interval_s(4), 4)
+        self.assertEqual(wmod.refresh_interval_s(0), 1)
+
+    def test_live_count_counts_only_live_in_channel(self):
+        self._seed_live_panel(0, 2001, "771747666")
+        self._seed_live_panel(2, 2002, "771750037")
+        # Upcoming in the same channel does not count.
+        up = wmod.snapshot_from_detail({
+            "home": "Lumbini Lions", "away": "Kathmandu Gurkhas",
+            "home_score": None, "away_score": None, "status": "upcoming",
+            "clock": "", "stats": None, "cricket": None})
+        wmod._watches[(777, "771747118")] = {
+            "home": "Lumbini Lions", "away": "Kathmandu Gurkhas",
+            "league": "", "detail": "simple", "fmt": "", "snapshot": up,
+            "missing": 0, "notify": True, "panel_kind": "compact",
+            "panel_message_id": None, "panel_body": None,
+            "panel_base_body": None, "panel_static": {},
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": 0.0, "panel_timer_sec": None,
+            "panel_timer_ts": 0.0}
+        # A live game in another channel does not count either.
+        wmod._watches[(888, "771747666")] = {
+            "snapshot": {"status": "2H"}}
+        self.assertEqual(wmod.live_watch_count(777), 2)
+        self.assertEqual(wmod.live_watch_count(888), 1)
+
+    async def test_view_label_from_count_and_static_default(self):
+        view = wmod.WatchAlertView("771747666", live_count=1)
+        self.assertEqual(self._watching_button(view).label,
+                         "👀 Watching: 1 · 1s")
+        self.assertEqual(self._watching_button(view).custom_id,
+                         "panel:watching:771747666")
+        view2 = wmod.WatchAlertView("771747666", live_count=2)
+        self.assertEqual(self._watching_button(view2).label,
+                         "👀 Watching: 2 · 2s each")
+        view0 = wmod.WatchAlertView()
+        self.assertEqual(self._watching_button(view0).label, "👀 Watching")
+        self.assertEqual(self._watching_button(view0).custom_id,
+                         "panel:watching")
+        # Nine buttons now, the old eight untouched and in order.
+        self.assertEqual(
+            [b.custom_id for b in view0.children],
+            ["watch:detail", "watch:live", "panel:refresh",
+             "panel:timeline", "panel:simple", "panel:advanced",
+             "panel:follow", "panel:unfollow", "panel:watching"])
+
+    async def test_view_label_from_channel(self):
+        self._seed_live_panel(0, 2001, "771747666")
+        view = wmod.WatchAlertView("771747666", channel_id=777)
+        self.assertEqual(self._watching_button(view).label,
+                         "👀 Watching: 1 · 1s")
+
+    async def test_refresh_panel_label_updates_with_count(self):
+        # 1 live -> the panel's button says 1 · 1s.
+        msg = self._seed_live_panel(0, 2001, "771747666")
+        watch = wmod._watches[(777, "771747666")]
+        detail = prov._onex_detail_from_raw(self.games1x2[0])
+        detail = dict(detail)
+        detail["timer_sec"] = 4020
+        self.assertTrue(await wmod._refresh_panel(
+            self.bot, 777, "771747666", watch, detail))
+        self.assertEqual(
+            self._watching_button(msg.view).label, "👀 Watching: 1 · 1s")
+        # A second game goes live in the same channel -> 2 · 2s.
+        self._seed_live_panel(2, 2002, "771750037")
+        detail["timer_sec"] = 4080
+        self.assertTrue(await wmod._refresh_panel(
+            self.bot, 777, "771747666", watch, detail))
+        self.assertEqual(
+            self._watching_button(msg.view).label,
+            "👀 Watching: 2 · 2s each")
+        # The second game ends -> back to 1 · 1s.
+        del wmod._watches[(777, "771750037")]
+        detail["timer_sec"] = 4140
+        self.assertTrue(await wmod._refresh_panel(
+            self.bot, 777, "771747666", watch, detail))
+        self.assertEqual(
+            self._watching_button(msg.view).label, "👀 Watching: 1 · 1s")
+
+    async def test_watching_button_tap_shows_list_ephemeral(self):
+        import bot as botmod
+        _, snap0 = await self._add_row(0, "771747666", notify=True)
+        detail1, snap1 = await self._add_row(
+            1, "771739998", notify=False, level="advanced", kind="detail")
+        up_snap = wmod.snapshot_from_detail({
+            "home": "Lumbini Lions", "away": "Kathmandu Gurkhas",
+            "home_score": None, "away_score": None, "status": "upcoming",
+            "clock": "", "stats": None, "cricket": None})
+        await db.add_watch(777, "771747118", "Lumbini Lions",
+                           "Kathmandu Gurkhas", "Nepal Premier League",
+                           "simple", "", up_snap, notify=True,
+                           panel_kind="compact")
+        view = wmod.WatchAlertView("771747666", live_count=2)
+        interaction = FakeInteraction(
+            channel_id=777,
+            message=SimpleNamespace(
+                content=wmod.render_detail(
+                    prov._onex_detail_from_raw(self.games1x2[0]),
+                    wmod.DETAIL_ADVANCED)),
+            data={"custom_id": "panel:watching:771747666"})
+        await self._watching_button(view).callback(interaction)
+        # Ephemeral list to the tapper only: no channel message,
+        # no response.send_message, no "panel updated" follow-up.
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(interaction.response.sent, [])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("2 games refreshing in this channel", text)
+        self.assertIn("each about every 2s", text)
+        self.assertIn("Republic of the Gambia", text)
+        self.assertIn(f"{snap0['home_score']}–{snap0['away_score']}", text)
+        self.assertIn("every 2s", text)
+        self.assertIn("🔔 alerts on", text)
+        self.assertIn(detail1["home"], text)
+        self.assertIn(f"{snap1['cricket']['over_str']} ov", text)
+        self.assertIn("🔕 alerts off", text)
+        self.assertIn("not refreshing yet", text)
+
+    async def test_watching_button_matches_command(self):
+        import bot as botmod
+        await self._add_row(0, "771747666", notify=True)
+        view = wmod.WatchAlertView("771747666", live_count=1)
+        interaction = FakeInteraction(
+            channel_id=777,
+            message=SimpleNamespace(
+                content=wmod.render_detail(
+                    prov._onex_detail_from_raw(self.games1x2[0]),
+                    wmod.DETAIL_SIMPLE)),
+            data={"custom_id": "panel:watching:771747666"})
+        await self._watching_button(view).callback(interaction)
+        cmd = FakeInteraction(channel_id=777)
+        await botmod.cmd_watching.callback(cmd)
+        # Same helper, same text — the button and the command
+        # can never drift apart.
+        self.assertEqual(interaction.followup.sent, cmd.response.sent)
+
+    async def test_watching_button_with_nothing_watched(self):
+        view = wmod.WatchAlertView(live_count=0)
+        interaction = FakeInteraction(
+            channel_id=777,
+            message=SimpleNamespace(content=""),
+            data={"custom_id": "panel:watching"})
+        await self._watching_button(view).callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["No games watched in this channel. "
+                          "Use `/watch <game>` to follow one."])
+        self.assertEqual(len(self.channel.sent), 0)
 
 
 if __name__ == "__main__":

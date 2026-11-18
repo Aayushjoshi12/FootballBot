@@ -1558,6 +1558,96 @@ def is_panel_live(status) -> bool:
     return str(status or "") in _PANEL_LIVE_STATUSES
 
 
+def refresh_interval_s(live_count: int) -> int:
+    """Seconds between refreshes for ONE live game when
+    `live_count` games share the channel's ~1 edit/s budget:
+    1 game -> every 1s, 2 games -> every 2s each, 3 -> every
+    3s, 4 -> every 4s. This is the ATTEMPT rule — the panel
+    tries an edit on every tick it is due; how many edits
+    actually land is Discord's call (see the note on
+    _maybe_log_panel_cadence: the live journal showed only
+    ~27–33 edits/min for 1 panel on 18 Nov 2026, not 60)."""
+    return max(1, int(live_count or 1))
+
+
+def watching_label(live_count: int | None) -> str:
+    """The 👀 Watching button label for a channel with
+    `live_count` live games: the count plus each game's
+    refresh speed. None means the count is unknown (a
+    persistent view with no channel, an ephemeral detail) —
+    then the plain static label, never a guessed number."""
+    if live_count is None:
+        return "👀 Watching"
+    n = int(live_count)
+    if n <= 0:
+        return "👀 Watching: 0"
+    if n == 1:
+        return "👀 Watching: 1 · 1s"
+    return f"👀 Watching: {n} · {n}s each"
+
+
+def live_watch_count(channel_id: int) -> int:
+    """Live games watched in this channel right now, from the
+    in-memory registry (no db read — this runs on every panel
+    edit, so it must stay cheap). A game counts when its
+    snapshot status is live; upcoming games and ended watches
+    do not count."""
+    return sum(
+        1 for (cid, _gid), w in _watches.items()
+        if cid == channel_id
+        and is_panel_live((w.get("snapshot") or {}).get("status")))
+
+
+async def render_watching(channel_id: int) -> str:
+    """The /watching text for a channel — the SAME text the
+    Watching button shows, from the same rows, so the command
+    and the button can never drift apart. Header: live count +
+    each game's refresh interval (the divide rule); one row per
+    watched game (teams, score, clock/overs, alerts on/off,
+    detail level, game ID); upcoming games say "not refreshing
+    yet". No games at all: the short "use /watch" line."""
+    rows = await list_channel_watches(channel_id, include_view_only=True)
+    if not rows:
+        return ("No games watched in this channel. "
+                "Use `/watch <game>` to follow one.")
+    live = [r for r in rows
+            if is_panel_live((r.get("snapshot") or {}).get("status"))]
+    n = len(live)
+    if n:
+        each = "every second" if n == 1 else f"every {n}s"
+        lines = [f"👀 **{n} game{'s' if n > 1 else ''} refreshing in this "
+                 f"channel — each about {each}**\n"]
+    else:
+        lines = [f"👀 **No games refreshing yet** — {len(rows)} watched, "
+                 f"starting later\n"]
+    for r in rows:
+        snap = r.get("snapshot") or {}
+        score = ""
+        hs, aws = snap.get("home_score"), snap.get("away_score")
+        if hs not in (None, "") or aws not in (None, ""):
+            score = f" — {hs or '?'}–{aws or '?'}"
+        cricket = snap.get("cricket") or {}
+        if cricket.get("is_break"):
+            clock = " · Innings break"
+        elif cricket.get("over_str"):
+            clock = f" · {cricket['over_str']} ov"
+        elif snap.get("clock"):
+            clock = f" · {snap['clock']}"
+        else:
+            clock = ""
+        alerts = "🔔 alerts on" if r.get("notify") else "🔕 alerts off"
+        if is_panel_live(snap.get("status")):
+            each = "every second" if n == 1 else f"every {n}s"
+            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
+                         f"{each} · {alerts} "
+                         f"({r['detail']}, ID `{r['game_id']}`)")
+        else:
+            lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} · "
+                         f"not refreshing yet · {alerts} "
+                         f"({r['detail']}, ID `{r['game_id']}`)")
+    return "\n".join(lines)
+
+
 def live_line(d: dict) -> str:
     """One short live line for the 🔄 Live button: teams, score,
     and the MM:SS clock for football, overs for cricket."""
@@ -1674,8 +1764,12 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
 # _schedule_panel_edits): the tick hands each panel's fresh
 # detail to that panel's worker task, content changes first,
 # and the edits go through the ONE shared per-channel scheduler
-# (see channel_edits) — 1 game refreshes every 1s, 2 games
-# every 2s each, 3 every 3s, 4 every 4s. The old design paced
+# (see channel_edits) — 1 game ATTEMPTS a refresh every 1s, 2
+# games every 2s each, 3 every 3s, 4 every 4s. Attempt, not
+# landing: the live journal showed 1 panel landing only
+# ~27–33 edits/min, so the divide rule is about how the
+# ~1 edit/s channel budget is SHARED, never a promise that
+# 60 edits/min will land. The old design paced
 # the panels with a per-panel slot timeline (1s apart) and let
 # the scoreboard edit the same channel OUTSIDE that timeline:
 # the VM journal showed only ~30 edits/min for 2 panels with
@@ -1842,7 +1936,10 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
                                   updated=now_npt_str())
     if text == watch.get("panel_body"):
         return False
-    view = WatchAlertView(game_id)
+    # Fresh view on every edit, so the 👀 Watching button's
+    # count + speed update as games go live and end.
+    view = WatchAlertView(game_id,
+                          live_count=live_watch_count(channel_id))
     message_id = watch.get("panel_message_id")
     if not message_id:
         if not post_if_missing:
@@ -2078,7 +2175,10 @@ async def _switch_panel_view(interaction: discord.Interaction,
         text = _render_panel_view(detail, entry, clock,
                                   updated=now_npt_str())
         await interaction.edit_original_response(
-            content=text, view=WatchAlertView(game_id))
+            content=text,
+            view=WatchAlertView(
+                game_id,
+                live_count=live_watch_count(channel_id)))
         entry["panel_body"] = text
         entry["panel_base_body"] = _render_panel_view(
             detail, entry, clock, updated=None)
@@ -2134,16 +2234,35 @@ class WatchAlertView(discord.ui.View):
     editing it after that, so no tap ever sends a fresh static
     snapshot while a panel exists. Timeline shows the chronoLine
     events (a one-off list); Follow / Unfollow start or stop a
-    watch for this game in this channel."""
+    watch for this game in this channel. The 9th button, 👀
+    Watching, shows how many games are live in this channel
+    and each one's refresh speed (1 game -> every 1s, 2 -> every
+    2s each, and so on — the divide rule); tapping it shows the
+    /watching list, ephemeral, for that channel only. Its label
+    is rebuilt with every panel edit, so the count follows
+    games going live and ending."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Maintenance mode: a press answers with the short notice
         # and no button runs — the bot is silent.
         return not await maintenance.view_blocked(interaction)
 
-    def __init__(self, game_id: str | None = None):
+    def __init__(self, game_id: str | None = None,
+                 live_count: int | None = None,
+                 channel_id: int | None = None):
         super().__init__(timeout=None)
         self.game_id = str(game_id) if game_id else None
+        # The live count, when the caller knows it (every panel
+        # edit passes it — see _refresh_panel) or when the
+        # channel is known and the registry can count it. None
+        # stays None: the persistent view (no channel, no count)
+        # and ephemeral details get the plain static label.
+        if live_count is None and channel_id is not None:
+            try:
+                live_count = live_watch_count(int(channel_id))
+            except Exception:
+                live_count = None
+        self.live_count = live_count
 
         def _cid(prefix: str) -> str:
             return f"{prefix}:{self.game_id}" if self.game_id else prefix
@@ -2165,6 +2284,8 @@ class WatchAlertView(discord.ui.View):
              self._on_follow),
             ("🔕 Unfollow", discord.ButtonStyle.danger, _cid("panel:unfollow"),
              self._on_unfollow),
+            (watching_label(live_count), discord.ButtonStyle.secondary,
+             _cid("panel:watching"), self._on_watching),
         ]
         for label, style, custom_id, callback in specs:
             btn = discord.ui.Button(label=label, style=style,
@@ -2316,6 +2437,32 @@ class WatchAlertView(discord.ui.View):
             f"{entry['away']}** — the live panel keeps ticking here "
             f"while the game is live.", ephemeral=True)
 
+    async def _on_watching(self, interaction: discord.Interaction):
+        # The 👀 Watching button: the /watching list for THIS
+        # channel, ephemeral, to the tapper only — the same text
+        # render_watching builds for the /watching command, so
+        # the two can never drift apart. No channel message, no
+        # "panel updated" confirm: the list itself is the answer.
+        # The button is channel-wide, not per-game, so no game
+        # id is resolved here. A db failure never crashes the
+        # tap — it says so plainly instead.
+        await interaction.response.defer(ephemeral=True)
+        channel_id = getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            await interaction.followup.send(
+                "Could not tell which channel this is.", ephemeral=True)
+            return
+        try:
+            text = await render_watching(channel_id)
+        except Exception as exc:
+            log.warning("[watch] watching list failed (%s)",
+                        type(exc).__name__)
+            await interaction.followup.send(
+                "Could not load the watching list right now.",
+                ephemeral=True)
+            return
+        await interaction.followup.send(text, ephemeral=True)
+
 
 async def _send_to_channel(bot: discord.Client, channel_id: int,
                            text: str, view: discord.ui.View | None = None) -> bool:
@@ -2450,10 +2597,17 @@ async def _panel_edit_worker(bot: discord.Client, channel_id: int,
 def _maybe_log_panel_cadence() -> None:
     """Once a minute, log how many panels are registered and how
     many tick edits actually landed in the last 60s — the number
-    the VM journal can prove the refresh cadence from. (One
-    panel editing every second contributes ~60; N panels divide
-    the ~1 edit/sec channel budget evenly, so the total stays
-    ~60/min whatever N is.)"""
+    the VM journal can prove the refresh cadence from. The
+    divide is about ATTEMPTS: N panels share the channel's
+    edit budget evenly, so the total ATTEMPTED stays ~60/min
+    whatever N is — but the LANDED number is Discord's call.
+    Honest numbers (VM journal, 18 Nov 2026): 1 panel landed
+    only ~27–33 edits/min live, never 60 — the 60/min figure
+    is a fake-bucket test number, not a live promise. A low
+    landed count with zero 429s means Discord's real budget
+    is below the 5-per-5s model, not that the bot stopped
+    trying: every live panel still attempts an edit on every
+    tick it is due (gap floor 1.0s, heartbeat 0.9s)."""
     global _panel_log_window_start, _panel_log_edits
     if not _watches:
         _panel_log_window_start = 0.0
@@ -2639,8 +2793,10 @@ async def _on_tick_locked(bot: discord.Client,
                 # The buttons resolve the game from the message, so the
                 # alert carries its id like the detail card does.
                 text += f"\nGame ID: {game_id}"
-                if await _send_to_channel(bot, channel_id, text,
-                                          view=WatchAlertView()):
+                if await _send_to_channel(
+                        bot, channel_id, text,
+                        view=WatchAlertView(
+                            live_count=live_watch_count(channel_id))):
                     for ev in sendable:
                         await history.record_sent_event(
                             ev["key"], game_id, channel_id, ev["kind"], ev["text"])

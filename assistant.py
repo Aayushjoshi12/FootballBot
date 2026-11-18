@@ -812,7 +812,9 @@ async def _handle_ask(interaction, text: str, model,
             await _send(interaction, "That game is no longer live.")
             return
         await _send(interaction, wmod.render_detail(detail, detail_level),
-                    view=wmod.WatchAlertView(str(game_id)))
+                    view=wmod.WatchAlertView(
+                        str(game_id),
+                        channel_id=getattr(interaction, "channel_id", None)))
         return
 
     if intent == "FOLLOW_MATCH":

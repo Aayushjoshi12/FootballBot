@@ -154,6 +154,26 @@ class TestRenderDetail(unittest.TestCase):
         self.assertEqual(detail["clock"], "Innings break")
         self.assertIn("Innings break", wmod.render_detail(detail, "simple"))
 
+    def test_render_top_games_stays_under_discord_limit(self):
+        # 18 Nov 2026: /ask failed with "Something went wrong"
+        # because a long list pushed the reply over Discord's
+        # 2000-character limit. _live_line_list got a budget in
+        # the first fix; render_top_games (the pick list used by
+        # search suggestions) had none — ten games with long
+        # team/league names passed 2000 chars on their own.
+        games = []
+        for i in range(10):
+            games.append({
+                "home": f"Persatuan Sepakbola Indonesia Raya Bersatu {i} United FC",
+                "away": f"Klub Sepakbola Muda Bersatu Selatan {i} Football Club",
+                "home_score": 1, "away_score": 0,
+                "league": "Indonesia. Liga Nusantara Championship Elite Division",
+                "onex_id": 771000000 + i, "status": "2H",
+                "clock": "67:12", "minute": 67})
+        msg = wmod.render_top_games(games)
+        self.assertLess(len(msg), 2000)
+        self.assertIn("…and", msg)
+
 
 class TestSearch(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

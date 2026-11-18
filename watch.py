@@ -270,22 +270,31 @@ def render_match_list(games: list[dict]) -> str:
 
 def render_top_games(games: list[dict],
                      header: str = "⚽ **Live games right now — pick one:**",
-                     limit: int = 10) -> str:
+                     limit: int = 10, budget: int = 1750) -> str:
     """Top live games as a pick list — when the user asks to see
     games, or as suggestions after a search found nothing.
     Same line format as render_match_list (score, clock, league,
     game ID); pass header="" when the caller's own sentence is
-    already the header. Capped at `limit` lines with an '…and N
-    more' tail, so a long list can never push the reply over
-    Discord's 2000-character message limit."""
+    already the header. Capped at `limit` lines AND a character
+    budget, with an '…and N more' tail — a 10-line list of long
+    team/league names can pass Discord's 2000-character message
+    limit on its own, and the send then raises and the whole
+    answer is lost (the same failure /ask hit on 18 Nov 2026)."""
     lines = ([header] if header else [])
     shown = list(games)[:limit]
+    total = sum(len(line) + 1 for line in lines)
+    kept = []
     for i, g in enumerate(shown, 1):
         clock = _clock_str(g)
-        lines.append(
+        line = (
             f"{i}. **{g.get('home', '?')} {_score_str(g)} {g.get('away', '?')}**"
             f" · {clock} · {g.get('league', '')} · ID `{g.get('onex_id')}`")
-    rest = len(games) - len(shown)
+        if kept and total + 1 + len(line) > budget:
+            break
+        kept.append(line)
+        total += len(line) + 1
+    lines.extend(kept)
+    rest = len(games) - len(kept)
     if rest > 0:
         lines.append(f"…and {rest} more live games.")
     lines.append("\nUse `/game <ID>` for the full detail, or `/watch <ID>` to follow one.")

@@ -325,8 +325,10 @@ async def validate_intent(parsed: dict, live_games: list[dict],
     {"ok": False, "error": "<plain message>"}. Never raises."""
     try:
         return await _validate_intent(parsed, live_games, channels)
-    except Exception as exc:
-        log.warning("[assistant] validation failed (%s)", type(exc).__name__)
+    except Exception:
+        # Full traceback, not just the type: a validation failure
+        # in production is otherwise undiagnosable from the journal.
+        log.exception("[assistant] validation failed")
         return {"ok": False, "error": "Something went wrong checking "
                                       "that — please try again."}
 
@@ -512,13 +514,16 @@ def _grounding_entries(raw: list[dict]) -> list[dict]:
     for g in raw or []:
         try:
             m = prov._onex_detail_from_raw(g)
-        except Exception as exc:
-            log.warning("[assistant] skipping malformed live entry (%s)",
-                        type(exc).__name__)
+            if m is None:
+                continue
+            gid = str(m["onex_id"])
+        except Exception:
+            # One malformed entry — including one whose normalized
+            # form is missing its id — is skipped, never allowed
+            # to kill the whole reply.
+            log.warning("[assistant] skipping malformed live entry",
+                        exc_info=True)
             continue
-        if m is None:
-            continue
-        gid = str(m["onex_id"])
         if gid in seen:
             continue
         seen.add(gid)
@@ -628,8 +633,12 @@ async def handle_ask(interaction, text: str, model,
         pass
     try:
         await _handle_ask(interaction, text, model, channels)
-    except Exception as exc:
-        log.warning("[assistant] handle_ask failed (%s)", type(exc).__name__)
+    except Exception:
+        # Log the full traceback: three production failures of this
+        # handler (18 Nov 2026) left only an exception type in the
+        # journal, which was not enough to find the cause. The
+        # user-facing reply stays exactly the same.
+        log.exception("[assistant] handle_ask failed")
         try:
             await interaction.followup.send(
                 "Something went wrong — please try again.", ephemeral=True)

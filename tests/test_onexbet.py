@@ -255,6 +255,45 @@ class TestPublicFunctions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await onex_live_matches(), [])
         self.assertEqual(await onex_events(1, "A", "B"), [])
 
+    async def test_live_raw_skips_non_dict_entries(self):
+        # One non-dict entry in the feed used to raise
+        # AttributeError in the merge loop and drop the WHOLE live
+        # list (the /ask handler then answered "no games live").
+        # Bad entries are skipped; the good games still come back.
+        good = _load("top_games_by_stat.json")[:2]
+        prov._onex_reset_caches()
+
+        async def fake_get(url, headers, params=None, cache_key="",
+                           provider="x", refresh_fn=None):
+            if "games1x2" in url:
+                return [None, "x", 123, good[0]]
+            if "topGamesByStat" in url:
+                return [good[1]]
+            raise AssertionError(f"unexpected URL in test: {url}")
+
+        prov.hc.get = fake_get
+        raw = await prov.onex_live_raw()
+        self.assertEqual([g["id"] for g in raw],
+                         [good[0]["id"], good[1]["id"]])
+        prov._onex_reset_caches()
+
+    def test_npl_filter_skips_non_dict_entries(self):
+        # Same family, in the NPL filter the scoreboard tick uses:
+        # a non-dict entry (or a non-dict liga) must not kill the
+        # whole tick.
+        npl = json.loads((Path(__file__).resolve().parent
+                          / "fixtures" / "scoreboard"
+                          / "games1x2_npl.json").read_text(encoding="utf-8"))
+        out = prov._onex_npl_from_games1x2(
+            [None, "x", {"id": 1, "liga": "Nepal. Premier league"},
+             {"id": 2, "liga": {"name": 123}}, *npl])
+        # Only the true NPL entry survives (the fixture's second
+        # entry is AFCON, not NPL) — and no bad entry raised.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["home"], "Lumbini Lions")
+        self.assertTrue(all(m["league"] == "Nepal Premier League"
+                            for m in out))
+
 
 if __name__ == "__main__":
     unittest.main()

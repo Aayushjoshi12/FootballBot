@@ -451,6 +451,60 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(msg), 2000)
         self.assertIn("…and", msg)
 
+    async def test_live_football_fresh_snapshot(self):
+        # 18 Nov 2026: /ask "show me all live football" answered
+        # "Something went wrong" in production twice on the old
+        # code and once more after the first fix — while the same
+        # question passed against small fixtures. This test runs
+        # the full handler against a REAL fresh live snapshot
+        # (games1x2 + the topGames-only game, captured from the
+        # lite mirror 18 Nov 2026 ~15:16 NPT): the pre-check must
+        # answer without Gemini, the reply must list football
+        # only, and it must stay under Discord's limit.
+        fresh = json.loads((Path(__file__).resolve().parent
+                            / "fixtures" / "assistant"
+                            / "games1x2_fresh_20261118.json")
+                           .read_text(encoding="utf-8"))
+        model = NeverCallModel()
+        with patch.object(prov, "onex_live_raw",
+                          new=AsyncMock(return_value=fresh)):
+            interaction = FakeInteraction()
+            await amod.handle_ask(interaction,
+                                  "show me all live football",
+                                  model, CHANNELS)
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertNotIn("Something went wrong", text)
+        self.assertLess(len(text), 2000)
+        self.assertIn("Nahia U19", text)
+        self.assertIn("Cerezo Osaka", text)
+        # The topGames-only game (not in games1x2) is listed too.
+        self.assertIn("Persibangga", text)
+        self.assertIn("771937351", text)
+        # …and no other sport leaks into the football reply.
+        self.assertNotIn("Kolkata Knight Riders", text)
+        self.assertNotIn("Chennai Cine Docs", text)
+
+    async def test_handle_ask_logs_traceback_on_failure(self):
+        # The production failures of 18 Nov 2026 left only an
+        # exception TYPE in the journal, which was not enough to
+        # find the cause. The catch-all now logs the full
+        # traceback — while the user still gets exactly the same
+        # short error reply.
+        interaction = FakeInteraction()
+        with patch.object(amod, "_handle_ask",
+                          side_effect=RuntimeError("boom")):
+            with self.assertLogs("assistant", level="ERROR") as logs:
+                await amod.handle_ask(interaction,
+                                      "show me all live football",
+                                      None, CHANNELS)
+        self.assertEqual(interaction.followup.sent,
+                         ["Something went wrong — please try again."])
+        joined = "\n".join(logs.output)
+        self.assertIn("Traceback", joined)
+        self.assertIn("RuntimeError: boom", joined)
+
     def test_grounding_skips_malformed_entry(self):
         # One entry the normalizer cannot handle must not kill
         # the whole reply — it is skipped, the rest are listed.

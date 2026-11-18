@@ -1116,8 +1116,12 @@ def _onex_npl_from_games1x2(data: Any) -> list[Match]:
         return []
     out = []
     for g in data:
-        liga = (g.get("liga") or {}).get("name") or ""
-        if _NPL_LIGA_NAME not in normalize(liga):
+        if not isinstance(g, dict):
+            continue
+        liga = g.get("liga")
+        name = liga.get("name") if isinstance(liga, dict) else None
+        if _NPL_LIGA_NAME not in normalize(name if isinstance(name, str)
+                                           else ""):
             continue
         if (m := _onex_norm_npl_match(g)) is not None:
             out.append(m)
@@ -1470,6 +1474,11 @@ async def onex_live_raw() -> list[dict]:
         if not isinstance(data, list):
             continue
         for g in data:
+            # One non-dict entry in the feed must not kill the
+            # whole live list (a single bad entry used to raise
+            # AttributeError here and drop every game).
+            if not isinstance(g, dict):
+                continue
             gid = str(g.get("id") or g.get("mainGameId") or "")
             if not gid or gid in seen:
                 continue

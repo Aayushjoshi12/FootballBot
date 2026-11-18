@@ -1350,10 +1350,25 @@ def _onex_detail_from_raw(g: dict) -> dict | None:
     return m
 
 
-async def onex_game_info(game_id: int | str) -> dict:
+async def onex_game_info(game_id: int | str) -> dict | None:
     """Live-feed gameInfo: venue, weather, format, constId,
     line-up/video flags. No scores, no odds — those come from
-    the live list. {} when 1xBet doesn't answer (204/400)."""
+    the live list. None when the call itself fails (transport
+    error, HTTP error); {} when it answers but carries no
+    usable record for this game. Callers treat both as "no
+    enrichment" — onex_game_detail records the difference as
+    info_failed so the UI can say so honestly.
+
+    NOTE (verified live 18 Nov 2026, do NOT "fix" the request
+    shape): gameInfo answers HTTP 400 InvalidQueryParameters
+    for EVERY game id tried, on BOTH mirrors, with five
+    param variations — while the IDENTICAL request (same
+    params, headers, UA) succeeds from Vercel, enriching the
+    same game with venue/weather/format. The endpoint is
+    gated upstream for datacentre IPs, not a bad request on
+    our side; the live list still answers, so scores/clock
+    are unaffected and only venue/weather/format/constId are
+    lost. A failed gameInfo never fails the detail."""
     try:
         params = dict(_ONEX_GAME_PARAMS)
         params["gameId"] = game_id
@@ -1362,8 +1377,10 @@ async def onex_game_info(game_id: int | str) -> dict:
     except Exception as exc:
         log.warning("[onexbet] gameInfo %s failed (%s)", game_id,
                     type(exc).__name__)
-        return {}
-    if not isinstance(data, dict) or not data.get("id"):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not data.get("id"):
         return {}
     mi = data.get("matchInfoObj") or {}
     weather = None
@@ -1390,11 +1407,20 @@ async def onex_game_info(game_id: int | str) -> dict:
 
 async def onex_game_detail(raw: dict) -> dict | None:
     """Full detail for one raw live entry: live scores/stats plus
-    gameInfo enrichment. A failed gameInfo never fails the detail."""
+    gameInfo enrichment. A failed gameInfo never fails the detail —
+    it only sets info_failed, so the UI can say the details feed
+    is not answering instead of silently dropping venue/format.
+    Stats are NOT from gameInfo: they come from the live list's
+    tabloStats (see _onex_detail_from_raw), so a gameInfo failure
+    never empties the stats table."""
     detail = _onex_detail_from_raw(raw)
     if detail is None:
         return None
     info = await onex_game_info(detail["onex_id"])
+    # None = the gameInfo call itself failed (HTTP 400 from the
+    # bot's server — see onex_game_info); {} = it answered but
+    # this game has no record. Only None is a feed failure.
+    detail["info_failed"] = info is None
     if info:
         detail["const_id"] = info.get("const_id")
         detail["sport"] = info.get("sport") or detail.get("sport")

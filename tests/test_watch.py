@@ -15,6 +15,7 @@ import logging
 import sys
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -99,6 +100,26 @@ def _snap(home_score, away_score, **kw):
     return d
 
 
+@contextmanager
+def _capture_watch_log():
+    """Collect 'watch' logger records at INFO for one block.
+    (pytest's caplog fixture is not injected into unittest
+    TestCase methods, so the tap-logging tests use this.)"""
+    records = []
+    handler = logging.Handler()
+    handler.setLevel(logging.INFO)
+    handler.emit = lambda record: records.append(record)
+    logger = logging.getLogger("watch")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
 class TestTabloStats(unittest.TestCase):
     def test_order_and_values(self):
         g = _load("games1x2.json")[0]
@@ -111,6 +132,59 @@ class TestTabloStats(unittest.TestCase):
     def test_none_when_absent(self):
         self.assertIsNone(prov._onex_tabular_stats({}))
         self.assertIsNone(prov._onex_tabular_stats({"tabloStats": {"0": []}}))
+
+
+class TestGameInfoFailure(unittest.IsolatedAsyncioTestCase):
+    """gameInfo failure plumbing (18 Nov 2026, VM journal):
+    the endpoint answers HTTP 400 for every game id from the
+    bot's server, while the IDENTICAL request (same params,
+    headers, UA, both mirrors) succeeds from Vercel — upstream
+    IP-gating, not a bad request shape. onex_game_info must
+    report the failure (None) so the detail can say so, and a
+    failed gameInfo must never fail the detail or empty the
+    stats table (stats come from the live list, not gameInfo)."""
+
+    async def test_http_failure_returns_none(self):
+        # hc.get returns None on an HTTP error (400):
+        # raise_for_status -> break -> None.
+        with patch.object(prov.hc, "get",
+                          new=AsyncMock(return_value=None)):
+            info = await prov.onex_game_info("771747666")
+        self.assertIsNone(info)
+
+    async def test_exception_returns_none(self):
+        with patch.object(prov.hc, "get",
+                          new=AsyncMock(side_effect=RuntimeError("boom"))):
+            info = await prov.onex_game_info("771747666")
+        self.assertIsNone(info)
+
+    async def test_empty_answer_returns_empty_dict(self):
+        # Answered but no usable record for this game: {} —
+        # NOT a feed failure, so info_failed stays False.
+        with patch.object(prov.hc, "get",
+                          new=AsyncMock(return_value={})):
+            info = await prov.onex_game_info("771747666")
+        self.assertEqual(info, {})
+
+    async def test_game_detail_marks_info_failed(self):
+        raw = _load("games1x2.json")[0]
+        with patch.object(prov.hc, "get",
+                          new=AsyncMock(return_value=None)):
+            detail = await prov.onex_game_detail(raw)
+        self.assertTrue(detail["info_failed"])
+        # Scores still come from the live list — the detail
+        # (and its stats) survive a dead gameInfo.
+        self.assertEqual(detail["home_score"], 0)
+        self.assertIsNotNone(detail["stats"])
+
+    async def test_game_detail_info_ok_when_game_info_answers(self):
+        raw = _load("games1x2.json")[0]
+        info = _load("gameinfo_771747666.json")
+        with patch.object(prov.hc, "get",
+                          new=AsyncMock(return_value=info)):
+            detail = await prov.onex_game_detail(raw)
+        self.assertFalse(detail["info_failed"])
+        self.assertEqual(detail.get("venue"), "Stade de Marrakech")
 
 
 class TestRenderDetail(unittest.TestCase):
@@ -734,11 +808,16 @@ class FakeFollowup:
     def __init__(self):
         self.sent: list[str] = []
         self.sent_views: list = []
+        # Whether each send was ephemeral — the new-message
+        # button behaviour sends VISIBLE messages, so tests
+        # must be able to tell the two apart.
+        self.ephemeral_flags: list[bool] = []
         self._next_id = 4000
 
     async def send(self, content=None, ephemeral=False, view=None, **kwargs):
         self.sent.append(content)
         self.sent_views.append(view)
+        self.ephemeral_flags.append(bool(ephemeral))
         # followup.send(wait=True) returns the sent message in
         # discord.py — give the panel-as-reply an id to record.
         self._next_id += 1
@@ -1420,7 +1499,8 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
     async def test_detail_button_resolves_game_from_message(self):
         # Static custom_id: the game comes from the message's
         # "Game ID:" line, and the fetch is for that id. The tap
-        # edits the card in place — no fresh snapshot message.
+        # sends a NEW visible message — it never edits the card
+        # in place and never adopts it as a panel.
         view = self._view()
         interaction = self._interaction("watch:detail")
         mock_search = AsyncMock(
@@ -1428,38 +1508,43 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
         with patch.object(prov, "onex_search", mock_search):
             await view.children[0].callback(interaction)
         mock_search.assert_awaited_once_with("771747666")
-        self.assertEqual(len(interaction.edited), 1)
-        text = interaction.edited[0][0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
         self.assertIn("Match stats", text)
         self.assertIn("Possession", text)
         self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", text)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
+        self.assertNotIn((777, "771747666"), wmod._watches)
 
-    async def test_detail_button_updates_card_in_place(self):
+    async def test_detail_button_sends_new_message(self):
         view = self._view()
         interaction = self._interaction("watch:detail")
         with self._mock_search(self.detail):
             await view.children[0].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        text = interaction.edited[0][0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
         self.assertIn("Match stats", text)
         self.assertIn("Possession", text)
         self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", text)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
+        self.assertNotIn((777, "771747666"), wmod._watches)
 
-    async def test_live_button_switches_card_to_live_line_in_place(self):
+    async def test_live_button_sends_new_live_line(self):
         view = self._view()
         interaction = self._interaction("watch:live")
         with self._mock_search(self.detail):
             await view.children[1].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        text = interaction.edited[0][0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
         self.assertIn("0 – 1", text)
         self.assertIn("67:00", text)
         self.assertNotIn("Match stats", text)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
 
-    async def test_live_button_cricket_switches_card_in_place(self):
+    async def test_live_button_cricket_sends_new_live_line(self):
         cricket_detail = {
             "home": "Lumbini Lions", "away": "Sudurpaschim Royals",
             "home_score": "108/4", "away_score": "105/8",
@@ -1473,11 +1558,12 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
         interaction = self._interaction("watch:live")
         with self._mock_search(cricket_detail):
             await view.children[1].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        text = interaction.edited[0][0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
         self.assertIn("16.4 ov", text)
         self.assertIn("108/4", text)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
 
     async def test_gone_game_says_no_longer_live(self):
         view = self._view()
@@ -2695,19 +2781,23 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
 
-    async def test_refresh_edits_detail_card_in_place(self):
+    async def test_refresh_sends_new_message(self):
         view = self._view()
         interaction = self._interaction("panel:refresh")
         new_detail = dict(self.detail)
         new_detail["home_score"] = 1
         with self._mock_search(new_detail):
             await view.children[2].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        content, edited_view = interaction.edited[0]
+        # Refresh sends a NEW visible message — it never edits
+        # the card in place.
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        content = interaction.followup.sent[0]
         self.assertIn("1 – 1", content)
         self.assertIn("Game ID: 771747666", content)
-        self.assertIsInstance(edited_view, wmod.WatchAlertView)
-        self.assertEqual(len(interaction.followup.sent), 0)
+        self.assertIsInstance(interaction.followup.sent_views[0],
+                              wmod.WatchAlertView)
+        self.assertEqual(interaction.edited, [])
 
     async def test_refresh_cooldown_blocks_second_click(self):
         view = self._view()
@@ -2732,14 +2822,15 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertIn("67:00", interaction.followup.sent[0])
         self.assertEqual(len(interaction.edited), 0)
 
-    async def test_detail_button_on_alert_is_silent(self):
-        # Reproduction of the user's screenshot (18 Nov, four
-        # identical ephemeral "Live panel updated." replies at
-        # 06:34 PM): one tap on an alert message must switch
-        # the real panel in place and send NOTHING — the panel
-        # changing IS the feedback. Before the fix this tap
-        # sends one ephemeral per tap, so repeated taps stack
-        # identical replies.
+    async def test_detail_button_on_alert_sends_new_message(self):
+        # The old in-place design switched the real panel and
+        # sent NOTHING — the panel changing was the feedback.
+        # That is the design the user said does not work
+        # properly (a queued tick edit could overwrite the
+        # tap's switch): a tap on an alert now sends a NEW
+        # visible message with the detail view, and the live
+        # panel is left exactly as it is — same kind, same
+        # body, still ticking.
         channel = FakeChannel()
         bot = FakeBot(channel)
         detail = self.detail
@@ -2759,9 +2850,14 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         interaction.client = bot
         with self._mock_search(detail):
             await view.children[0].callback(interaction)
-        self.assertEqual(len(msg.edits), 1)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Match stats", interaction.followup.sent[0])
         self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(msg.content, body)
+        self.assertEqual(watch["panel_kind"], "compact")
+        self.assertEqual(watch["panel_body"], body)
 
     async def test_timeline_lists_events(self):
         view = self._view()
@@ -2776,7 +2872,10 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
                 patch.object(prov, "onex_events",
                              new=AsyncMock(return_value=events)):
             await view.children[3].callback(interaction)
+        # Timeline is a NEW visible channel message now, not
+        # an ephemeral one-off.
         self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
         text = interaction.followup.sent[0]
         self.assertIn("Goal", text)
         self.assertIn("23'", text)
@@ -2791,26 +2890,29 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             await view.children[3].callback(interaction)
         self.assertEqual(interaction.followup.sent,
                          ["No timeline events yet for this game."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [True])
 
-    async def test_simple_button_switches_card_in_place_no_stats(self):
+    async def test_simple_button_sends_new_simple_message(self):
         view = self._view()
         interaction = self._interaction("panel:simple")
         with self._mock_search(self.detail):
             await view.children[4].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        self.assertNotIn("Match stats", interaction.edited[0][0])
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertNotIn("Match stats", interaction.followup.sent[0])
+        self.assertEqual(interaction.edited, [])
 
-    async def test_advanced_button_switches_card_to_analytics_in_place(self):
+    async def test_advanced_button_sends_new_analytics_message(self):
         view = self._view()
         interaction = self._interaction("panel:advanced")
         with self._mock_search(self.detail):
             await view.children[5].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        text = interaction.edited[0][0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
         self.assertIn("Match statistics", text)
         self.assertIn("Possession", text)
-        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.edited, [])
 
     async def test_follow_starts_watch(self):
         view = self._view()
@@ -2819,6 +2921,7 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             await view.children[6].callback(interaction)
         self.assertIn((777, "771747666"), wmod._watches)
         self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
         self.assertIn("Watching", interaction.followup.sent[0])
 
     async def test_follow_already_watched(self):
@@ -2829,6 +2932,7 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             await view.children[6].callback(interaction)
         self.assertEqual(interaction.followup.sent,
                          ["That game is already watched in this channel."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
 
     async def test_unfollow_keeps_panel_stops_alerts(self):
         self._seed_watch()
@@ -2840,6 +2944,7 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertIn((777, "771747666"), wmod._watches)
         self.assertFalse(wmod._watches[(777, "771747666")]["notify"])
         self.assertIn("Notifications off", interaction.followup.sent[0])
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
 
     async def test_unfollow_not_watched(self):
         view = self._view()
@@ -2848,6 +2953,7 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
             await view.children[7].callback(interaction)
         self.assertEqual(interaction.followup.sent,
                          ["That game is not watched in this channel."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
 
 
 class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
@@ -3085,7 +3191,12 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
             interaction.followup.sent,
             ["🔕 Notifications off for **Republic of the Gambia vs Ivory Coast** — the live panel keeps ticking here while the game is live."])
 
-    async def test_refresh_on_panel_edits_panel_in_place(self):
+    async def test_refresh_on_panel_sends_new_message(self):
+        # Refresh on a panel used to edit the panel in place —
+        # under the new-message design it sends a NEW visible
+        # message with the fresh score and leaves the panel
+        # alone (no watch is registered for this message here,
+        # so Refresh renders a simple detail snapshot).
         view = wmod.WatchAlertView("771747666")
         detail = prov._onex_detail_from_raw(self.games1x2[0])
         panel_text = wmod.render_panel(detail, "67:00")
@@ -3098,11 +3209,14 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
                           new=AsyncMock(return_value={"games": [],
                                                       "detail": new_detail})):
             await view.children[2].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        content, edited_view = interaction.edited[0]
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        content = interaction.followup.sent[0]
         self.assertIn("1 – 1", content)
-        self.assertIn("🔴 LIVE", content)
-        self.assertIsInstance(edited_view, wmod.WatchAlertView)
+        self.assertIn("Game ID: 771747666", content)
+        self.assertIsInstance(interaction.followup.sent_views[0],
+                              wmod.WatchAlertView)
+        self.assertEqual(interaction.edited, [])
 
     async def test_watch_command_reply_is_the_panel(self):
         # The user confirmed it (18 Nov 2026): when they run
@@ -3770,10 +3884,15 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-# Updated 12:00:05 NPT", msg.edits[0])
         self.assertNotIn("00:00:01", msg.edits[0])
 
-    async def test_detail_button_adopts_static_card_and_it_ticks(self):
-        # The user's exact case: a /game reply posted before the
-        # panel code was never registered, so it could never tick.
-        # Tapping Detail adopts it — and then it ticks.
+    async def test_detail_button_never_adopts_static_card(self):
+        # The user's exact case, under the new-message design:
+        # a /game reply posted before the panel code was never
+        # registered, so it could never tick. Tapping Detail
+        # used to adopt it as the panel (and then it ticked) —
+        # that in-place edit is exactly what raced the tick and
+        # never stuck. Now the tap sends a NEW visible message
+        # with the detail view and adopts nothing: the card
+        # stays a static card, no watch is created.
         detail = self._detail()
         card = wmod.render_detail(detail, wmod.DETAIL_SIMPLE)
         msg = FakeMessage(4001, card)
@@ -3782,22 +3901,14 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         interaction = self._button_interaction("watch:detail", card)
         with self._mock_search(detail):
             await view.children[0].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        self.assertEqual(interaction.followup.sent, [])
-        entry = wmod._watches[(777, "771678099")]
-        self.assertEqual(entry["panel_message_id"], 4001)
-        self.assertEqual(entry["panel_kind"], "detail")
-        # The tap itself just edited the card, so the 1s gap
-        # would defer the tick's edit — move the edit back 2s,
-        # the way the other tick tests do.
-        entry["last_panel_edit"] = time.monotonic() - 2
-        await wmod.on_tick(self.bot, [self._raw_overs("11.2")])
-        await _drain_panel_workers()
-        self.assertEqual(len(msg.edits), 1)
-        self.assertIn("11.2 ov", msg.edits[0])
-        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertEqual(interaction.edited, [])
+        self.assertNotIn((777, "771678099"), wmod._watches)
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(msg.content, card)
 
-    async def test_refresh_button_adopts_static_card_in_place(self):
+    async def test_refresh_button_never_adopts_static_card(self):
         detail = self._detail()
         card = wmod.render_detail(detail, wmod.DETAIL_SIMPLE)
         msg = FakeMessage(4001, card)
@@ -3806,13 +3917,14 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         interaction = self._button_interaction("panel:refresh", card)
         with self._mock_search(detail):
             await view.children[2].callback(interaction)
-        self.assertEqual(len(interaction.edited), 1)
-        self.assertIn("10.5 ov", interaction.edited[0][0])
-        self.assertIn("-# Updated", interaction.edited[0][0])
-        self.assertEqual(interaction.followup.sent, [])
-        self.assertIn((777, "771678099"), wmod._watches)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("10.5 ov", interaction.followup.sent[0])
+        self.assertIn("-# Updated", interaction.followup.sent[0])
+        self.assertEqual(interaction.edited, [])
+        self.assertNotIn((777, "771678099"), wmod._watches)
 
-    async def test_live_button_on_alert_switches_real_panel(self):
+    async def test_live_button_on_alert_sends_new_message(self):
         msg = self._seed_cricket_panel()
         alert = ("🏏 **WICKET** — Sudurpaschim Royals 76/2 (10.5 ov)\n"
                  "Game ID: 771678099")
@@ -3822,17 +3934,16 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         interaction.client = self.bot
         with self._mock_search(self._detail()):
             await view.children[1].callback(interaction)
-        # The real panel switched to the compact line, in place —
-        # and the tap sent NOTHING. The old code answered every
-        # tap with an ephemeral "Live panel updated.", so
-        # repeated taps stacked identical replies (the user's
-        # screenshot: four of them at 06:34 PM).
-        self.assertEqual(len(msg.edits), 1)
-        self.assertIn("🔴 LIVE", msg.edits[0])
-        self.assertIn("10.5 ov", msg.edits[0])
-        self.assertNotIn("Match stats", msg.edits[0])
-        self.assertEqual(interaction.followup.sent, [])
+        # The tap sends a NEW visible message with the compact
+        # line — the real panel is left exactly as it is (same
+        # kind, same body, no edit) and keeps ticking.
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("🔴 LIVE", interaction.followup.sent[0])
+        self.assertIn("10.5 ov", interaction.followup.sent[0])
+        self.assertNotIn("Match stats", interaction.followup.sent[0])
         self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
 
     async def test_ephemeral_card_is_never_adopted(self):
         # An ephemeral detail card (e.g. a /watch detail reply)
@@ -3845,6 +3956,7 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         with self._mock_search(detail):
             await view.children[0].callback(interaction)
         self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
         # The one-off advanced snapshot (Target/Need — cricket
         # has no stats table, so no "Match stats" line).
         self.assertIn("Target: 158", interaction.followup.sent[0])
@@ -5026,7 +5138,7 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self._watching_button(msg.view).label, "👀 Watching: 1 · 1s")
 
-    async def test_watching_button_tap_shows_list_ephemeral(self):
+    async def test_watching_button_tap_sends_new_message(self):
         import bot as botmod
         _, snap0 = await self._add_row(0, "771747666", notify=True)
         detail1, snap1 = await self._add_row(
@@ -5048,11 +5160,14 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
                     wmod.DETAIL_ADVANCED)),
             data={"custom_id": "panel:watching:771747666"})
         await self._watching_button(view).callback(interaction)
-        # Ephemeral list to the tapper only: no channel message,
-        # no response.send_message, no "panel updated" follow-up.
+        # NEW visible channel message (was ephemeral): the list
+        # itself is the answer — no response.send_message, no
+        # "panel updated" follow-up — and it carries one ❌
+        # Remove button per watched game.
         self.assertEqual(len(self.channel.sent), 0)
         self.assertEqual(interaction.response.sent, [])
         self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
         text = interaction.followup.sent[0]
         self.assertIn("2 games refreshing in this channel", text)
         self.assertIn("each about every 2s", text)
@@ -5064,6 +5179,14 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{snap1['cricket']['over_str']} ov", text)
         self.assertIn("🔕 alerts off", text)
         self.assertIn("not refreshing yet", text)
+        list_view = interaction.followup.sent_views[0]
+        self.assertIsInstance(list_view, wmod.WatchingListView)
+        self.assertEqual(
+            sorted(b.custom_id for b in list_view.children),
+            ["panel:remove:771739998", "panel:remove:771747118",
+             "panel:remove:771747666"])
+        self.assertTrue(all(b.item.label.startswith("❌ Remove ")
+                            for b in list_view.children))
 
     async def test_watching_button_matches_command(self):
         import bot as botmod
@@ -5080,7 +5203,8 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
         cmd = FakeInteraction(channel_id=777)
         await botmod.cmd_watching.callback(cmd)
         # Same helper, same text — the button and the command
-        # can never drift apart.
+        # can never drift apart (the button's message is
+        # visible, the command's reply stays ephemeral).
         self.assertEqual(interaction.followup.sent, cmd.response.sent)
 
     async def test_watching_button_with_nothing_watched(self):
@@ -5093,7 +5217,461 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(interaction.followup.sent,
                          ["No games watched in this channel. "
                           "Use `/watch <game>` to follow one."])
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
         self.assertEqual(len(self.channel.sent), 0)
+        # No games, so no Remove buttons either.
+        list_view = interaction.followup.sent_views[0]
+        self.assertIsInstance(list_view, wmod.WatchingListView)
+        self.assertEqual(list_view.children, [])
+
+
+class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
+    """Button taps send a NEW channel message (18 Nov 2026, the
+    user's call: editing in the same panel "is not working
+    properly"). The live panel is never edited by a tap — its
+    kind, body and message stay exactly as they are, and the
+    tick keeps editing it."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp9"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        self._orig_cooldown = dict(wmod._refresh_cooldown)
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._refresh_cooldown = {}
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        wmod._refresh_cooldown = self._orig_cooldown
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _view(self, game_id=None):
+        return wmod.WatchAlertView(game_id)
+
+    def _interaction(self, custom_id, content=None):
+        if content is None:
+            content = wmod.render_detail(self.detail,
+                                         wmod.DETAIL_ADVANCED)
+        return FakeInteraction(
+            message=SimpleNamespace(content=content),
+            data={"custom_id": custom_id})
+
+    def _mock_search(self, detail):
+        return patch.object(
+            prov, "onex_search",
+            new=AsyncMock(return_value={"games": [], "detail": detail}))
+
+    def _seed_panel(self, kind="compact", detail_level="simple"):
+        snap = wmod.snapshot_from_detail(
+            {"home": "Republic of the Gambia", "away": "Ivory Coast",
+             "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
+             "clock": "67'", "stats": [], "cricket": None})
+        snap["_home"], snap["_away"] = ("Republic of the Gambia",
+                                        "Ivory Coast")
+        body = wmod.render_panel(self.detail, "67:00")
+        msg = FakeMessage(2001, body)
+        self.channel.messages[2001] = msg
+        wmod._watches[(777, "771747666")] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": detail_level,
+            "fmt": "", "snapshot": snap, "missing": 0,
+            "missing_since": 0.0, "notify": True, "panel_kind": kind,
+            "panel_message_id": 2001, "panel_body": body,
+            "panel_base_body": body, "panel_static": {},
+            "panel_momentum": None, "panel_momentum_ts": 0.0,
+            "last_panel_edit": 0.0, "panel_timer_sec": None,
+            "panel_timer_ts": 0.0,
+        }
+        return msg, body
+
+    async def test_detail_tap_sends_new_message_panel_untouched(self):
+        msg, body = self._seed_panel()
+        view = self._view()
+        interaction = self._interaction("watch:detail")
+        with self._mock_search(self.detail):
+            await view.children[0].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Match stats", interaction.followup.sent[0])
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(msg.content, body)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "compact")
+        self.assertEqual(watch["panel_body"], body)
+
+    async def test_live_tap_sends_new_compact_message(self):
+        msg, body = self._seed_panel(kind="detail")
+        view = self._view()
+        interaction = self._interaction("watch:live")
+        with self._mock_search(self.detail):
+            await view.children[1].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
+        self.assertIn("🔴 LIVE", text)
+        self.assertIn("67:00", text)
+        self.assertNotIn("Match stats", text)
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_kind"], "detail")
+
+    async def test_advanced_tap_with_no_stats_says_so_plainly(self):
+        # The user's screenshot case (Cheetah Kasoa vs Gaz
+        # Nobles): Advanced shows "No match statistics
+        # available yet." — that is CORRECT, not a bug: the
+        # feed sends no tabloStats for that game, so there is
+        # nothing to show. The tap still sends its new message.
+        msg, body = self._seed_panel()
+        no_stats = dict(self.detail)
+        no_stats["stats"] = []
+        view = self._view()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(no_stats):
+            await view.children[5].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
+        self.assertIn("No match statistics available yet.", text)
+        self.assertIn("Game ID: 771747666", text)
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+
+    async def test_advanced_tap_with_failed_details_feed_says_so(self):
+        # The gameInfo 400s (18 Nov 2026, VM journal): the
+        # details feed is not answering from the bot's server.
+        # Advanced with no stats AND a failed details feed
+        # says so plainly — it does NOT pretend the stats feed
+        # itself failed (stats come from the live list, which
+        # is fine; this game just carries no stats table).
+        msg, body = self._seed_panel()
+        no_stats = dict(self.detail)
+        no_stats["stats"] = []
+        no_stats["info_failed"] = True
+        view = self._view()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(no_stats):
+            await view.children[5].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        text = interaction.followup.sent[0]
+        self.assertIn("No match statistics available for this game.",
+                      text)
+        self.assertIn("details feed is not answering", text)
+        self.assertIn("Game ID: 771747666", text)
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+
+    async def test_detail_tap_logs_one_line(self):
+        # Finding 4 (18 Nov 2026): taps logged NOTHING, so a
+        # "buttons not working" report was invisible in the
+        # journal. Every tap now logs exactly one line with
+        # button, game, channel, user and outcome.
+        view = self._view()
+        interaction = self._interaction("watch:detail")
+        with self._mock_search(self.detail), _capture_watch_log() as recs:
+            await view.children[0].callback(interaction)
+        tap_lines = [r.getMessage() for r in recs
+                     if r.name == "watch" and "tap Detail" in r.getMessage()]
+        self.assertEqual(len(tap_lines), 1)
+        line = tap_lines[0]
+        self.assertIn("game=771747666", line)
+        self.assertIn("channel=777", line)
+        self.assertIn("user=42", line)
+        self.assertIn("sent new message", line)
+
+    async def test_maintenance_blocked_tap_logs_blocked(self):
+        # A maintenance-blocked tap never reaches a handler,
+        # so interaction_check logs its only journal line.
+        view = self._view()
+        interaction = self._interaction("watch:detail")
+        with patch.object(wmod.maintenance, "view_blocked",
+                          new=AsyncMock(return_value=True)), \
+                _capture_watch_log() as recs:
+            blocked = await view.interaction_check(interaction)
+        self.assertFalse(blocked)
+        tap_lines = [r.getMessage() for r in recs
+                     if r.name == "watch"
+                     and "blocked: maintenance" in r.getMessage()]
+        self.assertEqual(len(tap_lines), 1)
+        self.assertIn("771747666", tap_lines[0])
+        self.assertIn("channel=777", tap_lines[0])
+
+    async def test_tap_on_stale_message_still_sends_new_message(self):
+        # Findings 3 + 5 (18 Nov 2026): tapping a STALE
+        # message — an old panel, a goal alert — used to
+        # silently switch the REAL panel elsewhere, with no
+        # feedback on the message tapped, and could adopt the
+        # stale message as the panel. Now the tap answers
+        # visibly on the spot and never touches any panel.
+        msg, body = self._seed_panel(kind="detail")
+        stale = wmod.render_panel(self.detail, "12:00")
+        view = self._view("771747666")
+        interaction = self._interaction("watch:detail:771747666",
+                                        content=stale)
+        with self._mock_search(self.detail):
+            await view.children[0].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_kind"], "detail")
+
+    async def test_refresh_tap_sends_current_view_as_new_message(self):
+        msg, body = self._seed_panel(kind="detail")
+        view = self._view()
+        interaction = self._interaction("panel:refresh")
+        with self._mock_search(self.detail):
+            await view.children[2].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Game ID: 771747666",
+                      interaction.followup.sent[0])
+        self.assertEqual(interaction.edited, [])
+        self.assertEqual(len(msg.edits), 0)
+
+    async def test_timeline_tap_sends_new_message(self):
+        view = self._view()
+        interaction = self._interaction("panel:timeline")
+        events = [{"minute_int": 23, "minute": "23", "icon": "⚽",
+                   "detail": "Goal", "player": "S. Mane",
+                   "team": "Ivory Coast"}]
+        with self._mock_search(self.detail), \
+                patch.object(prov, "onex_events",
+                             new=AsyncMock(return_value=events)):
+            await view.children[3].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Goal", interaction.followup.sent[0])
+
+    async def test_follow_tap_sends_new_message_and_starts_watch(self):
+        view = self._view()
+        interaction = self._interaction("panel:follow")
+        with self._mock_search(self.detail):
+            await view.children[6].callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Watching", interaction.followup.sent[0])
+
+    async def test_unfollow_tap_sends_new_message_panel_untouched(self):
+        msg, body = self._seed_panel()
+        view = self._view()
+        interaction = self._interaction("panel:unfollow")
+        await view.children[7].callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertFalse(wmod._watches[(777, "771747666")]["notify"])
+        self.assertFalse(msg.deleted)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("Notifications off", interaction.followup.sent[0])
+
+
+class TestRemoveWatchButton(unittest.IsolatedAsyncioTestCase):
+    """The ❌ Remove buttons on a watching-list message: full
+    remove like /unwatch, persistent after a restart via the
+    DynamicItem template."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp10"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await _cancel_panel_workers()
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    async def _seed_full(self, idx, game_id, mid):
+        detail = prov._onex_detail_from_raw(self.games1x2[idx])
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = detail["home"], detail["away"]
+        snap["status"] = "2H"
+        await db.add_watch(777, game_id, detail["home"], detail["away"],
+                           detail.get("league", ""), "simple", "", snap,
+                           notify=True, panel_kind="compact")
+        body = wmod.render_panel(detail, "67:00")
+        msg = FakeMessage(mid, body)
+        self.channel.messages[mid] = msg
+        wmod._watches[(777, game_id)] = {
+            "home": detail["home"], "away": detail["away"],
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": str(detail.get("format") or ""), "snapshot": snap,
+            "missing": 0, "missing_since": 0.0, "notify": True,
+            "panel_kind": "compact", "panel_message_id": mid,
+            "panel_body": body, "panel_base_body": body,
+            "panel_static": {}, "panel_momentum": None,
+            "panel_momentum_ts": 0.0, "last_panel_edit": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        return detail, msg
+
+    def _remove_button(self, view, game_id):
+        return next(b for b in view.children
+                    if b.custom_id == f"panel:remove:{game_id}")
+
+    async def _list_view_and_message(self):
+        rows = await wmod.list_channel_watches(777, include_view_only=True)
+        view = wmod.WatchingListView(rows)
+        text = wmod._watching_text(rows)
+        msg = FakeMessage(4001, text, view=view)
+        self.channel.messages[4001] = msg
+        return view, msg, text
+
+    async def test_remove_tap_fully_removes_watch(self):
+        await self._seed_full(0, "771747666", 2001)
+        await self._seed_full(2, "771750037", 2002)
+        view, msg, _text = await self._list_view_and_message()
+        btn = self._remove_button(view, "771747666")
+        interaction = FakeInteraction(
+            channel_id=777, message=msg,
+            data={"custom_id": "panel:remove:771747666"})
+        interaction.client = self.bot
+        await btn.callback(interaction)
+        # Panel deleted, watch gone from memory and db.
+        self.assertTrue(self.channel.messages[2001].deleted)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        rows = await wmod.list_channel_watches(777,
+                                               include_view_only=True)
+        self.assertEqual([r["game_id"] for r in rows], ["771750037"])
+        # The list message was edited to the fresh list...
+        self.assertEqual(len(interaction.edited), 1)
+        new_text, new_view = interaction.edited[0]
+        self.assertNotIn("Republic of the Gambia", new_text)
+        self.assertIsInstance(new_view, wmod.WatchingListView)
+        self.assertEqual([b.custom_id for b in new_view.children],
+                         ["panel:remove:771750037"])
+        # ...and a short new channel message confirms the removal.
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.ephemeral_flags, [False])
+        self.assertIn("❌ Removed", interaction.followup.sent[0])
+        self.assertIn("Republic of the Gambia",
+                      interaction.followup.sent[0])
+        # The other game is untouched: still watched, panel alive.
+        self.assertIn((777, "771750037"), wmod._watches)
+        self.assertFalse(self.channel.messages[2002].deleted)
+
+    async def test_remove_tap_logs_one_line(self):
+        # Taps used to log nothing (18 Nov 2026): a Remove tap
+        # logs its outcome like every other tap.
+        await self._seed_full(0, "771747666", 2001)
+        view, msg, _text = await self._list_view_and_message()
+        btn = self._remove_button(view, "771747666")
+        interaction = FakeInteraction(
+            channel_id=777, message=msg,
+            data={"custom_id": "panel:remove:771747666"})
+        interaction.client = self.bot
+        with _capture_watch_log() as recs:
+            await btn.callback(interaction)
+        tap_lines = [r.getMessage() for r in recs
+                     if r.name == "watch" and "tap Remove" in r.getMessage()]
+        self.assertEqual(len(tap_lines), 1)
+        self.assertIn("game=771747666", tap_lines[0])
+        self.assertIn("watch removed", tap_lines[0])
+
+    async def test_remove_tap_on_already_removed_game_answers_plainly(self):
+        await self._seed_full(2, "771750037", 2002)
+        view, msg, _text = await self._list_view_and_message()
+        # A Remove button for a game that is already gone (an
+        # old list message, tapped twice): no crash, plain words.
+        btn = wmod.RemoveWatchButton(
+            "771747666", "❌ Remove Republic of… v Ivory Coast")
+        interaction = FakeInteraction(
+            channel_id=777, message=msg,
+            data={"custom_id": "panel:remove:771747666"})
+        interaction.client = self.bot
+        await btn.callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is not watched in this channel "
+                          "any more."])
+        self.assertEqual(len(interaction.edited), 1)
+        self.assertIn((777, "771750037"), wmod._watches)
+
+    async def test_remove_button_survives_restart(self):
+        # Simulate a restart: throw the list view away and
+        # rebuild the button from its custom_id alone, the way
+        # discord.py's DynamicItem dispatch does — no in-memory
+        # view state, no registry beyond what load_watches
+        # rebuilds from db (here: _watches, as seeded).
+        await self._seed_full(0, "771747666", 2001)
+        await self._seed_full(2, "771750037", 2002)
+        view, msg, _text = await self._list_view_and_message()
+        btn = self._remove_button(view, "771747666")
+        template = wmod.RemoveWatchButton.__discord_ui_compiled_template__
+        self.assertIsNotNone(template.fullmatch(btn.custom_id))
+        self.assertIsNone(template.fullmatch("panel:remove:not-a-game"))
+        rebuilt = await wmod.RemoveWatchButton.from_custom_id(
+            None, btn.item, template.fullmatch(btn.custom_id))
+        self.assertEqual(rebuilt.game_id, "771747666")
+        self.assertEqual(rebuilt.custom_id, "panel:remove:771747666")
+        interaction = FakeInteraction(
+            channel_id=777, message=msg,
+            data={"custom_id": "panel:remove:771747666"})
+        interaction.client = self.bot
+        await rebuilt.callback(interaction)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertTrue(self.channel.messages[2001].deleted)
+        self.assertIn("❌ Removed", interaction.followup.sent[0])
+
+    async def test_remove_blocked_in_maintenance(self):
+        import maintenance
+        await self._seed_full(0, "771747666", 2001)
+        view, msg, _text = await self._list_view_and_message()
+        btn = self._remove_button(view, "771747666")
+        await maintenance.set_on(True)
+        try:
+            interaction = FakeInteraction(
+                channel_id=777, message=msg,
+                data={"custom_id": "panel:remove:771747666"})
+            self.assertFalse(await btn.interaction_check(interaction))
+            self.assertIn("maintenance",
+                          interaction.response.sent[0].lower())
+            self.assertIn((777, "771747666"), wmod._watches)
+        finally:
+            await maintenance.set_on(False)
+
+    async def test_list_view_caps_buttons_at_25(self):
+        # A discord.ui.View needs a running loop to build, so
+        # this one is async like the rest of the class.
+        rows = [{"game_id": str(1000 + i), "home": f"Home {i}",
+                 "away": f"Away {i}"} for i in range(30)]
+        view = wmod.WatchingListView(rows)
+        self.assertEqual(len(view.children), 25)
 
 
 if __name__ == "__main__":

@@ -27,10 +27,10 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
 
 import barcelona_reminder
 import db
+from normalizer import team_name_matches
 import providers as prov
 import watch as wmod
 from watch import DETAIL_ADVANCED, DETAIL_SIMPLE, EVENT_KINDS
@@ -144,6 +144,7 @@ _AI_PROMPT = """You parse a Discord user's request about a live sports game into
 Rules:
 - intent is FOLLOW_MATCH when the user wants alerts/updates for a game, UNFOLLOW_MATCH when they want to stop following it, MATCH_DETAILS when they only want to see it now, SEARCH_MATCH when they want to find a game, LIVE_MATCHES when they want to browse what is live, SET_ALERTS when they want to change which alerts they get, MATCH_TIMELINE when they want the goal/card events so far, TEAM_FIXTURES when they ask when a team plays next, HELP when they ask what you can do.
 - game_id is ONLY digits the user actually typed. Never invent an id — use null and put the team name in "team" instead.
+- "Barcelona" means FC Barcelona only, never "Barcelona II", "Barcelona B" or "Barça Atlètic" — a reserve team is only meant when the user names its suffix.
 - team is the team name as the user typed it, or null.
 - events uses ONLY these kinds: goal, wicket, yellow, red, penalty, sub, kickoff, ht, second_half, ft, break, correction, postponed, suspended, abandoned, cancelled. There is no second-yellow or VAR kind — never use them. null when the user names no events.
 - detail is "advanced" only when the user asks for full/advanced/detailed stats; "simple" when they ask for simple/basic/just goals; otherwise null.
@@ -257,7 +258,9 @@ def _team_names(entry: dict) -> tuple[str, str]:
 
 def _match_team(team: str, live_games: list[dict]) -> list[dict]:
     """Live entries involving the named team: exact name first,
-    then unique partial match — same rule as watch.resolve_watch."""
+    then partial match — same rule as watch.resolve_watch. A bare
+    base name never matches a reserve side ("Barcelona" does not
+    match "Barcelona II")."""
     needle = _norm(team)
     if not needle:
         return []
@@ -266,7 +269,8 @@ def _match_team(team: str, live_games: list[dict]) -> list[dict]:
         home, away = _team_names(g)
         if _norm(home) == needle or _norm(away) == needle:
             exact.append(g)
-        elif needle in _norm(f"{home} {away}"):
+        elif (team_name_matches(team, home)
+                or team_name_matches(team, away)):
             partial.append(g)
     return exact or partial
 
@@ -633,30 +637,22 @@ def _pick_list(games: list[dict], header: str) -> str:
 
 
 async def _next_barca_fixture() -> dict | None:
-    """Barcelona's next match from the same provider path
-    /nextbarca uses (free fixtures for LaLiga, league 140).
+    """Barcelona's next match — the shared lookup in
+    barcelona_reminder (same provider path /nextbarca uses).
     None when the provider has no upcoming Barcelona fixture —
     the caller says so instead of inventing one."""
-    now = datetime.now(barcelona_reminder.NEPAL)
-    candidates = []
-    for offset in range(9):
-        day = (now.date() + timedelta(days=offset)).isoformat()
-        try:
-            fixtures = await prov.free_fixtures_for_day(140, day)
-        except Exception as exc:
-            log.warning("[assistant] Barca fixture lookup failed (%s)",
-                        type(exc).__name__)
-            return None
-        for match in fixtures or []:
-            if not barcelona_reminder._is_barcelona(match):
-                continue
-            kickoff = barcelona_reminder._kickoff(match)
-            if kickoff and kickoff > now:
-                candidates.append((kickoff, match))
-    if not candidates:
-        return None
-    kickoff, match = min(candidates, key=lambda item: item[0])
-    return {"kickoff": kickoff, "match": match}
+    return await barcelona_reminder.next_barca_fixture()
+
+
+async def _barca_not_live_reply(live_now: list[dict]) -> str:
+    """'FC Barcelona are not live right now' — plus the next
+    fixture when the provider has one, plus the live Barcelona II
+    game as a separate offer. The reserve team is never silently
+    picked (18 Nov 2026: 'Barcelona' started a Barcelona II
+    panel in #general)."""
+    fixture = await _next_barca_fixture()
+    reserve = barcelona_reminder.reserve_games_for(live_now)
+    return barcelona_reminder.not_live_message(reserve, fixture)
 
 
 _HELP_TEXT = (
@@ -864,6 +860,9 @@ async def _handle_ask(interaction, text: str, model,
                              f"for '{valid.get('team')}':"),
                             view=_ask_watch_view(matches))
                 return
+            if _is_barca_team(valid.get("team")):
+                await _reply(await _barca_not_live_reply(live_now))
+                return
             if live_now:
                 pool, sport = _live_pool(text, live_now)
                 if sport and not pool:
@@ -887,10 +886,11 @@ async def _handle_ask(interaction, text: str, model,
             matches = [g for g in live_games
                        if str(g.get("onex_id")) == str(game_id)]
         elif needle:
+            team = valid.get("team") or ""
             matches = [g for g in live_games
-                       if needle in _norm(f"{g.get('home', '')} "
-                                          f"{g.get('away', '')} "
-                                          f"{g.get('league', '')}")]
+                       if team_name_matches(team, g.get("home", ""))
+                       or team_name_matches(team, g.get("away", ""))
+                       or needle in _norm(g.get("league", ""))]
         if matches:
             await _reply(_pick_list(
                 matches, f"Found {len(matches)} live game(s) "
@@ -917,7 +917,7 @@ async def _handle_ask(interaction, text: str, model,
     if intent == "MATCH_DETAILS":
         if not game_id:
             if _is_barca_team(valid.get("team")):
-                await _reply("Barcelona are not live right now.")
+                await _reply(await _barca_not_live_reply(live_now))
                 return
             pick = _no_game_pick_text(live_now)
             if pick:
@@ -958,8 +958,7 @@ async def _handle_ask(interaction, text: str, model,
             return
         if not game_id or entry is None:
             if _is_barca_team(valid.get("team")):
-                await _reply("Barcelona are not live right now, "
-                                         "so there is nothing to follow.")
+                await _reply(await _barca_not_live_reply(live_now))
                 return
             await _reply("I couldn't find a live game for that.")
             return

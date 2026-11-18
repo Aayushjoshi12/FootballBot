@@ -2491,6 +2491,31 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
             await wmod.on_tick(self.bot, [])
         self.assertEqual(wmod._watches, {})
 
+    async def test_barca_ii_does_not_start(self):
+        # 18 Nov 2026 incident: "Barcelona" matched Barcelona II
+        # and the auto-watch posted its panel in #general. The
+        # reserve team must never start the auto-watch.
+        b_team = {"onex_id": 772065621, "home": "Can Vidalet",
+                  "away": "Barcelona II",
+                  "league": "Spain. Copa Catalunya",
+                  "status": "1H", "home_score": 0, "away_score": 0}
+        with patch.object(wmod.prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [b_team],
+                                                      "detail": None})):
+            await wmod.on_tick(self.bot, [])
+        self.assertEqual(wmod._watches, {})
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_barca_atletic_does_not_start(self):
+        b_team = {"onex_id": 772065622, "home": "Barça Atlètic",
+                  "away": "Someone", "league": "Spain. Primera RFEF",
+                  "status": "2H", "home_score": 1, "away_score": 0}
+        with patch.object(wmod.prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [b_team],
+                                                      "detail": None})):
+            await wmod.on_tick(self.bot, [])
+        self.assertEqual(wmod._watches, {})
+
     async def test_check_throttled_to_thirty_seconds(self):
         self.games1x2 = _load("games1x2.json")
         prov._onex_reset_caches()
@@ -2510,6 +2535,122 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
                                                       "detail": None})) as spy:
             await wmod.on_tick(self.bot, [])
             spy.assert_not_called()
+
+
+class TestTeamNameMatching(unittest.TestCase):
+    """The reserve rule in normalizer: a bare base name never
+    matches a reserve side."""
+
+    def test_bare_barcelona_matches_main_only(self):
+        from normalizer import team_name_matches
+        self.assertTrue(team_name_matches("Barcelona", "FC Barcelona"))
+        self.assertTrue(team_name_matches("barca", "FC Barcelona"))
+        self.assertTrue(team_name_matches("FC Barcelona", "FC Barcelona"))
+        self.assertFalse(team_name_matches("Barcelona", "Barcelona II"))
+        self.assertFalse(team_name_matches("barcelona", "Barcelona B"))
+        self.assertFalse(team_name_matches("barcelona", "Barça Atlètic"))
+        self.assertFalse(team_name_matches("barcelona", "Barcelona U19"))
+
+    def test_reserve_team_matches_when_named(self):
+        from normalizer import team_name_matches
+        self.assertTrue(team_name_matches("Barcelona II", "Barcelona II"))
+        self.assertTrue(team_name_matches("Barcelona B", "Barcelona B"))
+        self.assertTrue(
+            team_name_matches("Barcelona Atletic", "Barça Atlètic"))
+
+    def test_senior_partial_match_still_works(self):
+        from normalizer import team_name_matches
+        self.assertTrue(team_name_matches("lumbini", "Lumbini Lions"))
+        self.assertTrue(team_name_matches("real madrid", "Real Madrid"))
+        # Castilla carries no reserve suffix, so it stays a plain
+        # partial match — the rule only covers suffixed sides.
+        self.assertTrue(team_name_matches("real madrid",
+                                          "Real Madrid Castilla"))
+
+    def test_search_hit_blocked(self):
+        from normalizer import search_hit_blocked_by_reserve_rule
+        self.assertTrue(search_hit_blocked_by_reserve_rule(
+            "Barcelona", "Can Vidalet", "Barcelona II"))
+        self.assertFalse(search_hit_blocked_by_reserve_rule(
+            "Barcelona II", "Can Vidalet", "Barcelona II"))
+        self.assertFalse(search_hit_blocked_by_reserve_rule(
+            "Real Madrid", "Can Vidalet", "Barcelona II"))
+
+
+class TestBarcaTeamMatching(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026: "Barcelona" matched Barcelona II and the
+    auto-watch posted its panel in #general. "Barcelona" means
+    the main FC Barcelona team only."""
+
+    MAIN_LIVE = {"id": "771800001", "home": "FC Barcelona",
+                 "away": "Real Madrid", "league": "Spain. LaLiga",
+                 "sport": "Football", "status": "2H"}
+    MAIN_UPCOMING = {"id": "771800002", "home": "FC Barcelona",
+                     "away": "Villarreal", "league": "Spain. LaLiga",
+                     "sport": "Football", "status": "upcoming"}
+    B_LIVE = {"id": "772065621", "home": "Can Vidalet",
+              "away": "Barcelona II", "league": "Spain. Copa Catalunya",
+              "sport": "Football", "status": "1H"}
+
+    def _grounding(self, entries):
+        return patch.object(
+            wmod.prov, "onex_grounding",
+            new=AsyncMock(return_value=list(entries)))
+
+    def _no_suggestions(self):
+        return patch.object(
+            wmod, "top_live_games",
+            new=AsyncMock(return_value=[]))
+
+    async def test_bare_barcelona_matches_main_team_only(self):
+        with self._grounding([self.MAIN_LIVE, self.B_LIVE]), \
+                self._no_suggestions():
+            out = await wmod.resolve_watch("Barcelona", None)
+        self.assertEqual(out["game_id"], "771800001")
+        self.assertEqual(out["source"], "name")
+
+    async def test_barca_alias_matches_main_team(self):
+        with self._grounding([self.MAIN_LIVE, self.B_LIVE]), \
+                self._no_suggestions():
+            out = await wmod.resolve_watch("barca", None)
+        self.assertEqual(out["game_id"], "771800001")
+
+    async def test_barcelona_ii_found_when_named(self):
+        with self._grounding([self.B_LIVE]), self._no_suggestions():
+            out = await wmod.resolve_watch("Barcelona II", None)
+        self.assertEqual(out["game_id"], "772065621")
+
+    async def test_main_not_live_is_not_live_not_b_team(self):
+        # Main team upcoming, B team live: no silent fallback.
+        with self._grounding([self.MAIN_UPCOMING, self.B_LIVE]), \
+                self._no_suggestions():
+            out = await wmod.resolve_watch("Barcelona", None)
+        self.assertIsNone(out["game_id"])
+        self.assertTrue(out["barca_not_live"])
+        self.assertEqual(out["candidates"], [])
+        self.assertEqual([g["id"] for g in out["reserve_games"]],
+                         ["772065621"])
+
+    async def test_ai_pick_of_b_team_rejected(self):
+        model = FakeModel('{"game_id": "772065621", "action": "follow", '
+                          '"detail": "simple", "note": "Barcelona"}')
+        with self._grounding([self.MAIN_UPCOMING, self.B_LIVE]), \
+                self._no_suggestions():
+            out = await wmod.resolve_watch("Barcelona", model)
+        self.assertIsNone(out["game_id"])
+        self.assertTrue(out["barca_not_live"])
+
+    def test_is_barcelona_rejects_reserve_sides(self):
+        import barcelona_reminder as barca
+        self.assertTrue(barca._is_barcelona(
+            {"home": "FC Barcelona", "away": "Real Madrid"}))
+        self.assertTrue(barca._is_barcelona(
+            {"home": "Villarreal", "away": "Barça"}))
+        for side in ("Barcelona II", "Barcelona B", "Barça Atlètic",
+                     "Barcelona U19", "FC Barcelona B"):
+            self.assertFalse(
+                barca._is_barcelona({"home": side, "away": "Someone"}),
+                side)
 
 
 class TestDetectEventsEngine(unittest.TestCase):

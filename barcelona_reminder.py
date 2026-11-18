@@ -10,6 +10,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import discord
 import maintenance
+from normalizer import (base_team_name, is_reserve_team,
+                        team_name_matches)
 from providers import free_fixtures_for_day
 
 log = logging.getLogger("barcelona_reminder")
@@ -68,8 +70,90 @@ def _kickoff(match: dict) -> datetime | None:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 def _is_barcelona(match: dict) -> bool:
-    teams = f"{match.get('home', '')} {match.get('away', '')}".lower()
-    return "barcelona" in teams and "barcelona b" not in teams
+    """True only for the main FC Barcelona team — never Barcelona II,
+    Barcelona B, Barça Atlètic or any youth/reserve side. The old
+    check only excluded "barcelona b", so "Barcelona" matched
+    Barcelona II and the auto-watch posted its panel in #general
+    (18 Nov 2026)."""
+    return any(team_name_matches("barcelona", str(match.get(k, "")))
+               for k in ("home", "away"))
+
+
+# Statuses that mean "live right now" in live-feed terms.
+_LIVE_STATUSES = ("1h", "2h", "et", "pen", "ht", "half-time",
+                  "live", "1st innings", "2nd innings")
+
+
+def reserve_games_for(live_games: list[dict]) -> list[dict]:
+    """Live games involving a Barcelona reserve side (Barcelona II,
+    Barcelona B, Barça Atlètic, ...). Used only to offer the
+    reserve game as a separate choice — never to pick it."""
+    out = []
+    for g in live_games or []:
+        if not isinstance(g, dict):
+            continue
+        if str(g.get("status") or "").lower() not in _LIVE_STATUSES:
+            continue
+        for side in (g.get("home", ""), g.get("away", "")):
+            if (is_reserve_team(side)
+                    and base_team_name(side) == "barcelona"):
+                out.append(g)
+                break
+    return out
+
+
+async def next_barca_fixture() -> dict | None:
+    """Barcelona's next fixture from the same provider path
+    /nextbarca uses (free fixtures, LaLiga league 140).
+    {"kickoff", "match"} or None when the provider has none —
+    never raises, never invents a fixture."""
+    now = datetime.now(NEPAL)
+    candidates = []
+    for offset in range(9):
+        day = (now.date() + timedelta(days=offset)).isoformat()
+        try:
+            fixtures = await free_fixtures_for_day(140, day)
+        except Exception as exc:
+            log.warning("[barcelona] fixture lookup failed (%s)",
+                        type(exc).__name__)
+            return None
+        for match in fixtures or []:
+            if not _is_barcelona(match):
+                continue
+            kickoff = _kickoff(match)
+            if kickoff and kickoff > now:
+                candidates.append((kickoff, match))
+    if not candidates:
+        return None
+    kickoff, match = min(candidates, key=lambda item: item[0])
+    return {"kickoff": kickoff, "match": match}
+
+
+def not_live_message(reserve_games: list[dict],
+                     fixture: dict | None) -> str:
+    """Plain 'FC Barcelona are not live right now' reply: the next
+    fixture when known, and the live Barcelona II game as a
+    separate offer — never silently picked."""
+    lines = ["FC Barcelona are not live right now."]
+    if fixture:
+        kickoff, match = fixture["kickoff"], fixture["match"]
+        local = kickoff.astimezone(NEPAL)
+        lines.append(
+            f"Next match: **{match.get('home', 'TBD')} vs "
+            f"{match.get('away', 'TBD')}** — "
+            f"{local.strftime('%a %d %b, %I:%M %p')} Nepal time.")
+    if reserve_games:
+        g = reserve_games[0]
+        score = ""
+        if (g.get("home_score") is not None
+                and g.get("away_score") is not None):
+            score = f" {g['home_score']}–{g['away_score']}"
+        lines.append(
+            f"Barcelona II are live right now "
+            f"({g.get('home', '?')} vs {g.get('away', '?')}{score}, "
+            f"{g.get('league', '')}) — say 'watch Barcelona II' "
+            f"if you want that one instead.")
+    return "\n".join(lines)
 
 def _send_at(kickoff: datetime) -> datetime:
     local = kickoff.astimezone(NEPAL)

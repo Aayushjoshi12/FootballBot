@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -25,7 +24,6 @@ from embeds import (
     match_embed, MatchView,
 )
 from providers import (
-    free_fixtures_for_day,
     sportsdb_live_matches,
     sofa_live_matches, apf_live, espn_live, onex_live_matches,
     onex_all_live_matches,
@@ -330,20 +328,11 @@ async def cmd_health(interaction: discord.Interaction):
 async def cmd_nextbarca(interaction: discord.Interaction):
     if not await _defer(interaction):
         return
-    now = datetime.now(barcelona_reminder.NEPAL)
-    candidates = []
-    for offset in range(9):
-        fixtures = await free_fixtures_for_day(140, (now.date() + timedelta(days=offset)).isoformat())
-        for match in fixtures:
-            if not barcelona_reminder._is_barcelona(match):
-                continue
-            kickoff = barcelona_reminder._kickoff(match)
-            if kickoff and kickoff > now:
-                candidates.append((kickoff, match))
-    if not candidates:
+    nxt = await barcelona_reminder.next_barca_fixture()
+    if nxt is None:
         await interaction.followup.send("No upcoming Barcelona fixture is available from the provider yet.")
         return
-    kickoff, match = min(candidates, key=lambda item: item[0])
+    kickoff, match = nxt["kickoff"], nxt["match"]
     local = kickoff.astimezone(barcelona_reminder.NEPAL)
     due = barcelona_reminder._send_at(kickoff)
     embed = discord.Embed(title="🔵🔴 Next Barcelona Match", color=0xA50044)
@@ -651,6 +640,30 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
         await _send_game_detail(interaction, result["detail"], detail)
         return
     games = result.get("games") or []
+    if watch.is_barca_query(query):
+        # "Barcelona" means the main team, live now. A live
+        # main-team game shows normally; anything else gets the
+        # plain not-live answer — never the Barcelona II game
+        # (18 Nov 2026: it posted a Barcelona II panel).
+        live_games = [g for g in games
+                      if str(g.get("status") or "").lower()
+                      in _LIVE_STATUSES]
+        if live_games:
+            games = live_games
+        else:
+            reserve = []
+            try:
+                reserve = (await onex_search("Barcelona II")).get("games") or []
+            except Exception:
+                reserve = []
+            fixture = None
+            try:
+                fixture = await barcelona_reminder.next_barca_fixture()
+            except Exception:
+                fixture = None
+            await interaction.followup.send(
+                barcelona_reminder.not_live_message(reserve, fixture))
+            return
     if len(games) == 1:
         try:
             again = await onex_search(str(games[0]["onex_id"]))
@@ -777,6 +790,19 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
                 "That game is not watched in this channel.", ephemeral=True)
         return
     if not resolved.get("game_id"):
+        if resolved.get("barca_not_live"):
+            # "Barcelona" means the main team, live now — the
+            # reserve team is never silently picked (18 Nov 2026).
+            fixture = None
+            try:
+                fixture = await barcelona_reminder.next_barca_fixture()
+            except Exception:
+                fixture = None
+            await interaction.followup.send(
+                barcelona_reminder.not_live_message(
+                    resolved.get("reserve_games") or [], fixture),
+                ephemeral=True)
+            return
         candidates = resolved.get("candidates") or []
         if candidates:
             await interaction.followup.send(

@@ -60,6 +60,8 @@ import channel_edits
 import db
 import history
 import maintenance
+from normalizer import (base_team_name, is_reserve_team,
+                        reserve_suffix, team_name_matches)
 import providers as prov
 
 log = logging.getLogger("watch")
@@ -733,6 +735,7 @@ Reply with STRICT JSON only — no other text, no markdown, no explanation:
 {"game_id": "<id from the list, or null>", "action": "follow|unfollow|detail|list", "detail": "simple|advanced", "channel_id": "<id from the channels list, or null>", "sport": "<sport name or null>", "note": "<one short line>"}
 Rules:
 - game_id MUST be one of the ids in the games list. If no game matches the request, use null.
+- A bare base name never means a reserve team: "Barcelona" means FC Barcelona only — never "Barcelona II", "Barcelona B" or "Barça Atlètic". A reserve team is only a match when the user names its suffix ("Barcelona II").
 - action is "follow" when the user wants alerts/updates for a game, "unfollow" when they want to stop following it, "detail" when they only want to see it now.
 - action is "list" when the user wants to browse/see the live games rather than follow one specific game (e.g. "show me a game", "what's live", "any game to test") — then game_id is null.
 - sport is the sport the user names when they want to browse games of one sport (e.g. "show me football games" -> "Football", "any cricket live?" -> "Cricket") — use only a sport name from the games list, or null when the user names none. Never invent a sport name.
@@ -824,16 +827,52 @@ def _norm(s: str) -> str:
 
 
 def _match_entries(text: str, grounding: list[dict]) -> list[dict]:
-    """Grounding entries whose home/away/league contains the text."""
+    """Grounding entries whose home/away/league contains the text.
+    A bare base name never matches a reserve side ("Barcelona"
+    does not match "Barcelona II") — see normalizer."""
     needle = _norm(text)
     if not needle:
         return []
     out = []
     for g in grounding:
-        hay = _norm(f"{g['home']} {g['away']} {g['league']}")
-        if needle in hay:
+        if (team_name_matches(text, g["home"])
+                or team_name_matches(text, g["away"])
+                or needle in _norm(g["league"])):
             out.append(g)
     return out
+
+
+def is_barca_query(text: str) -> bool:
+    """Free text asking for the main Barcelona team — the word
+    "barcelona"/"barca" with no reserve suffix named."""
+    from normalizer import canonical_team_name
+    return ("barcelona" in canonical_team_name(text).split()
+            and reserve_suffix(text) is None)
+
+
+def _is_barca_reserve_game(entry: dict) -> bool:
+    """A game involving a Barcelona reserve side."""
+    for side in (entry.get("home", ""), entry.get("away", "")):
+        if (is_reserve_team(side)
+                and base_team_name(side) == "barcelona"):
+            return True
+    return False
+
+
+def _is_reserve_mismatch(text: str, entry: dict) -> bool:
+    """True when a resolved game is a reserve side but the user's
+    words name only the base team — e.g. the AI picking
+    "Barcelona II" for "Barcelona". (18 Nov 2026: that exact
+    pick posted a Barcelona II panel in #general.)"""
+    from normalizer import canonical_team_name
+    q = canonical_team_name(text)
+    for side in (entry.get("home", ""), entry.get("away", "")):
+        if is_reserve_team(side):
+            base = base_team_name(side)
+            if (base and base in q
+                    and reserve_suffix(q) != reserve_suffix(side)):
+                return True
+    return False
 
 
 # Words that pick the detail level without the AI — checked
@@ -1042,7 +1081,7 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
 
     def _out(game_id, action, detail, candidates, entry, source,
              channel=None, note="", games=None, suggestions=None,
-             sport=None):
+             sport=None, barca_not_live=False, reserve_games=None):
         channel = channel if channel is not None else word_channel
         return {"game_id": game_id, "action": action, "detail": detail,
                 "candidates": candidates, "entry": entry, "source": source,
@@ -1050,13 +1089,25 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
                 "channel_id": (str(channel["id"]) if channel else None),
                 "channel_named": channel_named,
                 "games": games or [], "suggestions": suggestions or [],
-                "sport": sport}
+                "sport": sport, "barca_not_live": barca_not_live,
+                "reserve_games": reserve_games or []}
 
     if not q:
         return _out(None, "follow", words_detail, [], None, "none")
     if q.isdigit() and len(q) >= 5:
         return _out(q, "follow", words_detail, [], None, "id")
     grounding = await prov.onex_grounding()
+    # "Barcelona" means the main team, live now. An upcoming
+    # fixture is not a match — the caller says the team is not
+    # live (with its next fixture) instead — and the reserve team
+    # is never a match (18 Nov 2026: Barcelona II panel in
+    # #general). Other teams keep the old behaviour: an upcoming
+    # fixture can still be followed.
+    barca_query = is_barca_query(q)
+    if barca_query:
+        grounding = [g for g in grounding
+                     if str(g.get("status") or "").lower()
+                     in _BARCA_LIVE_STATUSES]
     exact = [g for g in grounding
              if _norm(g["home"]) == _norm(q) or _norm(g["away"]) == _norm(q)]
     if len(exact) == 1:
@@ -1067,6 +1118,17 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
         return _out(str(matches[0]["id"]), "follow", words_detail, [],
                     matches[0], "name")
     ai = await parse_watch_ai(q, grounding, model, channels)
+    if ai and ai.get("game_id"):
+        # The AI may still pick a reserve side from the list — a
+        # bare base name never means it, so reject that pick and
+        # fall through to the not-live answer instead.
+        entry = next((g for g in grounding
+                      if str(g["id"]) == str(ai["game_id"])), None)
+        if entry is not None and _is_reserve_mismatch(q, entry):
+            log.warning("[watch] AI picked a reserve team (%s vs %s) "
+                        "for a bare base name — ignoring it",
+                        entry.get("home"), entry.get("away"))
+            ai = None
     if ai and ai.get("action") == "list":
         # The AI's sport wins; the words back it up when the
         # model did not name one — "show any football game"
@@ -1095,8 +1157,16 @@ async def resolve_watch(text: str, model, channels: list[dict] | None = None) ->
                     games=top, sport=sport)
     sport = _sport_from_words(q)
     suggestions = await top_live_games(sport=sport)
+    # A Barcelona query with no live main-team game: the caller
+    # answers "not live" (with the next fixture) and offers the
+    # live reserve game as a separate choice — it is never
+    # silently picked.
+    reserve_games = ([g for g in grounding if _is_barca_reserve_game(g)]
+                     if barca_query else [])
     return _out(None, "follow", words_detail, matches[:5], None, "none",
-                suggestions=suggestions, sport=sport)
+                suggestions=suggestions, sport=sport,
+                barca_not_live=barca_query,
+                reserve_games=reserve_games)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1232,19 +1302,20 @@ async def maybe_team_follow_check() -> None:
         try:
             channel_id = int(follow["channel_id"])
             team_name = str(follow.get("team_name") or "")
-            team_norm = str(follow.get("team_norm") or "")
             if not team_name or not channel_id:
                 continue
             already = any(
                 cid == channel_id
-                and _norm(team_norm) in _norm(f"{w.get('home', '')} {w.get('away', '')}")
+                and (team_name_matches(team_name, w.get("home", ""))
+                     or team_name_matches(team_name, w.get("away", "")))
                 for (cid, _gid), w in _watches.items())
             if already:
                 continue
             result = await prov.onex_search(team_name)
             live = [g for g in (result or {}).get("games") or []
                     if str(g.get("status") or "").lower() in _BARCA_LIVE_STATUSES
-                    and _norm(team_norm) in _norm(f"{g.get('home', '')} {g.get('away', '')}")]
+                    and (team_name_matches(team_name, g.get("home", ""))
+                         or team_name_matches(team_name, g.get("away", "")))]
             if not live:
                 continue
             game = live[0]

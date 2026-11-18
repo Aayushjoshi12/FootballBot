@@ -17,6 +17,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -326,6 +327,55 @@ class TestPublicFunctions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out[0]["home"], "Lumbini Lions")
         self.assertTrue(all(m["league"] == "Nepal Premier League"
                             for m in out))
+
+
+class TestOnexSearchBarca(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026: onex_search("Barcelona") returned the live
+    Barcelona II game, and the auto-watch posted its panel in
+    #general. A bare base name never matches a reserve side."""
+
+    BARCA_II_RAW = {
+        "id": 772065621, "mainGameId": 772065621,
+        "liga": {"id": 1, "name": "Spain. Copa Catalunya"},
+        "opponent1": {"fullName": "Can Vidalet"},
+        "opponent2": {"fullName": "Barcelona II"},
+        "startTs": 1795000000,
+        "scores": {"scoreOpp1": 0, "scoreOpp2": 0,
+                   "timer": {"timeSec": 2400},
+                   "currentPeriod": 1, "currentPeriodName": "1st half"},
+        "sport": {"id": 1, "name": "Football"},
+    }
+
+    def _stubs(self):
+        return (
+            patch.object(prov, "onex_live_raw",
+                         new=AsyncMock(return_value=[self.BARCA_II_RAW])),
+            patch.object(prov, "onex_npl_fixtures",
+                         new=AsyncMock(return_value=[])),
+            patch.object(prov, "onex_uefa_fixtures",
+                         new=AsyncMock(return_value=[])),
+        )
+
+    async def test_barcelona_search_skips_barcelona_ii(self):
+        a, b, c = self._stubs()
+        with a, b, c:
+            out = await prov.onex_search("Barcelona")
+        self.assertEqual(out["games"], [])
+        self.assertIsNone(out["detail"])
+
+    async def test_barcelona_ii_search_finds_it(self):
+        a, b, c = self._stubs()
+        with a, b, c:
+            out = await prov.onex_search("Barcelona II")
+        self.assertEqual(len(out["games"]), 1)
+        self.assertEqual(out["games"][0]["away"], "Barcelona II")
+        self.assertEqual(out["games"][0]["onex_id"], 772065621)
+
+    async def test_barca_search_skips_barcelona_ii(self):
+        a, b, c = self._stubs()
+        with a, b, c:
+            out = await prov.onex_search("barca")
+        self.assertEqual(out["games"], [])
 
 
 if __name__ == "__main__":

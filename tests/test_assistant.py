@@ -388,6 +388,75 @@ class TestValidate(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(out["ok"], out)
 
 
+class TestBarcaTeamMatching(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026: "Barcelona" matched Barcelona II and the
+    auto-watch posted its panel in #general. "Barcelona" means
+    the main FC Barcelona team only."""
+
+    MAIN = {"onex_id": "771800001", "home": "FC Barcelona",
+            "away": "Real Madrid", "league": "Spain. LaLiga",
+            "sport": "Football", "status": "2H",
+            "home_score": 1, "away_score": 0}
+    B_TEAM = {"onex_id": "772065621", "home": "Can Vidalet",
+              "away": "Barcelona II", "league": "Spain. Copa Catalunya",
+              "sport": "Football", "status": "1H",
+              "home_score": 0, "away_score": 0}
+
+    def test_match_team_barcelona_is_main_only(self):
+        live = [self.MAIN, self.B_TEAM]
+        self.assertEqual(amod._match_team("barcelona", live),
+                         [self.MAIN])
+        self.assertEqual(amod._match_team("barca", live), [self.MAIN])
+
+    def test_match_team_barcelona_ii_when_named(self):
+        live = [self.MAIN, self.B_TEAM]
+        self.assertEqual(amod._match_team("Barcelona II", live),
+                         [self.B_TEAM])
+
+    async def test_validate_barcelona_with_only_b_live_passes_unresolved(self):
+        # No main-team match: validation passes it through (never
+        # resolves the B team) so the handler can say plainly the
+        # main team is not live.
+        out = await amod.validate_intent(
+            _parsed("MATCH_DETAILS", team="barcelona"), [self.B_TEAM],
+            CHANNELS)
+        self.assertTrue(out["ok"], out)
+        self.assertIsNone(out["game_id"])
+
+    async def test_validate_barcelona_ii_resolves(self):
+        out = await amod.validate_intent(
+            _parsed("MATCH_DETAILS", team="Barcelona II"),
+            [self.MAIN, self.B_TEAM], CHANNELS)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["game_id"], "772065621")
+
+    async def test_barca_not_live_reply_offers_b_team(self):
+        from datetime import datetime, timezone
+        fixture = {"kickoff": datetime(2026, 11, 22, 13, 0,
+                                       tzinfo=timezone.utc),
+                   "match": {"home": "FC Barcelona",
+                             "away": "Villarreal"}}
+        with patch.object(amod, "_next_barca_fixture",
+                          new=AsyncMock(return_value=fixture)):
+            text = await amod._barca_not_live_reply([self.B_TEAM])
+        self.assertIn("not live right now", text)
+        self.assertIn("Villarreal", text)
+        self.assertIn("Barcelona II are live", text)
+        self.assertIn("watch Barcelona II", text)
+
+    async def test_barca_not_live_reply_without_fixture_or_b_team(self):
+        with patch.object(amod, "_next_barca_fixture",
+                          new=AsyncMock(return_value=None)):
+            text = await amod._barca_not_live_reply([])
+        self.assertEqual(text, "FC Barcelona are not live right now.")
+
+    def test_reserve_games_for(self):
+        import barcelona_reminder as barca
+        upcoming_b = dict(self.B_TEAM, status="upcoming")
+        self.assertEqual(barca.reserve_games_for(
+            [self.MAIN, self.B_TEAM, upcoming_b]), [self.B_TEAM])
+
+
 class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._orig_get = prov.hc.get
@@ -885,8 +954,13 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         fixture = {"home": "FC Barcelona", "away": "Villarreal",
                    "kickoff": kickoff.isoformat()}
         interaction = FakeInteraction()
-        with patch.object(amod, "datetime", _FrozenDatetime), \
-                patch.object(prov, "free_fixtures_for_day",
+        # The fixture lookup now lives in barcelona_reminder
+        # (shared with /nextbarca and the not-live reply), so the
+        # frozen clock and the stubbed provider are patched there.
+        with patch.object(amod.barcelona_reminder, "datetime",
+                          _FrozenDatetime), \
+                patch.object(amod.barcelona_reminder,
+                             "free_fixtures_for_day",
                              new=AsyncMock(return_value=[fixture])):
             await amod.handle_ask(interaction,
                                   "when do Barcelona play next?",

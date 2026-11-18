@@ -25,7 +25,7 @@ from config import (
     APIFOOTBALL_API_KEY, CURRENT_SEASON, LEAGUE_MAP, LEAGUE_MAP_INV,
     TRACKED_LEAGUES, SPORTSDB_LEAGUE_MAP, ONEXBET_BASE_URL,
 )
-from normalizer import normalize
+from normalizer import normalize, search_hit_blocked_by_reserve_rule
 
 log = logging.getLogger("providers")
 
@@ -1760,6 +1760,12 @@ async def onex_search(query: str) -> dict:
         hay = " ".join([m.get("home") or "", m.get("away") or "",
                         m.get("league") or ""])
         if needle not in normalize(hay):
+            return
+        # A bare base name never matches a reserve side: searching
+        # "Barcelona" must not return a Barcelona II game (18 Nov
+        # 2026: that exact hit posted its panel in #general).
+        if search_hit_blocked_by_reserve_rule(
+                q, m.get("home") or "", m.get("away") or ""):
             return
         if any(x["onex_id"] == m["onex_id"] for x in out):
             return

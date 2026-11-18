@@ -901,5 +901,145 @@ class TestHandleAsk(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Rayo", text)
 
 
+class FakeChannel:
+    """A channel the bot can send a normal visible message to —
+    the last-resort /ask reply path when the token is dead."""
+
+    def __init__(self):
+        self.sent: list[str] = []
+        self.sent_views: list = []
+
+    async def send(self, content=None, view=None, **kwargs):
+        self.sent.append(content)
+        self.sent_views.append(view)
+        return SimpleNamespace(id=9999)
+
+
+class FailingDeferResponse(FakeResponse):
+    """response.defer that fails the way Discord did on 18 Nov
+    2026 ~22:44 NPT (three REST timeouts, then the token was
+    discarded)."""
+
+    async def defer(self, ephemeral=False, thinking=False, **kwargs):
+        raise RuntimeError("patch transport failed (TimeoutError)")
+
+
+class ExplodingFollowup(FakeFollowup):
+    """followup.send that fails loudly if anything calls it —
+    proves the dead-token path never attempts a followup."""
+
+    async def send(self, content=None, ephemeral=False, view=None,
+                   **kwargs):
+        raise AssertionError("followup must not be used on a dead token")
+
+
+class DeadTokenInteraction(FakeInteraction):
+    """An /ask interaction whose defer failed: the token is
+    dead, the channel is the only way to answer."""
+
+    def __init__(self, channel_id=777):
+        super().__init__(channel_id=channel_id)
+        self.response = FailingDeferResponse()
+        self.followup = ExplodingFollowup()
+        self.channel = FakeChannel()
+
+
+class DyingFollowup(FakeFollowup):
+    """followup.send that fails like production did (Unknown
+    Webhook 10015 — the token died after the defer)."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    async def send(self, content=None, ephemeral=False, view=None,
+                   **kwargs):
+        self.attempts += 1
+        raise RuntimeError("Unknown Webhook (10015)")
+
+
+class DyingFollowupInteraction(FakeInteraction):
+    """Defer succeeds, but every followup is rejected."""
+
+    def __init__(self, channel_id=777):
+        super().__init__(channel_id=channel_id)
+        self.followup = DyingFollowup()
+        self.channel = FakeChannel()
+
+
+class TestAskDeferFailure(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026 ~22:44 NPT: /ask and /help both failed with
+    'application did not respond' after three Discord REST
+    timeouts. The bot never crashed — the tokens were discarded
+    before the replies arrived. A failed defer must be logged,
+    and the answer must still reach the user as a channel
+    message instead of being lost."""
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.gameinfo = {
+            "771747666": _load("gameinfo_771747666.json"),
+            "771747795": _load("gameinfo_alias.json"),
+        }
+        prov.hc.get = StubHttp(self).get
+        prov._onex_reset_caches()
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".assistant-test-tmp"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        prov._onex_reset_caches()
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+
+    async def test_failing_defer_logs_and_uses_channel(self):
+        interaction = DeadTokenInteraction()
+        with self.assertLogs("assistant", level="WARNING") as logs:
+            await amod.handle_ask(interaction, "what games are live",
+                                  NeverCallModel(), CHANNELS)
+        self.assertTrue(any("defer failed" in line for line in logs.output),
+                        logs.output)
+        # followup was never attempted on the dead token…
+        self.assertEqual(interaction.followup.sent, [])
+        # …and the answer still reached the channel, visibly.
+        self.assertEqual(len(interaction.channel.sent), 1)
+        self.assertIn("Gambia", interaction.channel.sent[0])
+
+    async def test_followup_failure_falls_back_to_channel(self):
+        interaction = DyingFollowupInteraction()
+        with self.assertLogs("assistant", level="WARNING") as logs:
+            await amod.handle_ask(interaction, "help", None, CHANNELS)
+        self.assertTrue(any("followup failed" in line
+                            for line in logs.output), logs.output)
+        self.assertEqual(interaction.followup.attempts, 1)
+        self.assertEqual(len(interaction.channel.sent), 1)
+        self.assertIn("Here's what you can ask me",
+                      interaction.channel.sent[0])
+
+    async def test_defer_failure_error_path_uses_channel(self):
+        # Even when the handler itself blows up, a dead token
+        # must not swallow the error reply.
+        interaction = DeadTokenInteraction()
+        with patch.object(amod, "_handle_ask",
+                          new=AsyncMock(
+                              side_effect=RuntimeError("boom"))):
+            await amod.handle_ask(interaction, "help", None, CHANNELS)
+        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(interaction.channel.sent,
+                         ["Something went wrong — please try again."])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -795,8 +795,10 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
 class FakeResponse:
     def __init__(self):
         self.sent: list[str] = []
+        self.defer_calls: list[tuple] = []
 
     async def defer(self, ephemeral=False, thinking=False, **kwargs):
+        self.defer_calls.append((ephemeral, thinking))
         return None
 
     async def send_message(self, content=None, ephemeral=False,
@@ -2860,10 +2862,14 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(interaction.edited, [])
         self.assertEqual(len(msg.edits), 0)
         self.assertEqual(msg.content, body)
-        # The tap never edits the panel message — but the
-        # panel's stored view switches to the tapped one.
+        # The tap never edits the old panel message — but the
+        # panel MOVES to the new message (18 Nov 2026: the
+        # tap's own message was a dead copy while the tick kept
+        # editing the old panel elsewhere) and switches view.
         self.assertEqual(watch["panel_kind"], "detail")
-        self.assertEqual(watch["panel_body"], body)
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(watch["panel_body"],
+                         interaction.followup.sent[0])
 
     async def test_timeline_lists_events(self):
         view = self._view()
@@ -4387,7 +4393,10 @@ class TestWatchingAndUnwatch(unittest.IsolatedAsyncioTestCase):
                            panel_kind="compact")
         interaction = FakeInteraction(channel_id=777)
         await botmod.cmd_watching.callback(interaction)
-        text = interaction.response.sent[0]
+        # 18 Nov 2026: /watching defers first, so the text now
+        # arrives via followup, not response.send_message.
+        self.assertEqual(interaction.response.defer_calls, [(True, True)])
+        text = interaction.followup.sent[0]
         # Header: 2 live games refreshing, each about every 2s.
         self.assertIn("2 games refreshing in this channel", text)
         self.assertIn("each about every 2s", text)
@@ -4410,7 +4419,8 @@ class TestWatchingAndUnwatch(unittest.IsolatedAsyncioTestCase):
         await self._add_row(0, "771747666", notify=True)
         interaction = FakeInteraction(channel_id=777)
         await botmod.cmd_watching.callback(interaction)
-        text = interaction.response.sent[0]
+        self.assertEqual(interaction.response.defer_calls, [(True, True)])
+        text = interaction.followup.sent[0]
         self.assertIn("1 game refreshing in this channel", text)
         self.assertIn("every second", text)
 
@@ -5212,8 +5222,10 @@ class TestWatchingButton(unittest.IsolatedAsyncioTestCase):
         await botmod.cmd_watching.callback(cmd)
         # Same helper, same text — the button and the command
         # can never drift apart (the button's message is
-        # visible, the command's reply stays ephemeral).
-        self.assertEqual(interaction.followup.sent, cmd.response.sent)
+        # visible, the command's reply stays ephemeral). Both
+        # now arrive via followup: the button's, and the
+        # command's after its defer.
+        self.assertEqual(interaction.followup.sent, cmd.followup.sent)
 
     async def test_watching_button_with_nothing_watched(self):
         view = wmod.WatchAlertView(live_count=0)
@@ -5309,7 +5321,7 @@ class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
         }
         return msg, body
 
-    async def test_detail_tap_sends_new_message_panel_untouched(self):
+    async def test_detail_tap_sends_new_message_panel_moves_to_it(self):
         msg, body = self._seed_panel()
         view = self._view()
         interaction = self._interaction("watch:detail")
@@ -5322,12 +5334,16 @@ class TestNewMessageButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msg.edits), 0)
         self.assertEqual(msg.content, body)
         watch = wmod._watches[(777, "771747666")]
-        # The tap never edits the panel message — but its
-        # stored view switches to the tapped one (18 Nov 2026:
-        # "Advanced stops the refresh"), so the next tick
-        # renders the panel in detail view.
+        # The tap never edits the OLD panel message — but the
+        # panel MOVES to the new message (18 Nov 2026, proven
+        # live: the tap's own message was a dead copy while the
+        # tick kept editing the old panel elsewhere), in detail
+        # view, so the next tick refreshes the message in front
+        # of the user.
         self.assertEqual(watch["panel_kind"], "detail")
-        self.assertEqual(watch["panel_body"], body)
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(watch["panel_body"],
+                         interaction.followup.sent[0])
 
     async def test_live_tap_sends_new_compact_message(self):
         msg, body = self._seed_panel(kind="detail")
@@ -5503,10 +5519,16 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
     """18 Nov 2026 — "Advanced stops the refresh": tapping
     Advanced sent a one-off analytics snapshot that never
     ticks, while the live panel kept its OLD view, so the user
-    stared at a frozen card. A view tap must ALSO switch the
-    live panel to the tapped view and re-assert its worker, so
-    the panel keeps refreshing in the view the user asked for.
-    The tap itself never edits the panel message."""
+    stared at a frozen card. The aadf03dd repair (tap switches
+    the panel's stored view) was not enough — proven live at
+    22:57 NPT, the panel DID switch view and kept ticking at
+    45–52 edits/min, but on its OLD message, while the user
+    kept looking at the tap's new message. So the panel MOVES:
+    the message a view tap sends BECOMES the live panel — the
+    tick edits THAT message from then on, in the tapped view,
+    and the old panel message is left frozen, never edited
+    again. A second tap moves the panel again. The tap itself
+    never edits any message in place."""
 
     def setUp(self):
         self._orig_db = db._DB
@@ -5576,6 +5598,23 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
         interaction.client = self.bot
         return interaction
 
+    def _register_followup_panel(self, interaction):
+        """The followup message the tap just sent, registered
+        in the fake channel so the tick's worker can fetch and
+        edit it — in production the message exists in the
+        channel by construction. FakeFollowup ids start at
+        4001 and increment per send on that interaction."""
+        new_id = 4000 + len(interaction.followup.sent)
+        msg = FakeMessage(new_id, interaction.followup.sent[-1])
+        self.channel.messages[new_id] = msg
+        return msg
+
+    async def _goal_tick(self):
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        await _drain_panel_workers()
+
     async def test_advanced_tap_switches_panel_and_it_keeps_ticking(self):
         msg, body = self._seed_panel(kind="compact")
         view = wmod.WatchAlertView()
@@ -5586,35 +5625,57 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(interaction.followup.sent), 1)
         self.assertEqual(interaction.followup.ephemeral_flags, [False])
         self.assertIn("Match statistics", interaction.followup.sent[0])
-        # ...the tap itself never edits the panel message...
+        # ...the tap itself never edits the OLD panel message...
         self.assertEqual(msg.content, body)
         self.assertEqual(len(msg.edits), 0)
-        # ...but the panel's stored view switches to analytics
-        # and its worker is re-asserted on the spot.
+        # ...but the panel MOVES to the new message, in the
+        # analytics view, and its worker is re-asserted.
         watch = wmod._watches[(777, "771747666")]
         self.assertEqual(watch["panel_kind"], "analytics")
+        self.assertEqual(watch["panel_message_id"], 4001)
         self.assertIn((777, "771747666"), wmod._panel_workers)
-        # The re-asserted worker edits the panel to the new
-        # view — the panel now IS the analytics card.
-        await _drain_panel_workers()
-        self.assertEqual(len(msg.edits), 1)
-        self.assertIn("Match statistics", msg.content)
-        # ...and the NEXT tick still refreshes it: a goal lands
-        # on the panel, in the analytics view, instead of the
-        # panel going quiet after the tap.
-        changed = json.loads(json.dumps(self.games1x2[0]))
-        changed["scores"]["scoreOpp1"] = 1
-        await wmod.on_tick(self.bot, [changed])
-        await _drain_panel_workers()
-        self.assertEqual(len(msg.edits), 2)
-        self.assertIn("1 – 1", msg.content)
-        self.assertIn("Match statistics", msg.content)
+        # ...and the NEXT tick refreshes THAT message, not the
+        # old one: a goal lands on the new panel, in the
+        # analytics view, instead of the panel going quiet.
+        new_msg = self._register_followup_panel(interaction)
+        await self._goal_tick()
+        self.assertGreaterEqual(len(new_msg.edits), 1)
+        self.assertIn("1 – 1", new_msg.content)
+        self.assertIn("Match statistics", new_msg.content)
+        self.assertEqual(len(msg.edits), 0)
+        self.assertEqual(msg.content, body)
         self.assertIn((777, "771747666"), wmod._watches)
+
+    async def test_second_tap_moves_panel_again(self):
+        # Tap Advanced, then tap Live on the new panel: the
+        # panel moves a second time, to the newest message,
+        # and the tick follows it there.
+        msg, body = self._seed_panel(kind="compact")
+        view = wmod.WatchAlertView()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(self.detail):
+            await view.children[5].callback(interaction)
+        first_msg = self._register_followup_panel(interaction)
+        self.assertEqual(
+            wmod._watches[(777, "771747666")]["panel_message_id"], 4001)
+        with self._mock_search(self.detail):
+            await view.children[1].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 2)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "compact")
+        self.assertEqual(watch["panel_message_id"], 4002)
+        second_msg = self._register_followup_panel(interaction)
+        await self._goal_tick()
+        self.assertGreaterEqual(len(second_msg.edits), 1)
+        self.assertIn("1 – 1", second_msg.content)
+        self.assertEqual(len(first_msg.edits), 0)
+        self.assertEqual(len(msg.edits), 0)
 
     async def test_advanced_tap_on_stale_message_repairs_real_panel(self):
         # The tap lands on an old alert, not the live panel:
-        # the real panel must still switch to analytics and
-        # keep ticking — the stale message is never adopted.
+        # the panel still moves to the tap's new message and
+        # switches to analytics — the stale message is never
+        # adopted, and the old panel is never edited again.
         msg, body = self._seed_panel(kind="compact")
         alert = ("⚽ **GOAL** — Republic of the Gambia 1–1 Ivory Coast "
                  "(67')\nGame ID: 771747666")
@@ -5623,13 +5684,16 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
         with self._mock_search(self.detail):
             await view.children[5].callback(interaction)
         self.assertEqual(len(interaction.followup.sent), 1)
-        self.assertEqual(
-            wmod._watches[(777, "771747666")]["panel_kind"], "analytics")
-        self.assertEqual(
-            wmod._watches[(777, "771747666")]["panel_message_id"], 2001)
-        await _drain_panel_workers()
-        self.assertEqual(len(msg.edits), 1)
-        self.assertIn("Match statistics", msg.content)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "analytics")
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(len(msg.edits), 0)
+        new_msg = self._register_followup_panel(interaction)
+        await self._goal_tick()
+        self.assertGreaterEqual(len(new_msg.edits), 1)
+        self.assertIn("Match statistics", new_msg.content)
+        self.assertIn("1 – 1", new_msg.content)
+        self.assertEqual(len(msg.edits), 0)
 
     async def test_detail_tap_switches_panel_view_simple_too(self):
         msg, body = self._seed_panel(kind="compact")
@@ -5640,9 +5704,14 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
         watch = wmod._watches[(777, "771747666")]
         self.assertEqual(watch["panel_kind"], "detail")
         self.assertEqual(watch["detail"], wmod.DETAIL_ADVANCED)
-        await _drain_panel_workers()
-        self.assertEqual(len(msg.edits), 1)
-        self.assertIn("Match stats", msg.content)
+        # The panel moved to the detail card the tap sent.
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertIn("Match stats", interaction.followup.sent[0])
+        new_msg = self._register_followup_panel(interaction)
+        await self._goal_tick()
+        self.assertGreaterEqual(len(new_msg.edits), 1)
+        self.assertIn("1 – 1", new_msg.content)
+        self.assertEqual(len(msg.edits), 0)
 
     async def test_refresh_tap_reasserts_worker_without_switching_view(self):
         msg, body = self._seed_panel(kind="detail")
@@ -5651,11 +5720,18 @@ class TestTapRepairsPanel(unittest.IsolatedAsyncioTestCase):
         with self._mock_search(self.detail):
             await view.children[2].callback(interaction)
         # Refresh switches nothing — the panel keeps its view —
-        # but the worker is re-asserted, so a stalled panel
-        # gets its next edit.
-        self.assertEqual(
-            wmod._watches[(777, "771747666")]["panel_kind"], "detail")
+        # but it still MOVES to the fresh message, and the
+        # worker is re-asserted, so a stalled panel gets its
+        # next edit on the message in front of the user.
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch["panel_kind"], "detail")
+        self.assertEqual(watch["panel_message_id"], 4001)
         self.assertIn((777, "771747666"), wmod._panel_workers)
+        new_msg = self._register_followup_panel(interaction)
+        await self._goal_tick()
+        self.assertGreaterEqual(len(new_msg.edits), 1)
+        self.assertIn("1 – 1", new_msg.content)
+        self.assertEqual(len(msg.edits), 0)
 
     async def test_tap_with_no_live_panel_just_sends_snapshot(self):
         # An /ask detail reply with no watch behind it: the tap

@@ -60,7 +60,22 @@ class GroqModel:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise GroqError(f"Groq HTTP {exc.code}") from exc
+            # Log the status + a short slice of the server's error
+            # body so a 429 / 400 is diagnosable from the journal
+            # (18 Nov 2026: Groq failed at the same moment as a
+            # Discord timeout and left only "GroqError" behind).
+            # The body is the server's error JSON — it cannot
+            # contain the API key, which only ever travels in the
+            # request header. Truncated so a long body can't flood
+            # the log.
+            try:
+                detail = exc.read().decode("utf-8", "replace").strip()[:200]
+            except Exception:
+                detail = ""
+            if not detail:
+                detail = str(getattr(exc, "msg", "") or "")
+            log.warning("[ai] Groq HTTP %s: %s", exc.code, detail)
+            raise GroqError(f"Groq HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError,
                 json.JSONDecodeError) as exc:
             raise GroqError(
@@ -92,18 +107,38 @@ class ChainedModel:
         try:
             resp = self.primary.generate_content(prompt)
         except Exception as exc:
+            # Log the failure itself, not just its type: the
+            # GroqError message now carries the HTTP status + a
+            # short error body, which is what diagnoses a 429.
+            # Groq is called exactly once per request — no retry
+            # here, the fallback is the only second chance.
             log.warning("[ai] %s failed (%s) — trying %s",
-                        self.primary_name, type(exc).__name__,
+                        self.primary_name,
+                        _short_error(exc),
                         self.fallback_name or "nothing")
             if self.fallback is None:
+                log.error("[ai] both providers failed (%s; no "
+                          "fallback configured)", _short_error(exc))
                 raise
-            resp = self.fallback.generate_content(prompt)
+            try:
+                resp = self.fallback.generate_content(prompt)
+            except Exception as fb_exc:
+                log.error("[ai] both providers failed (%s then %s)",
+                          _short_error(exc), _short_error(fb_exc))
+                raise
             self.provider = self.fallback_name
             log.info("[ai] fell back to %s", self.fallback_name)
             return resp
         self.provider = self.primary_name
         log.info("[ai] answered by %s", self.primary_name)
         return resp
+
+
+def _short_error(exc: Exception) -> str:
+    """One short log-safe line for an exception: its message
+    truncated, or its type name when it has no message."""
+    text = str(exc).strip()
+    return (text[:200] if text else type(exc).__name__)
 
 
 def build_ai_model():

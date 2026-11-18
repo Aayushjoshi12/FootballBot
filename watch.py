@@ -24,10 +24,11 @@ heartbeat-edits the footer alone every second, so a cricket
 panel whose score has not moved for an over still shows life —
 the panel edits once a second, like the ticking clock on the
 site. Detail / Live / Simple / Advanced / Refresh send the
-requested view as a NEW channel message — a tap never edits
-the live panel in place (the old in-place tap edit gave no
-visible feedback on the tapped message and could switch a
-panel elsewhere; see _switch_panel_view). Timeline, Follow, Unfollow
+requested view as a NEW channel message — and that message
+BECOMES the live panel: the tick edits it from then on, in
+the tapped view, while the old panel message is left frozen
+(the tap itself never edits any message in place; see
+_switch_panel_view). Timeline, Follow, Unfollow
 and the 👀 Watching list likewise send new channel messages;
 Watching also carries one ❌ Remove button per watched game.
 
@@ -1448,16 +1449,14 @@ async def adopt_game_panel(channel_id: int, game_id: str,
                            detail: dict, level: str,
                            kind: str = "detail") -> dict:
     """Adopt a detail-card or compact-panel message as the live
-    panel — kept as a utility, but NO LONGER CALLED BY BUTTON
-    TAPS: since the new-message change (18 Nov 2026) taps send
-    a fresh message and never adopt anything (see
-    _switch_panel_view for why: taps on stale messages
-    silently switched the real panel elsewhere with no
-    feedback on the tapped message). The tapped message
-    becomes THE panel; any older panel message for the game
-    stops ticking (it stays as it is, frozen). Returns the
-    watch entry. The db writes are best effort: the in-memory
-    entry is what the tick uses, so a call never fails because
+    panel — called by view taps (see _switch_panel_view):
+    the message a tap just sent BECOMES the panel, so the
+    tick edits it from then on. Any older panel message for
+    the game stops ticking (it stays as it is, frozen). The
+    watch's alerts flag, snapshot and clock anchor are kept,
+    so the refresh continues without a gap. Returns the watch
+    entry. The db writes are best effort: the in-memory entry
+    is what the tick uses, so a call never fails because
     sqlite hiccuped."""
     game_id = str(game_id)
     snapshot = snapshot_from_detail(detail)
@@ -2178,11 +2177,27 @@ async def _switch_panel_view(interaction: discord.Interaction,
     design, which is one more reason it is gone; it just was
     not what happened here.)
 
-    - The live panel is never touched: its kind, detail level
-      and message id stay exactly as they are, and the tick
-      keeps editing it. The new message is a one-off snapshot —
-      it is never adopted as the panel and never ticks.
-    - The new message IS the feedback: no ephemeral "updated"
+    - THE PANEL MOVES (18 Nov 2026, proven live by a
+      read-only VM check at 22:57 NPT — this replaces the
+      aadf03dd repair below, which was not enough): after the
+      user's Advanced tap on CR Temouchent vs JS El Biar
+      (772046268) the live panel kept ticking at 45–52
+      edits/min for 6+ minutes with 0 Tracebacks, and the
+      panel_kind DID switch to analytics — but the user stared
+      at the tap's OWN new message, which is never edited
+      again, while the tick kept editing only the original
+      registered panel_message_id elsewhere in the channel.
+      That dead copy is what "refreshing stopped" was. So the
+      new message BECOMES the live panel: its id is stored as
+      the watch's panel_message_id (persisted), the tick edits
+      THAT message from then on, in the tapped view, and the
+      old panel message is left as-is, just never edited
+      again. A second tap moves the panel again, to the
+      newest message. A tap on a stale message behaves the
+      same — the newest tapped message is the panel.
+    - The tap itself never edits any message in place: the
+      panel moves by re-pointing, not by an edit. The new
+      message IS the feedback: no ephemeral "updated"
       follow-up is sent as well. Errors (unknown game, game no
       longer live) stay ephemeral, so a failed tap never spams
       the channel.
@@ -2193,19 +2208,18 @@ async def _switch_panel_view(interaction: discord.Interaction,
     feed is ALSO not answering (info_failed), the view says
     so plainly instead.
 
-    REPAIR (18 Nov 2026 — "Advanced stops the refresh"): the
-    snapshot above is a one-off message that never ticks, and
-    the live panel kept its OLD view — so the user stared at a
-    frozen analytics card while the panel ticked on in compact
-    view somewhere else, which reads as "refreshing stopped".
-    A view tap therefore ALSO switches the live panel to the
-    tapped view (kind + detail level, persisted) and
-    re-asserts its worker, so the panel keeps refreshing in
-    the view the user asked for. The tap still never edits the
-    panel message itself — only the stored view changes, and
-    the next tick (or the re-asserted worker) renders it. A
-    tap on a stale message repairs the REAL panel the same
-    way; the stale message is never adopted."""
+    REPAIR (aadf03dd, 18 Nov 2026 — "Advanced stops the
+    refresh", first attempt): the snapshot was a one-off
+    message that never ticks, and the live panel kept its OLD
+    view — so the user stared at a frozen analytics card
+    while the panel ticked on in compact view somewhere else.
+    That build made a view tap ALSO switch the live panel to
+    the tapped view (kind + detail level, persisted) and
+    re-assert its worker. It was not enough: the panel
+    switched view, but on its OLD message, while the user
+    kept looking at the new one. The PANEL MOVES rule above
+    is the complete fix — the view switch rides along with
+    the move (adopt_game_panel sets kind + level too)."""
     game_id = _resolve_game_id(interaction)
     if game_id is None:
         _tap_log(interaction, button, None, "failed: unknown game")
@@ -2261,18 +2275,45 @@ async def _switch_panel_view(interaction: discord.Interaction,
         else:
             text = render_detail(detail, DETAIL_SIMPLE,
                                  updated=now_npt_str())
-    await interaction.followup.send(
+    # wait=True: the sent message's id is needed below — it
+    # becomes the live panel (see the PANEL MOVES note in the
+    # docstring). Real discord.py returns the Message; the
+    # test fakes return a namespace with an id.
+    sent = await interaction.followup.send(
         text,
         view=WatchAlertView(
             game_id,
             live_count=(live_watch_count(channel_id)
-                        if channel_id is not None else None)))
-    _tap_log(interaction, button, game_id, "sent new message")
-    if entry is not None and kind in ("analytics", "compact", "detail"):
-        # View switch (see the REPAIR note in the docstring):
-        # the live panel keeps refreshing, now in the tapped
-        # view. Refresh (kind None) switches nothing — it just
-        # re-renders the panel's current view as the snapshot.
+                        if channel_id is not None else None)),
+        wait=True)
+    sent_id = getattr(sent, "id", None)
+    outcome = "sent new message"
+    if entry is not None and sent_id is not None and \
+            channel_id is not None:
+        # THE PANEL MOVES (see the docstring): the message in
+        # front of the user becomes the live panel — the tick
+        # edits THIS message from now on, in the tapped view.
+        # The old panel message is left as-is, just never
+        # edited again. adopt_game_panel re-points the watch
+        # (kind + detail level, persisted like
+        # _persist_panel_view) while keeping its alerts flag,
+        # snapshot and clock anchor, so the refresh continues
+        # without a gap. Refresh (kind None) moves the panel
+        # without switching its view.
+        new_kind = kind or entry.get("panel_kind") or "compact"
+        new_level = level or entry.get("detail") or DETAIL_SIMPLE
+        entry = await adopt_game_panel(channel_id, game_id, sent_id,
+                                       text, detail, new_level,
+                                       kind=new_kind)
+        if kind == "analytics":
+            entry["panel_momentum"] = momentum
+            entry["panel_momentum_ts"] = now
+        outcome = f"sent new message; panel now {sent_id}"
+    elif entry is not None and kind in ("analytics", "compact", "detail"):
+        # No message id came back (a fake that returns None):
+        # fall back to the old view-switch-only repair — the
+        # panel keeps refreshing in the tapped view, on its
+        # existing message.
         if kind == "analytics":
             entry["panel_kind"] = "analytics"
             entry["panel_momentum"] = momentum
@@ -2284,6 +2325,7 @@ async def _switch_panel_view(interaction: discord.Interaction,
             if level:
                 entry["detail"] = level
         await _persist_panel_view(channel_id, game_id, entry)
+    _tap_log(interaction, button, game_id, outcome)
     if entry is not None:
         # Re-assert the panel worker with the fresh detail, so
         # the panel's next edit lands at once in the (possibly
@@ -2311,15 +2353,11 @@ class WatchAlertView(discord.ui.View):
     as a fallback when the view was built with a game id.
 
     Detail / Live / Simple / Advanced / Refresh send the
-    requested view as a NEW channel message (the live panel is
-    never edited by a tap — see _switch_panel_view: in-place
-    tap edits gave no visible feedback on the tapped message
-    and could switch a panel elsewhere).
-    The live panel keeps ticking in place — a view tap also
-    switches it to the tapped view (stored kind + re-asserted
-    worker, see _switch_panel_view), so it keeps refreshing
-    in the view the user asked for; the new message is a
-    one-off snapshot that never ticks.
+    requested view as a NEW channel message — and that message
+    BECOMES the live panel (see _switch_panel_view): the tick
+    edits it from then on, in the tapped view, while the old
+    panel message is left frozen. The tap itself never edits
+    any message in place.
     Timeline sends the chronoLine events as a new channel
     message too; Follow / Unfollow send a new channel message
     confirming, and start/stop alerts for this game in this
@@ -2404,8 +2442,8 @@ class WatchAlertView(discord.ui.View):
             self.add_item(WatchGameButton(self.game_id, "▶ Watch"))
 
     async def _on_detail(self, interaction: discord.Interaction):
-        # The detail card as a new message — the live panel is
-        # never edited by a tap (see _switch_panel_view).
+        # The detail card as a new message — which then becomes
+        # the live panel (see _switch_panel_view).
         await _switch_panel_view(interaction, "detail",
                                  level=DETAIL_ADVANCED, button="Detail")
 

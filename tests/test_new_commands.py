@@ -22,8 +22,10 @@ class _Resp:
     def __init__(self):
         self.sent = []
         self.edited = []
+        self.defer_calls = []
 
     async def defer(self, ephemeral=False, thinking=False, **kwargs):
+        self.defer_calls.append((ephemeral, thinking))
         return None
 
     async def send_message(self, content=None, embed=None, ephemeral=False,
@@ -38,11 +40,13 @@ class _Followup:
     def __init__(self):
         self.sent = []
         self.sent_views = []
+        self.sent_embeds = []
 
     async def send(self, content=None, embed=None, ephemeral=False,
                    view=None, **kwargs):
         self.sent.append(content)
         self.sent_views.append(view)
+        self.sent_embeds.append(embed)
 
 
 class _Interaction:
@@ -162,8 +166,11 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
     async def test_help_embed_lists_only_kept_commands(self):
         interaction = _Interaction(channel_id=777)
         await botmod.cmd_help.callback(interaction)
-        self.assertEqual(len(interaction.response.sent), 1)
-        content, embed, view = interaction.response.sent[0]
+        # 18 Nov 2026: /help defers first, so the embed now
+        # arrives via followup, not response.send_message.
+        self.assertEqual(len(interaction.response.sent), 0)
+        self.assertEqual(len(interaction.followup.sent_embeds), 1)
+        embed = interaction.followup.sent_embeds[0]
         text = "".join(
             (field.name + " " + field.value) for field in embed.fields)
         for kept in ("/watch", "/unwatch", "/watching", "/game", "/live",
@@ -174,6 +181,34 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
         for removed in ("/ai ", "/today", "/tomorrow", "/fixtures",
                         "/stats", "/ping"):
             self.assertNotIn(removed, text)
+
+    async def test_help_defers_before_replying(self):
+        # 18 Nov 2026 ~22:44 NPT: /help answered directly and a
+        # slow Discord left it past the 3s window ("application
+        # did not respond"). It must defer ephemerally first.
+        interaction = _Interaction(channel_id=777)
+        await botmod.cmd_help.callback(interaction)
+        self.assertEqual(interaction.response.defer_calls, [(True, True)])
+        self.assertEqual(len(interaction.followup.sent_embeds), 1)
+
+    async def test_health_defers_before_replying(self):
+        # Same failure mode as /help: defer first, then the
+        # embed + snapshot arrive via followup.
+        interaction = _Interaction(channel_id=777)
+        stub_bot = SimpleNamespace(latency=0.05, barcelona_task=None)
+        with patch.object(botmod, "bot", stub_bot), \
+                patch.object(botmod.health, "snapshot",
+                             new=AsyncMock(return_value="snapshot ok")), \
+                patch.object(botmod.health, "stale_check",
+                             new=AsyncMock(return_value="")):
+            await botmod.cmd_health.callback(interaction)
+        self.assertEqual(interaction.response.defer_calls, [(True, True)])
+        # One real embed (the health embed) + one text-only
+        # snapshot send, whose embed slot records None.
+        embeds = [e for e in interaction.followup.sent_embeds
+                  if e is not None]
+        self.assertEqual(len(embeds), 1)
+        self.assertIn("snapshot ok", interaction.followup.sent)
 
     async def test_scoreboard_refused_in_general(self):
         # 18 Nov 2026 incident: /scoreboard must never start outside

@@ -5,6 +5,7 @@ and the Gemini model is a fake object.
 Run:  python3 -m pytest tests/test_groq.py -q
 from the footballbot directory.
 """
+import io
 import json
 import sys
 import unittest
@@ -86,6 +87,26 @@ class TestGroqModel(unittest.TestCase):
                 ac.GroqModel("k").generate_content("x")
         self.assertIn("429", str(ctx.exception))
 
+    def test_http_error_logs_status_and_body_without_key(self):
+        # 18 Nov 2026: Groq failed at the same moment as a
+        # Discord timeout and left only "GroqError" behind. The
+        # journal must carry the status + a short error body —
+        # and never the API key.
+        body = b'{"error": {"message": "Rate limit exceeded"}}'
+        err = urllib.error.HTTPError(ac.GROQ_URL, 429, "Too Many Requests",
+                                     {}, io.BytesIO(body))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertLogs("ai", level="WARNING") as logs:
+                with self.assertRaises(ac.GroqError) as ctx:
+                    ac.GroqModel("gsk-secret-test-key").generate_content("x")
+        output = "\n".join(logs.output)
+        self.assertIn("429", output)
+        self.assertIn("Rate limit exceeded", output)
+        self.assertNotIn("gsk-secret-test-key", output)
+        self.assertIn("429", str(ctx.exception))
+        self.assertIn("Rate limit exceeded", str(ctx.exception))
+        self.assertNotIn("gsk-secret-test-key", str(ctx.exception))
+
     def test_empty_content_raises_groq_error(self):
         with patch("urllib.request.urlopen",
                    return_value=FakeResponse(_groq_payload(""))):
@@ -127,6 +148,25 @@ class TestChainedModel(unittest.TestCase):
         model = ac.ChainedModel(groq, "groq")
         with self.assertRaises(ac.GroqError):
             model.generate_content("help")
+
+    def test_both_providers_failing_logs_both_failed(self):
+        # 18 Nov 2026: Groq raised GroqError and Gemini raised
+        # ResourceExhausted at the same moment — the journal must
+        # say both failed, not just the last one.
+        groq = FakeFallback()
+        groq.generate_content = lambda prompt: (_ for _ in ()).throw(
+            ac.GroqError("Groq HTTP 429: Rate limit exceeded"))
+        fallback = FakeFallback()
+        fallback.generate_content = lambda prompt: (_ for _ in ()).throw(
+            RuntimeError("ResourceExhausted: quota exceeded"))
+        model = ac.ChainedModel(groq, "groq", fallback, "gemini")
+        with self.assertLogs("ai", level="ERROR") as logs:
+            with self.assertRaises(RuntimeError):
+                model.generate_content("help")
+        output = "\n".join(logs.output)
+        self.assertIn("both providers failed", output)
+        self.assertIn("429", output)
+        self.assertIn("ResourceExhausted", output)
 
 
 class TestBuildAiModel(unittest.TestCase):

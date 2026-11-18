@@ -231,10 +231,13 @@ async def _send_paginated(interaction: discord.Interaction, embeds: list[discord
         await interaction.followup.send(embed=emb)
 
 
-async def _defer(interaction: discord.Interaction) -> bool:
-    """Acknowledge promptly; never make a second error from an expired command."""
+async def _defer(interaction: discord.Interaction,
+                 ephemeral: bool = False) -> bool:
+    """Acknowledge promptly; never make a second error from an expired command.
+    Ephemeral replies must defer ephemerally, or the followup cannot be
+    ephemeral either — pass ephemeral=True for those commands."""
     try:
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         return True
     except (discord.InteractionResponded, discord.NotFound, discord.HTTPException):
         log.warning("[command] acknowledgement unavailable for %s", interaction.command)
@@ -249,6 +252,12 @@ async def _defer(interaction: discord.Interaction) -> bool:
 
 @bot.tree.command(name="help", description="Show all commands")
 async def cmd_help(interaction: discord.Interaction):
+    # Defer first: /help used to answer directly, and on 18 Nov
+    # 2026 ~22:44 NPT a slow Discord left it past the 3s window
+    # ("application did not respond"). The embed is built locally
+    # and is identical either way.
+    if not await _defer(interaction, ephemeral=True):
+        return
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
@@ -280,11 +289,16 @@ async def cmd_help(interaction: discord.Interaction):
         "`/shutdown` — stop the bot (server owner)\n"
         "`/help` — this list"
     ), inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="health", description="Check bot, providers, and Barcelona reminders")
 async def cmd_health(interaction: discord.Interaction):
+    # Defer first, like /help: the embed is local and fast, but
+    # the followup health snapshot does real work, and a slow
+    # Discord must not leave the command unanswered.
+    if not await _defer(interaction, ephemeral=True):
+        return
     from http_client import stats_summary
     reminder = barcelona_reminder.health_snapshot(bot)
     embed = discord.Embed(title="🩺 Football Bot Health", color=0x00C851)
@@ -299,7 +313,7 @@ async def cmd_health(interaction: discord.Interaction):
             f"sent: {result.get('sent', 0)} • errors: {result.get('errors', 0)}"
         ), inline=False)
     embed.add_field(name="Provider status", value=f"```\n{stats_summary()}\n```", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
     # Feature 7: the full health snapshot (workers, data
     # freshness, recent recovery attempts) as a followup.
     try:
@@ -900,7 +914,11 @@ async def cmd_watching(interaction: discord.Interaction):
     # The text lives in watch.render_watching — the 👀 Watching
     # button shows exactly this, from the same helper, so the
     # command and the button can never drift apart.
-    await interaction.response.send_message(
+    # Defer first: render_watching reads the database, and a
+    # slow Discord must not leave the command unanswered.
+    if not await _defer(interaction, ephemeral=True):
+        return
+    await interaction.followup.send(
         await watch.render_watching(interaction.channel_id),
         ephemeral=True)
 

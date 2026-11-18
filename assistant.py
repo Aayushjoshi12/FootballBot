@@ -680,13 +680,24 @@ async def handle_ask(interaction, text: str, model,
     """The /ask command handler (the coordinator wires it to the
     slash command). Defers ephemerally, builds grounding from the
     live feed, parses + validates, then executes. Every reply is
-    ephemeral. Never raises — a failure is a short error reply."""
+    ephemeral. Never raises — a failure is a short error reply.
+    When the defer itself fails (18 Nov 2026 ~22:44 NPT: three
+    Discord REST timeouts in a row, then "application did not
+    respond" for /ask and /help), the interaction token is dead
+    and followup.send can never work — so the answer goes out
+    as a normal visible channel message instead of being lost."""
+    deferred = True
     try:
         await interaction.response.defer(ephemeral=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Never swallow this silently again: a failed defer is
+        # the whole story of a "did not respond" failure.
+        deferred = False
+        log.warning("[assistant] /ask defer failed (%s: %s)",
+                    type(exc).__name__, exc)
     try:
-        await _handle_ask(interaction, text, model, channels)
+        await _handle_ask(interaction, text, model, channels,
+                          deferred=deferred)
     except Exception:
         # Log the full traceback: three production failures of this
         # handler (18 Nov 2026) left only an exception type in the
@@ -694,8 +705,13 @@ async def handle_ask(interaction, text: str, model,
         # user-facing reply stays exactly the same.
         log.exception("[assistant] handle_ask failed")
         try:
-            await interaction.followup.send(
-                "Something went wrong — please try again.", ephemeral=True)
+            if deferred:
+                await interaction.followup.send(
+                    "Something went wrong — please try again.",
+                    ephemeral=True)
+            else:
+                await interaction.channel.send(
+                    "Something went wrong — please try again.")
         except Exception:
             pass
 
@@ -726,7 +742,24 @@ def _split_message(text: str, limit: int = 1900) -> list[str]:
     return out or [""]
 
 
-async def _send(interaction, content: str, view=None) -> None:
+async def _channel_send(interaction, content: str,
+                      view=None) -> None:
+    """The last-resort reply path: a normal visible channel
+    message, used only when the interaction token is dead (the
+    defer failed, or the followup was rejected with Unknown
+    Webhook). Raises when there is no channel to send to."""
+    channel = getattr(interaction, "channel", None)
+    send = getattr(channel, "send", None)
+    if not callable(send):
+        raise RuntimeError("no channel to fall back to for /ask reply")
+    kwargs: dict = {}
+    if view is not None:
+        kwargs["view"] = view
+    await send(content, **kwargs)
+
+
+async def _send(interaction, content: str, view=None,
+              deferred: bool = True) -> None:
     parts = _split_message(content)
     for i, part in enumerate(parts):
         # The buttons belong with the last chunk — and real
@@ -736,14 +769,35 @@ async def _send(interaction, content: str, view=None) -> None:
         # is what failed every /ask live-list question in
         # production on 18 Nov 2026 while the permissive fakes
         # passed.
+        last = i == len(parts) - 1
+        part_view = view if last else None
+        if not deferred:
+            # The defer failed, so the token is dead: never
+            # attempt followup.send on it — the answer goes to
+            # the channel where the user can still see it.
+            await _channel_send(interaction, part, view=part_view)
+            continue
         kwargs: dict = {"ephemeral": True}
-        if i == len(parts) - 1 and view is not None:
-            kwargs["view"] = view
-        await interaction.followup.send(part, **kwargs)
+        if part_view is not None:
+            kwargs["view"] = part_view
+        try:
+            await interaction.followup.send(part, **kwargs)
+        except Exception as exc:
+            # The token died after the defer (production 18 Nov
+            # 2026: followup rejected with Unknown Webhook
+            # 10015) — the answer must still reach the user.
+            log.warning("[assistant] /ask followup failed (%s) — "
+                        "sending as a channel message instead",
+                        type(exc).__name__)
+            await _channel_send(interaction, part, view=part_view)
 
 
 async def _handle_ask(interaction, text: str, model,
-                      channels: list[dict] | None) -> None:
+                      channels: list[dict] | None,
+                      deferred: bool = True) -> None:
+    async def _reply(content: str, view=None) -> None:
+        await _send(interaction, content, view=view, deferred=deferred)
+
     try:
         raw = await prov.onex_live_raw()
     except Exception as exc:
@@ -756,7 +810,7 @@ async def _handle_ask(interaction, text: str, model,
     parsed = await parse_intent(text, model, channels)
     valid = await validate_intent(parsed, live_games, channels)
     if not valid.get("ok"):
-        await _send(interaction, str(valid.get("error") or
+        await _reply(str(valid.get("error") or
                                      "I couldn't understand that."))
         return
 
@@ -773,19 +827,19 @@ async def _handle_ask(interaction, text: str, model,
         return own_channel_id
 
     if intent == "HELP":
-        await _send(interaction, _HELP_TEXT)
+        await _reply(_HELP_TEXT)
         return
 
     if intent == "LIVE_MATCHES":
         pool, sport = _live_pool(text, live_now)
         if sport and not pool:
-            await _send(interaction,
+            await _reply(
                         f"No live {sport.lower()} right now.")
             return
         if not pool:
-            await _send(interaction, "No games are live right now.")
+            await _reply("No games are live right now.")
             return
-        await _send(interaction,
+        await _reply(
                     "⚽ **Live games right now — pick one:**\n"
                     + _live_line_list(pool, 15)
                     + "\n\nUse `/game <ID>` for the full detail, "
@@ -797,15 +851,15 @@ async def _handle_ask(interaction, text: str, model,
         if not game_id and not valid.get("team"):
             pick = _no_game_pick_text(live_now)
             if pick:
-                await _send(interaction, pick,
+                await _reply(pick,
                             view=_ask_watch_view(_top_pick(live_now)))
             else:
-                await _send(interaction, "No games are live right now.")
+                await _reply("No games are live right now.")
             return
         if valid.get("matches") is not None:
             matches = valid["matches"]
             if matches:
-                await _send(interaction, _pick_list(
+                await _reply(_pick_list(
                     matches, f"Found {len(matches)} live game(s) "
                              f"for '{valid.get('team')}':"),
                             view=_ask_watch_view(matches))
@@ -813,17 +867,17 @@ async def _handle_ask(interaction, text: str, model,
             if live_now:
                 pool, sport = _live_pool(text, live_now)
                 if sport and not pool:
-                    await _send(interaction,
+                    await _reply(
                                 f"No live match for '{valid.get('team')}' "
                                 f"and no live {sport.lower()} right now.")
                     return
-                await _send(interaction,
+                await _reply(
                             f"No live match for '{valid.get('team')}' "
                             f"— here are the live games right now:\n"
                             + _live_line_list(pool, 15),
                             view=_ask_watch_view(pool))
                 return
-            await _send(interaction,
+            await _reply(
                         f"No live match for '{valid.get('team')}' "
                         f"and no games are live right now.")
             return
@@ -838,24 +892,24 @@ async def _handle_ask(interaction, text: str, model,
                                           f"{g.get('away', '')} "
                                           f"{g.get('league', '')}")]
         if matches:
-            await _send(interaction, _pick_list(
+            await _reply(_pick_list(
                 matches, f"Found {len(matches)} live game(s) "
                          f"for '{valid.get('team') or game_id}':"))
             return
         if live_now:
             pool, sport = _live_pool(text, live_now)
             if sport and not pool:
-                await _send(interaction,
+                await _reply(
                             f"No live match for '{valid.get('team') or game_id}' "
                             f"and no live {sport.lower()} right now.")
                 return
-            await _send(interaction,
+            await _reply(
                         f"No live match for '{valid.get('team') or game_id}' "
                         f"— here are the live games right now:\n"
                         + _live_line_list(pool, 15),
                         view=_ask_watch_view(pool))
             return
-        await _send(interaction,
+        await _reply(
                     f"No live match for '{valid.get('team') or game_id}' "
                     f"and no games are live right now.")
         return
@@ -863,14 +917,14 @@ async def _handle_ask(interaction, text: str, model,
     if intent == "MATCH_DETAILS":
         if not game_id:
             if _is_barca_team(valid.get("team")):
-                await _send(interaction, "Barcelona are not live right now.")
+                await _reply("Barcelona are not live right now.")
                 return
             pick = _no_game_pick_text(live_now)
             if pick:
-                await _send(interaction, pick,
+                await _reply(pick,
                             view=_ask_watch_view(_top_pick(live_now)))
                 return
-            await _send(interaction, "I couldn't find a live game for that.")
+            await _reply("I couldn't find a live game for that.")
             return
         try:
             result = await prov.onex_search(str(game_id))
@@ -880,9 +934,9 @@ async def _handle_ask(interaction, text: str, model,
             result = {"detail": None}
         detail = (result or {}).get("detail")
         if detail is None:
-            await _send(interaction, "That game is no longer live.")
+            await _reply("That game is no longer live.")
             return
-        await _send(interaction, wmod.render_detail(detail, detail_level),
+        await _reply(wmod.render_detail(detail, detail_level),
                     view=wmod.WatchAlertView(
                         str(game_id),
                         channel_id=getattr(interaction, "channel_id", None),
@@ -893,10 +947,10 @@ async def _handle_ask(interaction, text: str, model,
         if valid.get("mass"):
             # Never mass-follow: offer the pick list instead.
             if not live_now:
-                await _send(interaction, "No games are live right now, "
+                await _reply("No games are live right now, "
                                          "so there is nothing to follow.")
                 return
-            await _send(interaction,
+            await _reply(
                         "I don't follow every game at once — pick one "
                         "to follow:\n"
                         + _live_line_list(live_now, 15),
@@ -904,14 +958,14 @@ async def _handle_ask(interaction, text: str, model,
             return
         if not game_id or entry is None:
             if _is_barca_team(valid.get("team")):
-                await _send(interaction, "Barcelona are not live right now, "
+                await _reply("Barcelona are not live right now, "
                                          "so there is nothing to follow.")
                 return
-            await _send(interaction, "I couldn't find a live game for that.")
+            await _reply("I couldn't find a live game for that.")
             return
         channel_id = _target_channel()
         if channel_id is None:
-            await _send(interaction, "I couldn't tell which channel to "
+            await _reply("I couldn't tell which channel to "
                                      "send alerts to.")
             return
         watch_entry = {"id": str(game_id), "home": entry.get("home", ""),
@@ -921,11 +975,11 @@ async def _handle_ask(interaction, text: str, model,
         started = await wmod.start_watch(channel_id, watch_entry,
                                          detail_level)
         if not started:
-            await _send(interaction, "I couldn't start watching that game.")
+            await _reply("I couldn't start watching that game.")
             return
         where = (f" in <#{channel_id}>" if channel_id != own_channel_id
                  else "")
-        await _send(interaction,
+        await _reply(
                     f"👀 Watching **{started['home']} vs {started['away']}**"
                     f"{where} — {detail_level} alerts, only when the game "
                     f"changes.")
@@ -933,11 +987,11 @@ async def _handle_ask(interaction, text: str, model,
 
     if intent == "UNFOLLOW_MATCH":
         if not game_id:
-            await _send(interaction, "I couldn't find a live game for that.")
+            await _reply("I couldn't find a live game for that.")
             return
         channel_id = _target_channel()
         if channel_id is None:
-            await _send(interaction, "I couldn't tell which channel that "
+            await _reply("I couldn't tell which channel that "
                                      "watch is in.")
             return
         # Unfollow stops the alerts; the live panel keeps ticking
@@ -945,22 +999,22 @@ async def _handle_ask(interaction, text: str, model,
         # button — not /unwatch, which fully removes the game).
         entry = await wmod.set_notify(channel_id, str(game_id), False)
         if entry:
-            await _send(interaction,
+            await _reply(
                         f"🔕 Notifications off for **{entry['home']} vs "
                         f"{entry['away']}** — the live panel keeps ticking "
                         f"here while the game is live.")
         else:
-            await _send(interaction,
+            await _reply(
                         "That game is not watched in this channel.")
         return
 
     if intent == "SET_ALERTS":
         if not game_id:
-            await _send(interaction, "I couldn't find a live game for that.")
+            await _reply("I couldn't find a live game for that.")
             return
         channel_id = _target_channel()
         if channel_id is None:
-            await _send(interaction, "I couldn't tell which channel that "
+            await _reply("I couldn't tell which channel that "
                                      "watch is in.")
             return
         events = valid.get("events")
@@ -971,7 +1025,7 @@ async def _handle_ask(interaction, text: str, model,
         except Exception as exc:
             log.warning("[assistant] set_prefs failed (%s)",
                         type(exc).__name__)
-            await _send(interaction, "I couldn't save those alert settings.")
+            await _reply("I couldn't save those alert settings.")
             return
         label = (f"{entry.get('home', '')} vs {entry.get('away', '')}"
                  if entry else f"game {game_id}")
@@ -986,18 +1040,18 @@ async def _handle_ask(interaction, text: str, model,
         if stored.get("paused"):
             bits.append("paused")
         changed = "; ".join(bits) if bits else "default alerts"
-        await _send(interaction,
+        await _reply(
                     f"✅ Alerts updated for **{label}**: {changed}.")
         return
 
     if intent == "MATCH_TIMELINE":
         if not game_id or entry is None:
-            await _send(interaction, "I couldn't find a live game for that.")
+            await _reply("I couldn't find a live game for that.")
             return
         try:
             gid = int(game_id)
         except (TypeError, ValueError):
-            await _send(interaction, "I couldn't read this game's timeline.")
+            await _reply("I couldn't read this game's timeline.")
             return
         try:
             events = await prov.onex_events(
@@ -1007,7 +1061,7 @@ async def _handle_ask(interaction, text: str, model,
                         type(exc).__name__)
             events = []
         if not events:
-            await _send(interaction, "No timeline events yet for this game.")
+            await _reply("No timeline events yet for this game.")
             return
         lines = [f"**{entry.get('home', '?')} "
                  f"{wmod._score_str(entry)} {entry.get('away', '?')}** "
@@ -1016,26 +1070,26 @@ async def _handle_ask(interaction, text: str, model,
             lines.append(f"{ev.get('icon', '')} **{ev.get('minute', '?')}'** "
                          f"{ev.get('detail', '')} — {ev.get('player', '')} "
                          f"({ev.get('team', '')})")
-        await _send(interaction, "\n".join(lines)[:2000])
+        await _reply("\n".join(lines)[:2000])
         return
 
     if intent == "TEAM_FIXTURES":
         team = valid.get("team") or ""
         if not _is_barca_team(team):
-            await _send(interaction,
+            await _reply(
                         f"I don't have fixtures for {team} — I only have "
                         f"the next Barcelona fixture. Ask 'when do "
                         f"Barcelona play next?' for that.")
             return
         nxt = await _next_barca_fixture()
         if nxt is None:
-            await _send(interaction,
+            await _reply(
                         "No upcoming Barcelona fixture is available from "
                         "the provider yet.")
             return
         kickoff, match = nxt["kickoff"], nxt["match"]
         local = kickoff.astimezone(barcelona_reminder.NEPAL)
-        await _send(interaction,
+        await _reply(
                     f"🔵🔴 Next Barcelona match: "
                     f"**{match.get('home', 'TBD')} vs "
                     f"{match.get('away', 'TBD')}**\n"
@@ -1043,5 +1097,5 @@ async def _handle_ask(interaction, text: str, model,
                     f"({local.strftime('%I:%M %p')} Nepal time)")
         return
 
-    await _send(interaction, "I couldn't understand that — try 'help' to "
+    await _reply("I couldn't understand that — try 'help' to "
                              "see what I can do.")

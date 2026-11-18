@@ -229,6 +229,8 @@ class FakeMessage:
         self.content = content
         self.edits: list[str] = []
         self.edit_error = None
+        self.deleted = False
+        self.channel = None
 
     async def edit(self, content=None, allowed_mentions=None):
         if self.edit_error is not None:
@@ -237,16 +239,26 @@ class FakeMessage:
         self.content = content
         self.edits.append(content)
 
+    async def delete(self):
+        self.deleted = True
+        if self.channel is not None:
+            self.channel.messages.pop(self.id, None)
+
 
 class FakeChannel:
     def __init__(self):
         self.sent: list[FakeMessage] = []
         self.messages: dict[int, FakeMessage] = {}
         self._next_id = 1000
+        self.send_error = None
 
     async def send(self, content, allowed_mentions=None):
+        if self.send_error is not None:
+            err, self.send_error = self.send_error, None
+            raise err
         self._next_id += 1
         msg = FakeMessage(self._next_id, content)
+        msg.channel = self
         self.messages[msg.id] = msg
         self.sent.append(msg)
         return msg
@@ -345,7 +357,7 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(sb._state[123]["blocked_until"], time.time())
 
     async def test_loop_posts_once_and_skips_identical(self):
-        sb._state[123] = sb._new_entry()
+        sb._state[sb.TEST_CHANNEL_ID] = sb._new_entry()
         orig_fetch = sb._fetch_all
         orig_watch = sb.WATCH_SECONDS
         sb.WATCH_SECONDS = 0.05
@@ -360,6 +372,150 @@ class TestDelivery(unittest.IsolatedAsyncioTestCase):
             sb.WATCH_SECONDS = orig_watch
         self.assertEqual(len(self.channel.sent), 1)
         self.assertEqual(self.channel.sent[0].edits, [])
+
+
+GENERAL_CHANNEL_ID = 966731286884532257
+
+
+class TestGuardrails(unittest.IsolatedAsyncioTestCase):
+    """18 Nov 2026 incident: /scoreboard in #general reported failure
+    yet a scoreboard appeared there anyway. The old code registered
+    the channel before posting, and the background loop then posted
+    to every registered channel on its next tick. These tests pin
+    the fix: test channel only, register-after-post, boot purge,
+    and a Discord-side stop."""
+
+    def setUp(self):
+        self._orig_state_path = sb.STATE_PATH
+        self._orig_state = dict(sb._state)
+        self._orig_fetch = sb._fetch_all
+        self._orig_purged = sb._purged_disallowed
+        self._tmp = Path(__file__).resolve().parent / ".sb-guard-test-tmp"
+        self._tmp.mkdir(exist_ok=True)
+        sb.STATE_PATH = self._tmp / "scoreboard.json"
+        sb._state = {}
+        sb._purged_disallowed = False
+        # No network: start_for_channel's fetch returns nothing live.
+        sb._fetch_all = lambda: asyncio.sleep(0, result=([], [], []))
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    def tearDown(self):
+        sb.STATE_PATH = self._orig_state_path
+        sb._state = self._orig_state
+        sb._fetch_all = self._orig_fetch
+        sb._purged_disallowed = self._orig_purged
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _saved(self):
+        if not sb.STATE_PATH.exists():
+            return {}
+        return json.loads(sb.STATE_PATH.read_text(encoding="utf-8"))
+
+    async def test_start_refused_in_general(self):
+        self.assertFalse(
+            await sb.start_for_channel(self.bot, GENERAL_CHANNEL_ID))
+        self.assertNotIn(GENERAL_CHANNEL_ID, sb._state)
+        self.assertEqual(self.channel.sent, [])
+        self.assertNotIn(str(GENERAL_CHANNEL_ID), self._saved())
+
+    async def test_failed_first_post_registers_nothing(self):
+        # A transient transport error (not an HTTPException) during
+        # the first send — the incident's most likely failure mode.
+        self.channel.send_error = ConnectionError("connection reset")
+        self.assertFalse(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertNotIn(sb.TEST_CHANNEL_ID, sb._state)
+        self.assertEqual(self.channel.sent, [])
+        self.assertNotIn(str(sb.TEST_CHANNEL_ID), self._saved())
+        # A retry afterwards works and registers exactly once.
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertIn(sb.TEST_CHANNEL_ID, sb._state)
+        self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_load_drops_general_from_saved_state(self):
+        payload = {
+            str(GENERAL_CHANNEL_ID): {"message_id": 555, "body": "x",
+                                      "last_edit": 0, "blocked_until": 0},
+            str(sb.TEST_CHANNEL_ID): {"message_id": 777, "body": "y",
+                                      "last_edit": 0, "blocked_until": 0},
+        }
+        sb.STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = sb._load_state()
+        self.assertNotIn(GENERAL_CHANNEL_ID, loaded)
+        self.assertIn(sb.TEST_CHANNEL_ID, loaded)
+        self.assertTrue(sb._purged_disallowed)
+        # Persisting the loaded state cleans the file for good.
+        sb._state = loaded
+        sb._save_state()
+        self.assertNotIn(str(GENERAL_CHANNEL_ID), self._saved())
+        self.assertIn(str(sb.TEST_CHANNEL_ID), self._saved())
+
+    async def test_ensure_running_persists_purge(self):
+        payload = {str(GENERAL_CHANNEL_ID): {"message_id": 555, "body": "x",
+                                             "last_edit": 0,
+                                             "blocked_until": 0}}
+        sb.STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        sb._state = sb._load_state()
+        self.assertTrue(sb._purged_disallowed)
+        # A live dummy task so ensure_running does not start the loop.
+        dummy = asyncio.create_task(asyncio.sleep(3600))
+        self.bot.scoreboard_task = dummy
+        try:
+            sb.ensure_running(self.bot)
+            self.assertNotIn(str(GENERAL_CHANNEL_ID), self._saved())
+            self.assertFalse(sb._purged_disallowed)
+        finally:
+            dummy.cancel()
+            await asyncio.gather(dummy, return_exceptions=True)
+
+    async def test_loop_ignores_general_even_if_registered(self):
+        sb._state[GENERAL_CHANNEL_ID] = sb._new_entry()
+        sb._state[sb.TEST_CHANNEL_ID] = sb._new_entry()
+        orig_fetch = sb._fetch_all
+        orig_watch = sb.WATCH_SECONDS
+        sb.WATCH_SECONDS = 0.05
+        sb._fetch_all = lambda: asyncio.sleep(
+            0, result=([], [_foot_match()], []))
+        try:
+            task = asyncio.create_task(sb.scoreboard_loop(self.bot))
+            await asyncio.sleep(0.35)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            sb._fetch_all = orig_fetch
+            sb.WATCH_SECONDS = orig_watch
+        # Only the test channel got a post; general was skipped.
+        self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_stop_removes_channel_and_deletes_message(self):
+        self.assertTrue(
+            await sb.start_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        mid = sb._state[sb.TEST_CHANNEL_ID]["message_id"]
+        self.assertIn(mid, self.channel.messages)
+        self.assertTrue(
+            await sb.stop_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        self.assertNotIn(sb.TEST_CHANNEL_ID, sb._state)
+        self.assertNotIn(mid, self.channel.messages)
+        self.assertNotIn(str(sb.TEST_CHANNEL_ID), self._saved())
+        # A second stop reports nothing to stop.
+        self.assertFalse(
+            await sb.stop_for_channel(self.bot, sb.TEST_CHANNEL_ID))
+        # And the loop sends nothing afterwards.
+        sent_before = len(self.channel.sent)
+        orig_watch = sb.WATCH_SECONDS
+        sb.WATCH_SECONDS = 0.05
+        try:
+            task = asyncio.create_task(sb.scoreboard_loop(self.bot))
+            await asyncio.sleep(0.2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            sb.WATCH_SECONDS = orig_watch
+        self.assertEqual(len(self.channel.sent), sent_before)
 
 
 if __name__ == "__main__":

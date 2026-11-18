@@ -64,6 +64,24 @@ STATE_PATH = Path(__file__).resolve().with_name("scoreboard.json")
 # 0 = off; the parent sets this to the test channel at deploy time.
 SCOREBOARD_CHANNEL_ID = int(os.getenv("SCOREBOARD_CHANNEL_ID", "0"))
 
+# ── Test channel ONLY (incident 18 Nov 2026) ─────────────────────────
+# The scoreboard may post in the test channel and nowhere else — never
+# in #general or any other channel. On 18 Nov a /scoreboard run in
+# #general registered that channel and the background loop kept
+# editing its message there even though the command had reported
+# failure. Every entry point below enforces this allowlist: the
+# command, the first-post registration, the boot-resume load, and
+# the loop's channel set. The Barcelona reminder and auto-watch are
+# a separate system and are still allowed in #general.
+TEST_CHANNEL_ID = 1572145824530563185
+ALLOWED_SCOREBOARD_CHANNELS = frozenset({TEST_CHANNEL_ID})
+
+
+def is_scoreboard_channel(channel_id: int) -> bool:
+    """True only for the test channel — the one place the scoreboard
+    is allowed to post."""
+    return int(channel_id) in ALLOWED_SCOREBOARD_CHANNELS
+
 WATCH_SECONDS = 1            # 1xBet poll interval (the watch)
 BACKOFF_SECONDS = 10         # watch interval while 1xBet gives no live data
 MIN_EDIT_GAP = 5             # seconds between Discord message edits
@@ -77,8 +95,19 @@ FOOTER_PREFIX = "-# Updated "
 #                "last_edit": float (epoch), "blocked_until": float (epoch)}
 _state: dict[int, dict] = {}
 
+# Serialises first starts so two concurrent /scoreboard runs in the
+# same channel cannot both post a fresh message (one would be
+# orphaned, never edited again).
+_start_lock = asyncio.Lock()
+
+
+# Set by _load_state when it drops a non-test channel from the
+# saved file; ensure_running() persists the cleaned state at boot.
+_purged_disallowed = False
+
 
 def _load_state() -> dict[int, dict]:
+    global _purged_disallowed
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -94,6 +123,14 @@ def _load_state() -> dict[int, dict]:
         try:
             cid = int(key)
         except (TypeError, ValueError):
+            continue
+        if not is_scoreboard_channel(cid):
+            # A channel that must never get a scoreboard (e.g. #general
+            # from the 18 Nov 2026 incident) is dropped on load, so a
+            # restart can never resume posting there.
+            log.warning("[scoreboard] dropping non-test channel %s from "
+                        "saved state; scoreboard is test-channel only", cid)
+            _purged_disallowed = True
             continue
         if not isinstance(value, dict):
             continue
@@ -369,8 +406,10 @@ async def scoreboard_loop(bot: discord.Client) -> None:
                              WATCH_SECONDS)
                 interval = WATCH_SECONDS
                 empty_ticks = 0
-            channels = set(_state)
-            if SCOREBOARD_CHANNEL_ID:
+            channels = {cid for cid in _state
+                        if is_scoreboard_channel(cid)}
+            if SCOREBOARD_CHANNEL_ID and is_scoreboard_channel(
+                    SCOREBOARD_CHANNEL_ID):
                 channels.add(SCOREBOARD_CHANNEL_ID)
             for cid in list(channels):
                 try:
@@ -387,6 +426,13 @@ async def scoreboard_loop(bot: discord.Client) -> None:
 
 
 def ensure_running(bot: discord.Client) -> None:
+    global _purged_disallowed
+    if _purged_disallowed:
+        # A non-test channel was dropped from the saved state at load
+        # — persist the cleaned state at once so the file can never
+        # bring it back.
+        _purged_disallowed = False
+        _save_state()
     task = getattr(bot, "scoreboard_task", None)
     if task is None or task.done():
         if task is not None and not task.cancelled() and task.exception() is not None:
@@ -408,10 +454,96 @@ def ensure_running(bot: discord.Client) -> None:
 
 
 async def start_for_channel(bot: discord.Client, channel_id: int) -> bool:
-    """Register a channel and post/resume its scoreboard immediately."""
-    _state.setdefault(channel_id, _new_entry())
-    _save_state()
-    ensure_running(bot)
-    npl, games = await _fetch_all()
-    return await refresh_channel(bot, channel_id,
-                                 render_scoreboard(npl, games))
+    """Register a channel and post/resume its scoreboard immediately.
+
+    Returns True only when a message was actually posted or edited.
+    The channel is registered ONLY after a first successful post, so
+    a failed start can never leave a live scoreboard behind. The old
+    code registered + saved the channel first and then posted — and
+    it also unpacked _fetch_all()'s 3-tuple as 2 values, so it raised
+    ValueError on EVERY run. On 18 Nov 2026 that is exactly what
+    happened in #general: the command reported failure while the
+    background loop picked the registered channel up on its next
+    tick and posted there anyway.
+    """
+    if not is_scoreboard_channel(channel_id):
+        log.warning("[scoreboard] refused start in non-test channel %s "
+                    "(scoreboard is test-channel only)", channel_id)
+        return False
+    async with _start_lock:
+        npl, games, _raw = await _fetch_all()
+        text = render_scoreboard(npl, games)
+        if channel_id in _state:
+            # Already running here: resume/edit via the normal path.
+            try:
+                posted = await refresh_channel(bot, channel_id, text)
+            except Exception as exc:
+                # refresh_channel only catches NotFound/HTTPException,
+                # so a transient transport error (aiohttp/timeout) can
+                # still escape — report it honestly instead of
+                # letting the caller think the start itself failed
+                # while a scoreboard appears anyway.
+                log.warning("[scoreboard] start edit failed in %s (%s)",
+                            channel_id, type(exc).__name__)
+                return False
+            if posted:
+                ensure_running(bot)
+            return posted
+        # First start here: post ONCE without registering. Only a
+        # successful send creates the state entry, so the loop cannot
+        # pick this channel up before the command has succeeded.
+        channel = await _get_channel(bot, channel_id)
+        if channel is None:
+            return False
+        try:
+            message = await channel.send(
+                text, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as exc:
+            # Broad catch on purpose (see above): a failed first post
+            # simply reports False and registers nothing.
+            log.warning("[scoreboard] first post failed in %s (%s)",
+                        channel_id, type(exc).__name__)
+            return False
+        _state[channel_id] = {
+            "message_id": message.id,
+            "body": _split_body(text)[0],
+            "last_edit": time.time(),
+            "blocked_until": 0.0,
+        }
+        _save_state()
+        ensure_running(bot)
+        return True
+
+
+async def stop_for_channel(bot: discord.Client, channel_id: int) -> bool:
+    """Stop the scoreboard in one channel, from Discord (/stopscoreboard).
+
+    Removes the channel from state, so the loop stops editing there
+    on its next tick, and best-effort deletes the posted message so
+    nothing frozen is left behind. True when a scoreboard was
+    actually running in that channel. The loop itself keeps running —
+    it also drives the game watches — only this channel is removed.
+    Deletion failures are ignored: state removal is what stops the
+    edits, and the message is the bot's own so no special permission
+    is needed to delete it.
+    """
+    entry = None
+    async with _start_lock:
+        entry = _state.get(channel_id)
+        if entry is not None:
+            del _state[channel_id]
+            _save_state()
+    if entry is None:
+        return False
+    msg_id = entry.get("message_id")
+    if msg_id is not None:
+        try:
+            channel = await _get_channel(bot, channel_id)
+            if channel is not None:
+                message = await channel.fetch_message(msg_id)
+                await message.delete()
+        except Exception:
+            pass
+    if entry is not None:
+        log.info("[scoreboard] stopped in channel %s", channel_id)
+    return entry is not None

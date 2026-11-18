@@ -185,7 +185,8 @@ async def cmd_help(interaction: discord.Interaction):
     )
     embed.add_field(name="📡 Live", value=(
         "`/live` — all live matches\n"
-        "`/scoreboard` — live scoreboard in this channel\n"
+        "`/scoreboard` — live scoreboard (test channel only)\n"
+        "`/stopscoreboard` — stop the scoreboard in this channel\n"
         "`/game` — detail for one game (ID or team name)"
     ), inline=True)
     embed.add_field(name="🔍 Follow a game", value=(
@@ -542,8 +543,16 @@ async def cmd_live(interaction: discord.Interaction):
 
 
 # ── /scoreboard ───────────────────────────────────────────────────────────────
-@bot.tree.command(name="scoreboard", description="Live scoreboard in this channel (NPL + top games)")
+@bot.tree.command(name="scoreboard", description="Live scoreboard in the test channel (NPL + top games)")
 async def cmd_scoreboard(interaction: discord.Interaction):
+    # Test channel only (incident 18 Nov 2026): never start a
+    # scoreboard in #general or any other channel.
+    if not scoreboard.is_scoreboard_channel(interaction.channel_id):
+        await interaction.response.send_message(
+            "The live scoreboard only runs in the test channel — "
+            "I can't start it here.",
+            ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     try:
         posted = await scoreboard.start_for_channel(bot, interaction.channel_id)
@@ -561,6 +570,22 @@ async def cmd_scoreboard(interaction: discord.Interaction):
         await interaction.followup.send(
             "Could not post the scoreboard here — check the bot can send "
             "messages in this channel.", ephemeral=True)
+
+
+# ── /stopscoreboard ─────────────────────────────────────────────────────────
+@bot.tree.command(name="stopscoreboard", description="Stop the live scoreboard in this channel")
+async def cmd_stopscoreboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    stopped = await scoreboard.stop_for_channel(bot, interaction.channel_id)
+    if stopped:
+        await interaction.followup.send(
+            "📊 Live scoreboard stopped in this channel — it won't update "
+            "here any more.",
+            ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "No live scoreboard is running in this channel.",
+            ephemeral=True)
 
 
 # ── /today ──────────────────────────────────────────────────────────────────────

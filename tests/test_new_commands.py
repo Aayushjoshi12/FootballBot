@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db
 import history
 import bot as botmod
+import scoreboard as sb
+
+GENERAL_CHANNEL_ID = 966731286884532257
 
 
 class _Resp:
@@ -59,6 +62,10 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
         self._tmp = Path(__file__).resolve().parent / ".new-cmd-test-tmp"
         self._tmp.mkdir(exist_ok=True)
         db._DB = str(self._tmp / "test.db")
+        self._orig_sb_path = sb.STATE_PATH
+        self._orig_sb_state = dict(sb._state)
+        sb.STATE_PATH = self._tmp / "scoreboard.json"
+        sb._state = {}
 
     async def asyncSetUp(self):
         await db.init()
@@ -66,6 +73,8 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await db.close()
         db._DB = self._orig_db
+        sb.STATE_PATH = self._orig_sb_path
+        sb._state = self._orig_sb_state
         for p in self._tmp.glob("*"):
             p.unlink()
         self._tmp.rmdir()
@@ -138,5 +147,40 @@ class TestNewCommands(unittest.IsolatedAsyncioTestCase):
         # descriptions are the contract — new commands must exist.
         names = {c.name for c in botmod.bot.tree.get_commands()}
         for expected in ("ask", "notifications", "history", "health",
-                         "watch", "game", "live", "scoreboard"):
+                         "watch", "game", "live", "scoreboard",
+                         "stopscoreboard"):
             self.assertIn(expected, names)
+
+    async def test_scoreboard_refused_in_general(self):
+        # 18 Nov 2026 incident: /scoreboard must never start outside
+        # the test channel, and the refusal must not register anything.
+        interaction = _Interaction(channel_id=GENERAL_CHANNEL_ID)
+        with patch.object(botmod.scoreboard, "start_for_channel",
+                          new=AsyncMock()) as start:
+            await botmod.cmd_scoreboard.callback(interaction)
+        start.assert_not_awaited()
+        self.assertEqual(len(interaction.response.sent), 1)
+        self.assertIn("test channel", interaction.response.sent[0][0])
+        self.assertNotIn(GENERAL_CHANNEL_ID, sb._state)
+
+    async def test_scoreboard_starts_in_test_channel(self):
+        interaction = _Interaction(channel_id=sb.TEST_CHANNEL_ID)
+        with patch.object(botmod.scoreboard, "start_for_channel",
+                          new=AsyncMock(return_value=True)) as start:
+            await botmod.cmd_scoreboard.callback(interaction)
+        start.assert_awaited_once_with(botmod.bot, sb.TEST_CHANNEL_ID)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertIn("started", interaction.followup.sent[0])
+
+    async def test_stopscoreboard_command(self):
+        interaction = _Interaction(channel_id=777)
+        await botmod.cmd_stopscoreboard.callback(interaction)
+        self.assertIn("No live scoreboard", interaction.followup.sent[0])
+        # A running scoreboard (no posted message id, so no Discord
+        # delete is attempted) stops from Discord, no VM access.
+        sb._state[777] = {"message_id": None, "body": None,
+                          "last_edit": 0, "blocked_until": 0}
+        interaction2 = _Interaction(channel_id=777)
+        await botmod.cmd_stopscoreboard.callback(interaction2)
+        self.assertIn("stopped", interaction2.followup.sent[0])
+        self.assertNotIn(777, sb._state)

@@ -447,10 +447,15 @@ class FakeMessage:
         if self.bucket is not None and not self.bucket.try_acquire():
             # Faithful to a Discord 429: _refresh_panel reads
             # err.retry_after and pauses only this panel.
+            # retry_after matches the bucket: one token refills
+            # in window/limit seconds, so a retry after that
+            # lands instead of denying again.
+            retry_after = (self.bucket.window / self.bucket.limit
+                           if self.bucket is not None else 1.0)
             resp = SimpleNamespace(status=429, reason="Too Many Requests",
-                                   headers={"Retry-After": "1"})
+                                   headers={"Retry-After": str(retry_after)})
             err = discord.HTTPException(resp, "rate limited")
-            err.retry_after = 1.0
+            err.retry_after = retry_after
             raise err
         self.content = content
         if view is not None:
@@ -671,15 +676,44 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("(67:00)", self.channel.sent[0].content)
 
-    async def test_missing_game_ends_watch_after_ten_ticks(self):
+    async def test_missing_game_survives_thirty_absent_ticks(self):
+        # Feed truncation (games1x2 caps at 50): a game can sit off
+        # the live list for minutes while still live. 30 absent
+        # ticks must not end the watch or send anything.
         self._seed_watch()
-        for _ in range(9):
+        for _ in range(30):
             await wmod.on_tick(self.bot, [])
-            self.assertEqual(len(self.channel.sent), 0)
+            self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_missing_game_ends_after_long_absence(self):
+        # ...but a game gone for over MISSING_END_AFTER_S is over:
+        # the "no longer live" notice goes out once and the watch
+        # ends, exactly as the old 10-tick rule did — just later.
+        self._seed_watch()
+        wmod._watches[(777, "771747666")]["missing_since"] = (
+            time.monotonic() - wmod.MISSING_END_AFTER_S - 1)
         await wmod.on_tick(self.bot, [])
+        self.assertNotIn((777, "771747666"), wmod._watches)
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("no longer live", self.channel.sent[0].content)
-        self.assertEqual(wmod._watches, {})
+
+    async def test_failed_fetch_never_counts_as_missing(self):
+        # A tick whose fetch failed arrives as None: the game is
+        # absent from nothing, so the watch must not age at all —
+        # not even its missing counter moves.
+        self._seed_watch()
+        for _ in range(30):
+            await wmod.on_tick(self.bot, None)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertEqual(watch.get("missing", 0), 0)
+        self.assertFalse(watch.get("missing_since"))
+        # ...and genuinely-absent ticks after that still leave it
+        # alive while the absence is short.
+        for _ in range(5):
+            await wmod.on_tick(self.bot, [])
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(self.channel.sent), 0)
 
 
 class FakeResponse:
@@ -2581,8 +2615,11 @@ class TestOnTickEngine(unittest.IsolatedAsyncioTestCase):
     async def test_gone_game_ends_watch_and_records_history(self):
         import history
         self._seed_watch()
-        for _ in range(wmod.MISSING_TICKS_TO_END):
-            await wmod.on_tick(self.bot, [])
+        # Gone for over MISSING_END_AFTER_S, not merely a few ticks:
+        # a short absence (feed truncation) must not end the watch.
+        wmod._watches[(777, "771747666")]["missing_since"] = (
+            time.monotonic() - wmod.MISSING_END_AFTER_S - 1)
+        await wmod.on_tick(self.bot, [])
         self.assertNotIn((777, "771747666"), wmod._watches)
         self.assertEqual(len(self.channel.sent), 1)
         self.assertIn("no longer live", self.channel.sent[0].content)
@@ -2920,6 +2957,29 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(panel.edits), 1)
         self.assertIn("1 – 1", panel.edits[0])
         self.assertIn("67:00", panel.edits[0])
+
+    async def test_watch_survives_truncated_feed_and_panel_resumes(self):
+        # The Eliminator case (18 Nov): the game fell off the
+        # 50-entry live list for a stretch while still live. 30
+        # absent ticks hold the SAME panel — nothing is sent, the
+        # panel is not touched — and when the game reappears the
+        # panel ticks on in place, no /game needed.
+        self._seed_watch(with_panel=True)
+        panel = self.channel.messages[2001]
+        for _ in range(30):
+            await wmod.on_tick(self.bot, [])
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(panel.edits), 0)
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        await wmod.on_tick(self.bot, [changed])
+        await _drain_panel_workers()
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(panel.edits), 1)
+        self.assertIn("1 – 1", panel.edits[0])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("GOAL", self.channel.sent[0].content)
 
     async def test_full_time_panel_shows_final_and_watch_ends(self):
         self._seed_watch(with_panel=True)
@@ -3911,7 +3971,11 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         # bucket — that firing is what used to cascade (the VM
         # journal showed ~14.6 429s/min and only ~30 landed
         # edits/min). Exactly one 429 happens, and every panel
-        # still lands its edit.
+        # still lands its edit — the limited one on the scheduler's
+        # single retry after the pause (a 429's retry_after IS the
+        # bucket refilling, so the retry lands; a fake that failed
+        # forever would 429 the retry too and stall the queue past
+        # the drain).
         msgs = self._seed_four()
         resp = SimpleNamespace(status=429, reason="Too Many Requests",
                                headers={"Retry-After": "5"})
@@ -3927,6 +3991,10 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
             except discord.HTTPException as exc:
                 if getattr(exc, "status", None) == 429:
                     raises.append(exc)
+                    # Bucket refilled after retry_after: the
+                    # scheduler's retry lands instead of 429ing
+                    # again.
+                    msgs[1].edit_error = None
                 raise
 
         msgs[1].edit = _counting_edit
@@ -3943,17 +4011,20 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         self._reset_tick_state()
         await wmod.on_tick(self.bot, self.games1x2)
         # The drain waits out the 5s channel pause (msg2 lands
-        # ~6s after msg0: 1s pacing, then the pause).
-        await _drain_panel_workers(timeout=10.0)
+        # ~7s after msg0: 1s pacing, the pause, the retry, then
+        # the 1.5s grown gap).
+        await _drain_panel_workers(timeout=15.0)
         self.assertEqual(len(msgs[0].edits), 1)
-        self.assertEqual(len(msgs[1].edits), 0)
+        # The limited panel landed on the scheduler's retry after
+        # the pause — not dropped, not hammered.
+        self.assertEqual(len(msgs[1].edits), 1)
         self.assertEqual(len(msgs[2].edits), 1)
         self.assertEqual(len(msgs[3].edits), 1)
         self.assertEqual(len(self.channel.sent), 0)
         # Exactly one 429 — no cascade.
         self.assertEqual(len(raises), 1)
         # The pause delayed the other panels well past their
-        # normal 1s slots: msg2 landed ~6s after msg0, not ~2s.
+        # normal 1s slots: msg2 landed ~7s after msg0, not ~2s.
         self.assertGreaterEqual(times[2][0] - times[0][0], 4.0)
         self.assertAlmostEqual(times[3][0] - times[2][0], 1.0, delta=0.75)
         # Once the error clears, the limited panel edits again —
@@ -3961,8 +4032,8 @@ class TestPanelEverySecond(unittest.IsolatedAsyncioTestCase):
         msgs[1].edit_error = None
         self._reset_tick_state()
         await wmod.on_tick(self.bot, self.games1x2)
-        await _drain_panel_workers(timeout=10.0)
-        self.assertEqual(len(msgs[1].edits), 1)
+        await _drain_panel_workers(timeout=15.0)
+        self.assertEqual(len(msgs[1].edits), 2)
         self.assertEqual(len(raises), 1)
 
     async def test_refresh_budget_divides_evenly(self):
@@ -4342,14 +4413,21 @@ class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
     async def _run_scenario(self, n_panels, seconds=60,
-                            scoreboard_every=10):
+                            scoreboard_every=10, bucket_window=5.0,
+                            gap_samples=None):
         """Simulate `seconds` virtual seconds: every second one
         edit per panel (as the tick hands them fresh detail) plus
         a scoreboard edit every `scoreboard_every` seconds (the
         scoreboard only edits when the score changes — a busy
-        minute). Returns (per-panel landed counts, scoreboard
-        landed count, 429 count)."""
-        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        minute). `bucket_window` calibrates the fake bucket:
+        5.0s is Discord's standard 5-per-5s bucket; 10.0s
+        refills 0.5/s, modelling the tighter budget production
+        proved (429s at a steady 1 edit/s). `gap_samples`
+        (a list) records the scheduler's adaptive gap each
+        simulated second. Returns (per-panel landed counts,
+        scoreboard landed count, 429 count)."""
+        bucket = FakeBucket(limit=5, window=bucket_window,
+                            now_fn=lambda: self.clock.now)
         panel_msgs = []
         for idx in range(n_panels):
             msg = FakeMessage(2001 + idx, "stale", bucket=bucket)
@@ -4381,6 +4459,8 @@ class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
                     cemod.edit_message(
                         self.bot, 777, sb_msg.id,
                         content=f"scoreboard t={s}")))
+            if gap_samples is not None:
+                gap_samples.append(cemod.channel_gap(777))
             await self._tick_virtual(1.0)
         # Let the trailing queue land (a few more virtual
         # seconds); those edits count toward the total too.
@@ -4495,8 +4575,11 @@ class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(results[0], 5)
         self.assertGreaterEqual(results[1], 5)
         # Total landed is ~1/s over the ~17 virtual seconds,
-        # minus the ~2s the channel paused for the 429.
-        self.assertGreaterEqual(sum(results), 12)
+        # minus the ~2s the channel paused for the 429 and the
+        # elevated gap afterwards (×1.5, easing back only after
+        # 10 clean edits — so ~10, not ~14). The point is the
+        # 429 did not cascade: both panels keep landing edits.
+        self.assertGreaterEqual(sum(results), 9)
         self.assertLessEqual(sum(results), 16)
 
     async def test_priority_tap_jumps_the_queue(self):
@@ -4541,24 +4624,222 @@ class TestSharedEditBudget(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(landed[2], 0)
         self.assertEqual(landed, [0, 1, 0, 2, 3])
 
-    async def test_coalescing_keeps_only_the_freshest_edit(self):
-        # Three rapid submits for the same message: one PATCH
-        # lands, with the LAST content — the queue never holds
-        # stale renders.
+    async def test_first_429_seen_once_and_retried_after_pause(self):
+        # Production falsified the old design (18 Nov 2026):
+        # discord.py retries a 429 up to 5x inside the call, so
+        # the scheduler never saw the FIRST 429 and the worker
+        # stalled ~20s in hidden retries. The raw PATCH sees the
+        # first 429 at once: exactly one rate-limit warning, the
+        # channel pauses for retry_after, the job is retried once
+        # after the pause and lands — ~4s total, never ~20s.
         bucket = FakeBucket(now_fn=lambda: self.clock.now)
         msg = FakeMessage(2001, "stale", bucket=bucket)
         self.channel.messages[msg.id] = msg
-        tasks = [asyncio.create_task(cemod.edit_message(
-                    self.bot, 777, 2001, content=f"v{i}"))
-                 for i in range(3)]
-        self._tasks.extend(tasks)
-        await self._tick_virtual(3.0)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        calls = []
+        orig_edit = msg.edit
+
+        async def _once_429(*args, **kwargs):
+            calls.append(self.clock.now)
+            if len(calls) == 1:
+                resp = SimpleNamespace(status=429,
+                                       reason="Too Many Requests",
+                                       headers={"Retry-After": "4"})
+                err = discord.HTTPException(resp, "rate limited")
+                err.retry_after = 4.0
+                raise err
+            return await orig_edit(*args, **kwargs)
+
+        msg.edit = _once_429
+        t0 = self.clock.now
+        with self.assertLogs("edits", level="INFO") as logs:
+            task = asyncio.create_task(
+                cemod.edit_message(self.bot, 777, 2001, content="v1"))
+            await self._tick_virtual(6.0)
+            result = await task
+        self.assertEqual(result, ("ok", "v1"))
+        self.assertEqual(len(calls), 2)  # first attempt + one retry
         self.assertEqual(len(msg.edits), 1)
-        self.assertEqual(msg.edits[0], "v2")
-        self.assertEqual(results[0][0], "superseded")
-        self.assertEqual(results[1][0], "superseded")
-        self.assertEqual(results[2][0], "ok")
+        # The retry landed ~4s after the submit (one retry_after),
+        # not ~20s (five hidden discord.py retries).
+        self.assertGreaterEqual(calls[1] - t0, 3.5)
+        self.assertLessEqual(calls[1] - t0, 5.5)
+        # Exactly one rate-limit warning for the one logical edit.
+        limited = [line for line in logs.output if "rate-limited" in line]
+        self.assertEqual(len(limited), 1)
+
+    async def test_scoreboard_edit_lands_after_a_429_pause(self):
+        # The old 2.0s scoreboard timeout was shorter than ONE
+        # discord.py retry sleep, so every scoreboard edit timed
+        # out and was discarded while resubmitting every tick.
+        # With the raw PATCH (429 at once, one retry after the
+        # pause) and the 5s timeout, the edit lands.
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        msg = FakeMessage(2001, "stale", bucket=bucket)
+        self.channel.messages[msg.id] = msg
+        calls = {"n": 0}
+        orig_edit = msg.edit
+
+        async def _once_429(*args, **kwargs):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                resp = SimpleNamespace(status=429,
+                                       reason="Too Many Requests",
+                                       headers={"Retry-After": "4"})
+                err = discord.HTTPException(resp, "rate limited")
+                err.retry_after = 4.0
+                raise err
+            return await orig_edit(*args, **kwargs)
+
+        msg.edit = _once_429
+        task = asyncio.create_task(
+            cemod.edit_message(self.bot, 777, 2001, content="sb",
+                               timeout=5.0))
+        await self._tick_virtual(6.0)
+        result = await task
+        self.assertEqual(result, ("ok", "sb"))
+        self.assertEqual(len(msg.edits), 1)
+
+    async def test_gap_adapts_when_budget_is_tighter_than_model(self):
+        # Production falsified the 1.0s premise: Discord 429'd at
+        # a steady 1 edit/s from minute one. Calibrated to that
+        # observation, the fake bucket here refills 0.5/s (5 per
+        # 10s) instead of 1/s: the gap must grow so 429s stay
+        # rare, and the run reports the sustainable rate honestly
+        # instead of hammering the bucket.
+        gaps = []
+        counts, sb_edits, denied = await self._run_scenario(
+            2, bucket_window=10.0, gap_samples=gaps)
+        total = sum(counts) + sb_edits
+        print(f"[shared-budget] tighter bucket (refill 0.5/s): "
+              f"panels={counts}, scoreboard={sb_edits}, "
+              f"total={total}, 429s={denied}, "
+              f"max gap={max(gaps):.1f}s")
+        # Rare 429s (a couple while the gap adapts), never the
+        # ~15/min the old design produced.
+        self.assertLessEqual(denied, 4)
+        self.assertGreaterEqual(max(gaps), 1.5)
+        # The sustainable rate at the adapted gap (~2s): well
+        # below 60/min — that is the honest number for this
+        # budget, not a failure to fix.
+        self.assertGreaterEqual(total, 20)
+        self.assertLessEqual(total, 45)
+
+    async def test_worker_start_is_logged(self):
+        # The total absence of "[edits]" lines in the VM journal
+        # made the scheduler invisible — a dead or stalled worker
+        # could not be told apart from a healthy one. The worker
+        # now logs its start.
+        bucket = FakeBucket(now_fn=lambda: self.clock.now)
+        msg = FakeMessage(2001, "stale", bucket=bucket)
+        self.channel.messages[msg.id] = msg
+        with self.assertLogs("edits", level="INFO") as logs:
+            task = asyncio.create_task(
+                cemod.edit_message(self.bot, 777, 2001, content="v1"))
+            await self._tick_virtual(2.0)
+            await task
+        self.assertTrue(
+            any("edit worker started" in line for line in logs.output),
+            logs.output)
+
+
+class _FakeResp:
+    """Minimal aiohttp response stand-in for _raw_patch tests."""
+
+    def __init__(self, status, data):
+        self.status = status
+        self._data = data
+
+    async def json(self, content_type=None):
+        return self._data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    """Minimal aiohttp session stand-in: patch() returns a
+    canned response and records the URL + body."""
+
+    def __init__(self, status, data):
+        self.status = status
+        self.data = data
+        self.calls = []
+
+    def patch(self, url, json=None, timeout=None):
+        self.calls.append((url, json))
+        return _FakeResp(self.status, self.data)
+
+
+class TestRawPatchMapping(unittest.IsolatedAsyncioTestCase):
+    """The raw PATCH itself (channel_edits._raw_patch): status
+    mapping and retry_after parsing, with the session stubbed —
+    no network, no token."""
+
+    async def _run_raw(self, status, data):
+        session = _FakeSession(status, data)
+        orig = cemod._get_session
+
+        async def _fake_session(bot):
+            return session
+
+        cemod._get_session = _fake_session
+        try:
+            bot = SimpleNamespace(http=SimpleNamespace(token="tok"))
+            msg = SimpleNamespace(
+                channel=SimpleNamespace(id=777), id=2001)
+            return (await cemod._raw_patch(
+                        bot, msg, {"content": "v1"}), session)
+        finally:
+            cemod._get_session = orig
+
+    async def test_200_returns_ok(self):
+        (status, data), session = await self._run_raw(
+            200, {"id": "2001", "content": "v1"})
+        self.assertEqual(status, 200)
+        self.assertIn("/channels/777/messages/2001",
+                      session.calls[0][0])
+        self.assertEqual(session.calls[0][1]["content"], "v1")
+
+    async def test_429_returns_retry_after(self):
+        (status, data), _ = await self._run_raw(
+            429, {"retry_after": 4.5, "global": False})
+        self.assertEqual(status, 429)
+        self.assertEqual(data["retry_after"], 4.5)
+
+    async def test_404_returns_gone(self):
+        (status, data), _ = await self._run_raw(
+            404, {"message": "Unknown Message", "code": 10008})
+        self.assertEqual(status, 404)
+
+    async def test_no_token_falls_back_to_message_edit(self):
+        # No token (tests / offline): the edit goes through
+        # message.edit with the same (status, data) contract.
+        channel = FakeChannel()
+        msg = FakeMessage(2001, "stale")
+        channel.messages[2001] = msg
+        bot = FakeBot(channel)  # no .http, no token
+        status, data = await cemod._raw_patch(
+            bot, msg, {"content": "v2"})
+        self.assertEqual((status, data), (200, {}))
+        self.assertEqual(msg.content, "v2")
+
+    async def test_no_token_fallback_maps_429(self):
+        channel = FakeChannel()
+        msg = FakeMessage(2001, "stale")
+        channel.messages[2001] = msg
+        err = discord.HTTPException(
+            SimpleNamespace(status=429, reason="Too Many Requests"),
+            "rate limited")
+        err.retry_after = 3.0
+        msg.edit_error = err
+        bot = FakeBot(channel)
+        status, data = await cemod._raw_patch(
+            bot, msg, {"content": "v2"})
+        self.assertEqual(status, 429)
+        self.assertEqual(data, {"retry_after": 3.0})
 
 
 if __name__ == "__main__":

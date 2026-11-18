@@ -330,12 +330,20 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
     the stop lands cannot resurrect the scoreboard.
 
     The edit goes through the shared per-channel scheduler
-    (channel_edits) with a short timeout: the scoreboard must
-    never stall the 1s loop waiting behind a queue of panel
-    heartbeats — if its edit cannot land promptly it returns
-    False and the next tick retries it. (The entry's own
-    "blocked_until" field is retained only so old state files
-    still load; the live 429 pause lives in the scheduler.)"""
+    (channel_edits) with a timeout that covers one rate-limit
+    pause: the scheduler's raw PATCH returns a 429 at once and
+    retries the job once after retry_after (~3–5s in
+    production), so a 5s timeout lets the scoreboard's edit
+    land after a 429 episode instead of being thrown away — the
+    old 2.0s timeout was shorter than ONE discord.py retry
+    sleep, so every scoreboard edit since a restart timed out
+    and was discarded while resubmitting every tick. The
+    scoreboard must still never stall the 1s loop for long:
+    5s is the cap, and while the channel is paused the
+    scheduler refuses at once instead of queueing. (The entry's
+    own "blocked_until" field is retained only so old state
+    files still load; the live 429 pause lives in the
+    scheduler.)"""
     if channel_id in _stopped:
         return False
     now = time.time()
@@ -360,7 +368,7 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
         return True
     status, _landed = await channel_edits.edit_message(
         bot, channel_id, entry["message_id"], content=text,
-        timeout=2.0)
+        timeout=5.0)
     if status == "gone":
         # Deleted between ticks — post a fresh one once, unless
         # the channel was stopped in the meantime.
@@ -386,17 +394,25 @@ async def refresh_channel(bot: discord.Client, channel_id: int,
     return True
 
 
-async def _fetch_all() -> tuple[list[dict], list[dict], list[dict]]:
+async def _fetch_all() -> tuple[list[dict], list[dict], list[dict] | None]:
     """One watch tick: NPL + featured games + the raw live entries,
     cache bypassed, from exactly two 1xBet calls (onex_fetch_tick).
-    A failed fetch is [] — the loop never dies on provider errors.
-    The raw entries are shared with the game watches (watch.on_tick)
-    so there is no second 1-second poller."""
+    A failed fetch is ([], [], None) — raw None, not []: an empty
+    list would read as "nothing is live", while None says "the
+    fetch failed, we know nothing". The loop never dies on provider
+    errors, and the watches (watch.on_tick) must never count a
+    failed tick as their game vanishing. The raw entries are shared
+    with the game watches (watch.on_tick) so there is no second
+    1-second poller."""
     try:
-        npl, games, raw = await onex_fetch_tick()
+        npl, games, raw, ok = await onex_fetch_tick()
     except Exception as exc:
         log.warning("[scoreboard] tick fetch failed (%s)", type(exc).__name__)
-        npl, games, raw = [], [], []
+        return [], [], None
+    if not ok:
+        # Both live lists failed — npl/games/raw are empty because
+        # the fetch failed, not because nothing is live.
+        return [], [], None
     return npl, games, raw
 
 

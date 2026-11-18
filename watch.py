@@ -86,11 +86,17 @@ TERMINAL_STATUSES: dict[str, tuple[str, str, str]] = {
     "canc": ("cancelled", "❌", "Match cancelled"),
 }
 
-# A watched game that vanishes from the live list for this many
-# 1-second ticks is treated as finished/removed (it can flicker
-# out of the 50-game list while still live, so one tick is not
-# enough to end a watch).
-MISSING_TICKS_TO_END = 10
+# A watched game that vanishes from the live list is NOT ended at
+# once: the games1x2 feed caps at 50 entries, so a game can flicker
+# off the list for minutes while still live (18 Nov 2026: the NPL
+# Eliminator vanished that way and the 10-tick rule killed a live
+# watch). The watch ends only after this long of CONTINUOUS
+# absence from a live list that DID arrive — or on an explicit
+# terminal status (full-time / postponed / ...), handled where the
+# detail lands. A game that reappears before then resumes the SAME
+# panel; a tick whose fetch failed never counts at all (see
+# on_tick: it arrives as raw_games=None).
+MISSING_END_AFTER_S = 300.0
 
 # Gemini gets this long to resolve free text; on timeout the
 # caller falls back to the candidate list instead of hanging the
@@ -1260,7 +1266,7 @@ async def load_watches() -> None:
         _watches[(row["channel_id"], str(row["game_id"]))] = {
             "home": row.get("home", ""), "away": row.get("away", ""),
             "league": row.get("league", ""), "detail": row.get("detail") or DETAIL_SIMPLE,
-            "fmt": row.get("fmt") or "", "snapshot": snapshot, "missing": 0,
+            "fmt": row.get("fmt") or "", "snapshot": snapshot, "missing": 0, "missing_since": 0.0,
             # notify / panel_kind default to the old behaviour for
             # rows written before the /game-panel change.
             "notify": bool(row.get("notify", 1)),
@@ -1322,7 +1328,7 @@ async def start_watch(channel_id: int, entry: dict, level: str,
     _watches[(channel_id, game_id)] = {
         "home": detail.get("home", ""), "away": detail.get("away", ""),
         "league": detail.get("league", ""), "detail": level, "fmt": fmt,
-        "snapshot": snapshot, "missing": 0,
+        "snapshot": snapshot, "missing": 0, "missing_since": 0.0,
         "notify": bool(notify), "panel_kind": panel_kind,
         # Live panel: posted on the next 1s tick (see _refresh_panel)
         # and edited in place after that — never a second message.
@@ -1392,7 +1398,7 @@ async def register_game_panel(channel_id: int, game_id: str,
     _watches[(channel_id, game_id)] = {
         "home": detail.get("home", ""), "away": detail.get("away", ""),
         "league": detail.get("league", ""), "detail": level, "fmt": fmt,
-        "snapshot": snapshot, "missing": 0,
+        "snapshot": snapshot, "missing": 0, "missing_since": 0.0,
         "notify": False, "panel_kind": "detail",
         "panel_message_id": message_id, "panel_body": body,
         "panel_base_body": _strip_updated_footer(body),
@@ -1455,7 +1461,7 @@ async def adopt_game_panel(channel_id: int, game_id: str,
         entry = {
             "home": detail.get("home", ""), "away": detail.get("away", ""),
             "league": detail.get("league", ""), "detail": level, "fmt": fmt,
-            "snapshot": snapshot, "missing": 0,
+            "snapshot": snapshot, "missing": 0, "missing_since": 0.0,
             "notify": False, "panel_kind": kind,
             "panel_message_id": message_id, "panel_body": body,
             "panel_base_body": _strip_updated_footer(body),
@@ -2472,12 +2478,15 @@ _MOMENTUM_EVERY_S = 30.0
 _last_momentum_snapshot: dict[tuple[int, str], float] = {}
 
 
-async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
+async def on_tick(bot: discord.Client,
+                  raw_games: list[dict] | None) -> None:
     """One shared tick: diff every watched game against its stored
     snapshot and send ONLY on a real change. Called from
     scoreboard_loop — never raises, never sends duplicates, and
     never re-sends an event recorded in the history table (so a
-    restart cannot repeat an old alert)."""
+    restart cannot repeat an old alert). raw_games=None means the
+    tick's fetch failed: the watches are left untouched, since a
+    failed fetch says nothing about any game."""
     # Maintenance mode: silent — no panels, no alerts, no new
     # watches (the scoreboard loop also checks, this covers a
     # direct tick).
@@ -2487,7 +2496,8 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
         await _on_tick_locked(bot, raw_games)
 
 
-async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
+async def _on_tick_locked(bot: discord.Client,
+                          raw_games: list[dict] | None) -> None:
     # Barça auto-watch rides this same tick — no second poller.
     # It runs before the early return below so it also fires when
     # no game is watched yet.
@@ -2516,8 +2526,29 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
         try:
             raw = by_id.get(game_id)
             if raw is None:
-                watch["missing"] = watch.get("missing", 0) + 1
-                if watch["missing"] >= MISSING_TICKS_TO_END:
+                if raw_games is None:
+                    # The tick's fetch failed — an empty list here
+                    # says nothing about the game, so this tick
+                    # must never count toward ending the watch.
+                    continue
+                # Absent from a live list that DID arrive: the
+                # games1x2 feed caps at 50 entries, so a game can
+                # flicker off the list for minutes while still
+                # live. Hold the panel and end the watch only
+                # after MISSING_END_AFTER_S of continuous absence
+                # (an explicit terminal status ends it at once,
+                # handled where the detail lands below).
+                now = time.monotonic()
+                if not watch.get("missing_since"):
+                    watch["missing_since"] = now
+                    watch["missing"] = 1
+                    log.info("[watch] %s vs %s absent from live list — "
+                             "holding panel (ends after %.0fs away)",
+                             watch["home"], watch["away"],
+                             MISSING_END_AFTER_S)
+                else:
+                    watch["missing"] = watch.get("missing", 0) + 1
+                if now - watch["missing_since"] >= MISSING_END_AFTER_S:
                     # The panel (if one was posted) shows the ended
                     # state; the message below is the notification
                     # that the watch itself has ended. Priority: a
@@ -2541,10 +2572,19 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
                         (watch.get("snapshot") or {}).get("away_score"),
                         "ended")
                     await remove_watch(channel_id, game_id)
-                    log.info("[watch] ended %s vs %s (gone from live list)",
-                             watch["home"], watch["away"])
+                    log.info("[watch] ended %s vs %s (absent %.0fs)",
+                             watch["home"], watch["away"],
+                             now - watch["missing_since"])
                 continue
             watch["missing"] = 0
+            if watch.get("missing_since"):
+                # Back in the live list after an absence: the SAME
+                # panel resumes below — no /game needed.
+                log.info("[watch] %s vs %s back in live list after %.0fs — "
+                         "same panel resumes",
+                         watch["home"], watch["away"],
+                         time.monotonic() - watch["missing_since"])
+                watch["missing_since"] = 0.0
             detail = _detail_for_tick(raw, watch.get("fmt") or "")
             if detail is None:
                 continue

@@ -277,6 +277,39 @@ class TestPublicFunctions(unittest.IsolatedAsyncioTestCase):
                          [good[0]["id"], good[1]["id"]])
         prov._onex_reset_caches()
 
+    async def test_fetch_tick_reports_failed_fetch(self):
+        # Both live lists failing is a FETCH ERROR, not "nothing
+        # live": onex_fetch_tick says so, so the scoreboard can
+        # pass a failed tick (raw None) to the watches instead of
+        # an empty list that would age every watch toward ending.
+        prov._onex_reset_caches()
+
+        async def failing_get(url, headers, params=None, cache_key="",
+                              provider="x", refresh_fn=None):
+            raise ConnectionError("boom")
+
+        prov.hc.get = failing_get
+        npl, featured, raw, ok = await prov.onex_fetch_tick()
+        self.assertEqual((npl, featured, raw), ([], [], []))
+        self.assertFalse(ok)
+        prov._onex_reset_caches()
+
+    async def test_fetch_tick_reports_successful_empty_fetch(self):
+        # The mirror image: both lists arriving empty IS real data
+        # (nothing live) — ok stays True, so a genuinely finished
+        # game still ages out of its watch.
+        prov._onex_reset_caches()
+
+        async def empty_get(url, headers, params=None, cache_key="",
+                            provider="x", refresh_fn=None):
+            return []
+
+        prov.hc.get = empty_get
+        npl, featured, raw, ok = await prov.onex_fetch_tick()
+        self.assertEqual((npl, featured, raw), ([], [], []))
+        self.assertTrue(ok)
+        prov._onex_reset_caches()
+
     def test_npl_filter_skips_non_dict_entries(self):
         # Same family, in the NPL filter the scoreboard tick uses:
         # a non-dict entry (or a non-dict liga) must not kill the

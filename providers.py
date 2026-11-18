@@ -1428,7 +1428,7 @@ async def onex_game_detail(raw: dict) -> dict | None:
 # scoreboard's back-off still sees one empty tick per second.
 _ONEX_LIVE_TTL_S = 3.0
 _ONEX_FIXTURES_TTL_S = 60.0
-_live_cache: dict[str, Any] = {"ts": 0.0, "raw": None}
+_live_cache: dict[str, Any] = {"ts": 0.0, "raw": None, "fetch_ok": True}
 _fix_cache: dict[str, tuple[float, list[dict] | None]] = {
     "npl": (0.0, None), "uefa": (0.0, None),
 }
@@ -1438,6 +1438,7 @@ def _onex_reset_caches() -> None:
     """Clear the live + fixture caches (tests only)."""
     _live_cache["ts"] = 0.0
     _live_cache["raw"] = None
+    _live_cache["fetch_ok"] = True
     _fix_cache["npl"] = (0.0, None)
     _fix_cache["uefa"] = (0.0, None)
 
@@ -1452,6 +1453,9 @@ async def onex_live_raw() -> list[dict]:
     now = time.monotonic()
     cached = _live_cache["raw"]
     if cached is not None and now - _live_cache["ts"] < _ONEX_LIVE_TTL_S:
+        # Served from a fresh cache: the last fetch succeeded,
+        # so an absent game really is absent from live data.
+        _live_cache["fetch_ok"] = True
         return cached
 
     async def _one(url: str, params: dict) -> list | None:
@@ -1468,6 +1472,12 @@ async def onex_live_raw() -> list[dict]:
         _one(f"{_ONEX_FEED}/games1x2", _ONEX_GAMES1X2_PARAMS),
         _one(f"{_ONEX_FEED}/topGamesByStat", _ONEX_TOP_PARAMS),
     )
+    # Did the fetch itself succeed? Either list arriving is a
+    # success — even an empty list is real data (nothing live).
+    # Both failing is a fetch error, and the caller must not read
+    # the empty result as every game vanishing (see onex_fetch_tick
+    # and watch.on_tick: a failed tick never ages a watch).
+    _live_cache["fetch_ok"] = data1 is not None or data2 is not None
     out: list[dict] = []
     seen: set[str] = set()
     for data in (data1, data2):
@@ -1496,12 +1506,16 @@ def onex_last_success_ts() -> float:
     return _live_cache["ts"]
 
 
-async def onex_fetch_tick() -> tuple[list[dict], list[dict], list[dict]]:
+async def onex_fetch_tick() -> tuple[list[dict], list[dict], list[dict], bool]:
     """One watch tick's data, from exactly two 1xBet calls:
-    (npl_matches, featured_matches, raw_live_entries). The
-    scoreboard and the game watches share this tick — no second
-    1-second poller."""
+    (npl_matches, featured_matches, raw_live_entries, fetch_ok).
+    The scoreboard and the game watches share this tick — no second
+    1-second poller. fetch_ok is False when BOTH live lists failed:
+    raw is then [] because the fetch failed, not because nothing
+    is live — the caller must pass that on as a failed tick, never
+    as an empty live list."""
     raw = await onex_live_raw()
+    ok = bool(_live_cache.get("fetch_ok", True))
     npl = _onex_npl_from_games1x2(raw)
     featured: list[dict] = []
     for g in raw:
@@ -1510,7 +1524,7 @@ async def onex_fetch_tick() -> tuple[list[dict], list[dict], list[dict]]:
         m = _onex_norm_match(g)
         if m is not None:
             featured.append(m)
-    return npl, featured, raw
+    return npl, featured, raw, ok
 
 
 # --- line feed: fixtures (upcoming games, 1xBet only) ---------------

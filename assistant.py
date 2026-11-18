@@ -865,13 +865,15 @@ async def _handle_ask(interaction, text: str, model,
             await _send(interaction, "I couldn't tell which channel that "
                                      "watch is in.")
             return
-        # Unfollow stops the alerts and takes the game off the
-        # live board (same rule as the 🔕 button and /unwatch).
+        # Unfollow stops the alerts; the live panel keeps ticking
+        # in place while the game is live (same rule as the 🔕
+        # button and /unwatch).
         entry = await wmod.set_notify(channel_id, str(game_id), False)
         if entry:
             await _send(interaction,
                         f"🔕 Notifications off for **{entry['home']} vs "
-                        f"{entry['away']}** — it is off the live board now.")
+                        f"{entry['away']}** — the live panel keeps ticking "
+                        f"here while the game is live.")
         else:
             await _send(interaction,
                         "That game is not watched in this channel.")

@@ -257,7 +257,7 @@ class TestNotifyManagerDb(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await db.get_prefs(CHANNEL_ID, GAME_ID))
         self.assertTrue(any("Notifications off" in s
                             for s in interaction.response.sent))
-        self.assertTrue(any("it is off the live board now" in s
+        self.assertTrue(any("live panel keeps ticking" in s
                             for s in interaction.response.sent))
         # The game select now shows the empty state again — a
         # view-only panel is not a watched game.

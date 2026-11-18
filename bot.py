@@ -145,7 +145,6 @@ class FootballBot(discord.Client):
     async def setup_hook(self):
         await db.init()
         await watch.load_watches()
-        await watch.load_boards()
         # Maintenance gate for every slash command (see
         # _tree_interaction_check).
         self.tree.interaction_check = _tree_interaction_check
@@ -245,20 +244,20 @@ async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚽ Football Bot",
         description=(
-            "Follow a game and its live board updates every second; "
+            "Follow a game and its live panel ticks every second; "
             "goals and big moments send you a notification."
         ),
         color=0x00C851,
     )
     embed.add_field(name="📡 Live", value=(
         "`/live` — all live matches right now\n"
-        "`/game` — detail for one game; the live board in the channel updates every second while the game is on\n"
+        "`/game` — detail for one game; the reply ticks live every second while the game is on\n"
         "`/scoreboard` — live scoreboard (test channel only)\n"
         "`/stopscoreboard` — stop the scoreboard in this channel"
     ), inline=False)
     embed.add_field(name="👀 Follow a game", value=(
-        "`/watch` — follow a game; its live board updates every second, alerts on goals, wickets and cards\n"
-        "`/unwatch` — stop alerts for a game (it leaves the live board)\n"
+        "`/watch` — follow a game; its panel ticks live, alerts on goals, wickets and cards\n"
+        "`/unwatch` — stop alerts for a game (its live panel keeps ticking)\n"
         "`/watching` — games this channel follows\n"
         "`/notifications` — manage alerts for watched games\n"
         "`/history` — past matches and alerts that were sent"
@@ -566,10 +565,10 @@ async def cmd_stopscoreboard(interaction: discord.Interaction):
 async def _send_game_detail(interaction: discord.Interaction,
                             detail: dict, level: str) -> None:
     """Send a /game detail reply and, when the game is live, make
-    the reply the detail card: the channel's live board carries
-    the every-second score after that, and Follow switches alerts
-    on. When the game already has a panel in this channel the
-    reply stays a static detail card."""
+    the reply itself the live panel: the shared 1s tick edits it
+    in place (score + MM:SS clock) until full-time, with no new
+    messages. When the game already has a panel in this channel
+    the reply stays a static detail card."""
     body = watch.render_detail(detail, level,
                                updated=watch.now_npt_str())
     msg = await interaction.followup.send(
@@ -729,15 +728,15 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             await interaction.followup.send(msg, ephemeral=True)
         return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
-        # Unfollow stops the alerts and takes the game off the
-        # live board; its panel stays as a frozen card.
+        # Unfollow stops the alerts; the live panel keeps ticking
+        # in place while the game is live.
         entry = await watch.set_notify(
             target.id, str(resolved["game_id"]), False)
         if entry:
             await interaction.followup.send(
                 f"🔕 Notifications off for **{entry['home']} vs "
-                f"{entry['away']}** — it is off the live board now.",
-                ephemeral=True)
+                f"{entry['away']}** — the live panel keeps ticking "
+                f"here while the game is live.", ephemeral=True)
         else:
             await interaction.followup.send(
                 "That game is not watched in this channel.", ephemeral=True)
@@ -781,13 +780,13 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             "Could not find that game right now.", ephemeral=True)
         return
     # The game already has a live panel in this channel (a /game
-    # reply): Follow switches its alerts on and the board keeps
-    # carrying its row — never a second panel message.
+    # reply): Follow switches its alerts on and the panel keeps
+    # ticking — never a second panel message.
     if started.get("panel_exists"):
         await interaction.followup.send(
             f"🔔 Now following **{started['home']} vs {started['away']}** "
-            f"({started['league']}) — the live board in this channel "
-            f"updates every second; {level} alerts only for goals, wickets "
+            f"({started['league']}) — the live panel in this channel "
+            f"keeps ticking; {level} alerts only for goals, wickets "
             f"and cards.{channel_note}", ephemeral=True)
         return
     # The panel IS the reply when the game is live: one public
@@ -820,7 +819,7 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
         return
     await interaction.followup.send(
         f"👀 Watching **{started['home']} vs {started['away']}** "
-        f"({started['league']}) in <#{target.id}> — a live board there "
+        f"({started['league']}) in <#{target.id}> — a live panel there "
         f"updates every second; {level} alerts only for goals, wickets "
         f"and cards.{channel_note}", ephemeral=True)
 
@@ -852,14 +851,14 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
             f"No watched game matches '{game}' in this channel. "
             "Use `/watching` to see what is watched here.", ephemeral=True)
         return
-    # Unfollow stops the alerts and takes the game off the live
-    # board; the panel stays as a frozen card.
+    # Unfollow stops the alerts; the live panel keeps ticking in
+    # place while the game is live.
     entry = await watch.set_notify(
         interaction.channel_id, picked["game_id"], False)
     if entry:
         await interaction.followup.send(
             f"🔕 Stopped following **{entry['home']} vs {entry['away']}** — "
-            f"it is off the live board now.",
+            f"the live panel keeps ticking here while the game is live.",
             ephemeral=True)
     else:
         await interaction.followup.send("That watch is already gone.", ephemeral=True)

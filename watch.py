@@ -29,24 +29,12 @@ tapped on a /game reply that was never registered adopts that
 message as the panel. Timeline stays a one-off ephemeral list
 and Follow/Unfollow stay ephemeral confirms.
 
-A /game reply IS a panel too: it stays as the detail card while
-the game is live, with working buttons. Follow controls
-notifications ONLY, not the live view — a followed game sends
-event alerts; Unfollow stops the alerts and the game drops off
-the live board, while its detail card stays as it is until
-full-time. One registry, one tick for every game.
-
-THE LIVE BOARD: Discord's per-channel edit budget (~1 edit/sec
-sustained) means N separate panel messages in one channel can
-never each refresh every second — four panels need four
-edits/sec in one channel, and the journal proved it (3 panels,
-49 edits in 60s, with 429s). So the ticking surface is ONE
-board message per channel holding every live watched game as a
-compact row, edited in place once a second from the shared 1s
-tick — one edit refreshes every game at once, and routine
-changes never send a new message. Per-game panels no longer
-heartbeat-edit; they are detail cards whose buttons switch the
-view in place when tapped.
+A /game reply IS a panel too: the same tick edits the detail card
+in place (panel_kind "detail") while the game is live. Follow
+controls notifications ONLY, not the live view — a followed game
+ticks its panel and sends event alerts; Unfollow stops the alerts
+and the panel keeps ticking until full-time. One registry, one
+tick, one edit discipline for every panel.
 
 AI resolution: /watch takes free text. The text is resolved
 deterministically first (game ID, exact team name, unique partial
@@ -1329,16 +1317,15 @@ async def start_watch(channel_id: int, entry: dict, level: str,
                        level, fmt, snapshot, notify=notify,
                        panel_kind=panel_kind)
     # A re-follow keeps the old panel's message id, body and
-    # clock anchor, so the board's clock keeps running from the
-    # same anchor and a button tap still finds the same card.
+    # clock anchor, so the tick edits the same message.
     kept = old or {}
     _watches[(channel_id, game_id)] = {
         "home": detail.get("home", ""), "away": detail.get("away", ""),
         "league": detail.get("league", ""), "detail": level, "fmt": fmt,
         "snapshot": snapshot, "missing": 0,
         "notify": bool(notify), "panel_kind": panel_kind,
-        # Live board: the game joins the channel's board on the
-        # next 1s tick — never a second message.
+        # Live panel: posted on the next 1s tick (see _refresh_panel)
+        # and edited in place after that — never a second message.
         "panel_message_id": kept.get("panel_message_id"),
         "panel_body": kept.get("panel_body"),
         "panel_base_body": kept.get("panel_base_body"),
@@ -1362,7 +1349,7 @@ async def start_watch(channel_id: int, entry: dict, level: str,
 async def set_panel_message(channel_id: int, game_id: str,
                             message_id: int, body: str) -> None:
     """Record the panel message for a watch (in memory + db), so
-    a button tap finds this card and the game stays linked to it.
+    the 1s tick edits this message instead of posting a new one.
     Used when /watch posts the panel as its reply."""
     watch = _watches.get((channel_id, str(game_id)))
     if watch is not None:
@@ -1386,12 +1373,12 @@ async def post_panel_now(bot, channel_id: int, game_id: str,
 async def register_game_panel(channel_id: int, game_id: str,
                               message_id: int, body: str,
                               detail: dict, level: str) -> bool:
-    """Turn a /game reply into a live panel: the game joins the
-    channel's live board (its row ticks every second there) while
-    this message stays as the detail card — no event alerts are
-    sent — Follow switches alerts on later. False when the game
-    already has a panel in this channel (the reply stays a static
-    detail card instead of a second ticking message)."""
+    """Turn a /game reply into a live panel: the same 1s tick
+    edits this message in place (score + MM:SS clock) while the
+    game is live, but no event alerts are sent — Follow switches
+    alerts on later. False when the game already has a panel in
+    this channel (the reply stays a static detail card instead of
+    a second ticking message)."""
     game_id = str(game_id)
     if (channel_id, game_id) in _watches:
         return False
@@ -1502,9 +1489,7 @@ async def adopt_game_panel(channel_id: int, game_id: str,
 async def set_notify(channel_id: int, game_id: str,
                      notify: bool) -> dict | None:
     """Follow / Unfollow: switch event alerts for a game without
-    touching its panel — the card stays as it is either way.
-    Unfollow also drops a /watch game off the live board (a /game
-    detail card stays listed — it is a live view, not a follow).
+    touching its live panel — the panel keeps ticking either way.
     Returns the entry, or None when the game has no panel here."""
     watch = _watches.get((channel_id, str(game_id)))
     if watch is None:
@@ -1516,9 +1501,14 @@ async def set_notify(channel_id: int, game_id: str,
 
 async def remove_watch(channel_id: int, game_id: str) -> dict | None:
     entry = _watches.pop((channel_id, str(game_id)), None)
-    # No worker to cancel: the board is per-channel, not
-    # per-game — the next tick simply renders the board without
-    # this game's row.
+    # Stop the panel's worker, if one is waiting for its slot —
+    # it checks the watch itself, but cancelling avoids a stale
+    # edit landing after the watch is gone. Never cancel the
+    # task running right now (remove_watch can be reached from
+    # inside a worker's own _refresh_panel call).
+    task = _panel_workers.pop((channel_id, str(game_id)), None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
     await db.remove_watch(channel_id, str(game_id))
     return entry
 
@@ -1584,14 +1574,12 @@ def _updated_footer(updated: str | None) -> str:
 
 def render_panel(d: dict, clock: str | None = None,
                  updated: str | None = None) -> str:
-    """One game's compact panel: league header, score, ticking clock
+    """One game's live panel: league header, score, ticking clock
     (or overs / Innings break for cricket), Game ID line so the
-    panel buttons keep resolving. This is the /watch reply and the
-    view the 🔄 Live button switches to — a detail card, not the
-    ticking surface: the live BOARD carries the every-second
-    refresh now, so the tick no longer edits this message.
-    Pass clock=None to use the detail's own clock (one-off
-    refreshes); button taps pass the locally ticking MM:SS."""
+    panel buttons keep resolving. The panel is edited in place on
+    every tick — routine changes never send a new message. Pass
+    clock=None to use the detail's own clock (one-off refreshes);
+    the tick passes the locally ticking MM:SS."""
     status = str(d.get("status") or "")
     league = str(d.get("league") or "")
     if status == "FT":
@@ -1649,152 +1637,63 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
     return _clock_str(detail)
 
 
-# The board heartbeat: the board's Updated line advances every
-# second, like the ticking clock on the site — one edit per
-# second per channel refreshes EVERY game's row at once.
-# Score/overs/clock changes still land within a second; the
-# heartbeat only fires when nothing else changed, so a quiet
-# cricket row edits once a second on its footer alone. The
-# Updated time is the LAST-EDIT time, not a promise the score
-# moved — honest, and it is the only thing that can move when
-# no ball has been bowled.
+# Panel heartbeat: a panel whose game has not changed still
+# proves it is alive — the Updated line advances every second,
+# like the ticking clock on the site. Score/overs/clock changes
+# still land within a second; the heartbeat only fires when
+# nothing else changed, so a quiet cricket panel edits once a
+# second on its footer alone. The Updated time is the LAST-EDIT
+# time, not a promise the score moved — honest, and it is the
+# only thing that can move when no ball has been bowled.
 #
-# Why one board instead of one panel per game: Discord's
-# per-channel edit budget is ~1 edit/sec sustained (5 per 5s
-# burst). Four panels in one channel need four edits/sec, so
-# each panel only landed about every 3-4s — the journal proved
-# it (3 panels, 49 edits in 60s, with 429s). One board message
-# per channel needs exactly one edit/sec no matter how many
-# games are watched, so the refresh is a true 1s. Per-game
-# panels no longer heartbeat-edit; they are detail cards whose
-# buttons switch the view in place when tapped.
+# Every panel gets its edit on every tick (see
+# _schedule_panel_edits): the tick hands each panel's fresh
+# detail to that panel's worker task, content changes first,
+# and the workers space the edits 0.35s apart per channel.
+# The old design called _refresh_panel inline, one panel after
+# another, and its stagger gate let only ONE panel per channel
+# edit per tick — with four panels in one channel each panel's
+# Updated footer only advanced about every 4s, which is exactly
+# what the user saw. A worker always edits the FRESHEST pending
+# detail, so a panel never reverts to a stale score.
 _PANEL_HEARTBEAT_S = 1.0
 # Analytics momentum stays on its old 30s cadence — it is a db
 # read, not a visible edit, and nothing about it needs to move
 # every second.
 _PANEL_MOMENTUM_REFRESH_S = 30.0
-# Board edits: at most one per second per channel (the tick
-# itself), and a 429 pauses the board until the retry time.
-# One edit per second is exactly Discord's sustained budget,
-# so the board lands on every tick.
-_BOARD_MIN_EDIT_GAP_S = 1.0
-# Panel edits (one-off: full-time final, button taps,
-# post_panel_now): at most one per second per panel, and a 429
-# pauses that panel until the retry time.
+# Panel edits: at most one per second per panel (the tick itself),
+# and a 429 pauses that panel until the retry time — the same
+# discipline as the scoreboard's edits, but the ticking clock
+# needs the panel to update as fast as the tick allows.
 _PANEL_MIN_EDIT_GAP_S = 1.0
-# Channel stagger: at most one edit per channel per 0.35s, so
-# a board edit and a button-tap edit in one channel never fire
-# in the same instant. The stagger is a SPACING, not a skip:
-# an edit whose slot has not come yet waits for it (in its
-# worker) instead of being deferred to the next tick.
+# Channel stagger: at most one panel edit per channel per 0.35s,
+# so several panels ticking in one channel never fire in the
+# same instant. The stagger is a SPACING, not a skip: a panel
+# whose slot has not come yet waits for it (in its worker) instead
+# of being deferred to the next tick. A lone panel still edits
+# every second; a crowded channel shares the spacing.
 _CHANNEL_EDIT_GAP_S = 0.35
 _channel_last_edit: dict[int, float] = {}
 # Per-channel edit slot timeline: the monotonic time at which the
-# channel's next edit may fire. Workers take slots from it
+# channel's next panel edit may fire. Workers take slots from it
 # (each slot is _CHANNEL_EDIT_GAP_S after the previous one), so
 # edits in one channel form a continuous 0.35s-spaced stream
-# across ticks. _refresh_panel and _refresh_board also advance
-# it on any successful edit, so a button tap and a board edit
-# never collide.
+# across ticks. _refresh_panel also advances it on any successful
+# edit, so a button tap and a tick edit never collide.
 _channel_next_slot: dict[int, float] = {}
-# One live board per channel: {message_id, body, base_body,
-# last_edit, blocked_until, _pending_text, _pending_base}.
-# Persisted in db.live_boards so a restart resumes editing the
-# SAME message instead of posting a new one.
-_boards: dict[int, dict] = {}
-# One background worker task per board, keyed by channel_id.
-# A worker loops while its board has fresh text pending and
-# exits when there is nothing to do; the tick only hands it
-# fresh text and starts it if it is not already running — so
-# there is never more than one worker per board, and a board
-# never edits from stale text.
-_board_workers: dict[int, asyncio.Task] = {}
-# Games that ended on THIS tick (full-time): their final row
-# shows on the board once, then drops off on the next tick.
-# {channel_id: {game_id: detail}}
-_board_finals: dict[int, dict[str, dict]] = {}
+# One background worker task per live panel, keyed by
+# (channel_id, game_id). A worker loops while its panel has a
+# fresh detail pending and exits when there is nothing to do;
+# the tick only hands it fresh detail and starts it if it is not
+# already running — so there is never more than one worker per
+# panel, and a panel never edits from a stale detail.
+_panel_workers: dict[tuple, asyncio.Task] = {}
 # Cadence log: successful tick edits in the current 60s window.
 # Logged once a minute (see _maybe_log_panel_cadence) so the VM
-# journal can prove how fast the board really edits. One board
-# editing every second contributes ~60.
+# journal can prove how fast panels really edit.
 _PANEL_LOG_EVERY_S = 60.0
 _panel_log_window_start: float = 0.0
 _panel_log_edits: int = 0
-
-
-def _board_row(detail: dict, clock: str, final: bool = False) -> str:
-    """One watched game as a board row: teams, score, ticking
-    clock (MM:SS for football, overs for cricket), league."""
-    title = (f"**{detail.get('home', '?')} {_score_str(detail)} "
-             f"{detail.get('away', '?')}**")
-    league = str(detail.get("league") or "")
-    suffix = f" · {league}" if league else ""
-    if final:
-        status = str(detail.get("status") or "")
-        label = "Full-time" if status == "FT" else (status or "Ended")
-        return f"🏁 {title} · {label}{suffix}"
-    cricket = detail.get("cricket") or {}
-    if cricket.get("is_break"):
-        return f"{title} · Innings break{suffix}"
-    if cricket.get("over_str") is not None:
-        return f"{title} · {cricket['over_str']} ov{suffix}"
-    if clock == "Half-time":
-        return f"{title} · Half-time{suffix}"
-    if clock:
-        return f"{title} · {clock}{suffix}"
-    return f"{title}{suffix}"
-
-
-def render_board(rows: list, updated: str | None = None) -> str:
-    """The live board: one compact row per watched game, plus the
-    Updated footer — the visible proof the board is alive.
-    rows are (detail, clock, final) tuples. No rows: an honest
-    short line, never a new message."""
-    lines = ["🔴 Live now"]
-    if not rows:
-        lines.append("No live games being watched right now.")
-    else:
-        for detail, clock, final in rows:
-            lines.append(_board_row(detail, clock, final))
-    return "\n".join(lines) + _updated_footer(updated)
-
-
-def _board_included(watch: dict) -> bool:
-    """Does this watch get a row on its channel's board? A game
-    being followed (alerts on) does; so does a /game detail card
-    (a live view the user asked for) — including the advanced
-    analytics view of one. A /watch game the user unfollowed
-    (alerts off, compact kind) drops off the board — its panel
-    stays as a frozen card, but the board only lists games being
-    followed or viewed live."""
-    if watch.get("notify", True):
-        return True
-    return (watch.get("panel_kind") or "compact") in ("detail",
-                                                      "analytics")
-
-
-async def load_boards() -> None:
-    """Load persisted board message ids into memory (called once
-    at startup, next to load_watches). The first tick after a
-    restart edits the SAME board message — never a new one."""
-    try:
-        rows = await db.get_live_boards()
-    except Exception as exc:
-        log.warning("[watch] could not load boards (%s)",
-                    type(exc).__name__)
-        return
-    for row in rows:
-        message_id = row.get("message_id") or 0
-        if not message_id:
-            continue
-        _boards[int(row["channel_id"])] = {
-            "message_id": int(message_id), "body": None,
-            "base_body": None, "last_edit": 0.0,
-            "blocked_until": 0.0, "_pending_text": None,
-            "_pending_base": None,
-        }
-    if _boards:
-        log.info("[watch] loaded %d boards", len(_boards))
 
 
 async def _get_channel(bot: discord.Client, channel_id: int):
@@ -1867,19 +1766,16 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
                          text: str | None = None,
                          post_if_missing: bool = True,
                          heartbeat: bool = True) -> bool:
-    """Edit one game's panel message in place — one-off edits
-    only now (full-time final, a button tap switching the view,
-    post_panel_now): the every-second ticking moved to the live
-    board, so the tick no longer calls this. Pass text to edit
-    the panel to a fixed line (e.g. the ended state) instead of
-    rendering from detail. Returns True when a send/edit
-    happened. Never raises — a failed edit is retried on the
-    next call, a 429 pauses this panel until Discord says
-    otherwise, a deleted watch panel is re-posted once, and a
-    deleted /game panel stops quietly (its reply stays deleted,
-    no new message).
+    """Post the watch panel on its first tick, then edit it in
+    place whenever its text changes. Pass text to edit the panel to
+    a fixed line (e.g. the ended state) instead of rendering from
+    detail. Returns True when a send/edit happened. Never raises —
+    a failed edit is retried on the next tick, a 429 pauses this
+    panel until Discord says otherwise, a deleted watch panel is
+    re-posted once, and a deleted /game panel stops quietly (its
+    reply stays deleted, no new message).
 
-    A refresh compares the render WITHOUT the Updated footer
+    The tick compares the render WITHOUT the Updated footer
     (panel_base_body): a score/overs/clock change edits at once,
     and when nothing about the game changed the panel still
     heartbeat-edits its footer every second so it visibly proves
@@ -1961,8 +1857,8 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     edited = False
     try:
         if message is not None:
-            # No stagger gate here: the board worker spaces edits via
-            # _channel_next_slot (see _board_edit_worker), and
+            # No stagger gate here: the workers space edits via
+            # _channel_next_slot (see _panel_edit_worker), and
             # _refresh_panel advances that timeline on every
             # successful edit below, so a button tap and a worker
             # edit never land in the same instant. The old gate
@@ -2238,12 +2134,11 @@ class WatchAlertView(discord.ui.View):
     as a fallback when the view was built with a game id.
 
     Detail / Live / Simple / Advanced / Refresh switch the
-    game's live panel to that view IN PLACE — the board keeps
-    carrying the every-second refresh after that, so no tap ever
-    sends a fresh static snapshot while a panel exists. Timeline
-    shows the chronoLine events (a one-off list); Follow /
-    Unfollow start or stop a watch for this game in this
-    channel."""
+    game's live panel to that view IN PLACE — the tick keeps
+    editing it after that, so no tap ever sends a fresh static
+    snapshot while a panel exists. Timeline shows the chronoLine
+    events (a one-off list); Follow / Unfollow start or stop a
+    watch for this game in this channel."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Maintenance mode: a press answers with the short notice
@@ -2365,7 +2260,7 @@ class WatchAlertView(discord.ui.View):
         existing = _watches.get((channel_id, game_id))
         if existing is not None:
             # Follow controls notifications ONLY, not the live
-            # view: the game is already on the live board, it just
+            # view: a /game panel here keeps ticking, it just
             # starts sending event alerts too. No new message.
             if existing.get("notify", True):
                 await interaction.followup.send(
@@ -2376,8 +2271,8 @@ class WatchAlertView(discord.ui.View):
             await interaction.followup.send(
                 f"🔔 Now following **{existing['home']} vs "
                 f"{existing['away']}** — alerts on goals, wickets "
-                f"and cards. The live board here updates every "
-                f"second.", ephemeral=True)
+                f"and cards. The live panel keeps ticking here.",
+                ephemeral=True)
             return
         detail = await _fetch_live_detail(game_id)
         if detail is None:
@@ -2395,7 +2290,7 @@ class WatchAlertView(discord.ui.View):
             return
         await interaction.followup.send(
             f"👀 Watching **{started['home']} vs {started['away']}** — "
-            f"a live board in this channel updates every second; simple "
+            f"a live panel in this channel ticks every second; simple "
             f"alerts only when the game changes.", ephemeral=True)
 
     async def _on_unfollow(self, interaction: discord.Interaction):
@@ -2410,24 +2305,20 @@ class WatchAlertView(discord.ui.View):
             await interaction.followup.send(
                 "Could not tell which channel this is.", ephemeral=True)
             return
-        # Unfollow stops notifications ONLY — the panel stays as
-        # it is, and stops being listed at full-time. A /watch
-        # game also drops off the live board; a /game detail card
-        # (including its advanced view) stays listed (it is a live
-        # view, not a follow).
+        # Unfollow stops notifications ONLY — the live panel keeps
+        # ticking in place while the game is live, and stops on
+        # its own at full-time. The panel is the live view, not
+        # the subscription.
         entry = _watches.get((channel_id, game_id))
         if entry is None:
             await interaction.followup.send(
                 "That game is not watched in this channel.", ephemeral=True)
             return
         await set_notify(channel_id, game_id, False)
-        stays = (entry.get("panel_kind") or "compact") in ("detail",
-                                                           "analytics")
-        tail = ("the live board here still lists it."
-                if stays else "it is off the live board now.")
         await interaction.followup.send(
             f"🔕 Notifications off for **{entry['home']} vs "
-            f"{entry['away']}** — {tail}", ephemeral=True)
+            f"{entry['away']}** — the live panel keeps ticking here "
+            f"while the game is live.", ephemeral=True)
 
 
 async def _send_to_channel(bot: discord.Client, channel_id: int,
@@ -2468,158 +2359,79 @@ def _detail_for_tick(raw: dict, fmt: str) -> dict | None:
     return detail
 
 
-async def _refresh_board(bot: discord.Client, channel_id: int,
-                         text: str, base: str, board: dict) -> bool:
-    """Post the channel's live board on its first tick, then edit
-    it in place once a second. Returns True when a send/edit
-    happened. Never raises — a failed edit is retried on the next
-    tick, a 429 pauses the board until Discord says otherwise,
-    and a deleted board is re-posted once. The board carries no
-    buttons: it is a display, the per-game panels carry the
-    buttons. The base is only stored after a successful edit —
-    a failed edit must be retried, not swallowed."""
-    if text == board.get("body"):
-        return False
-    now = time.monotonic()
-    if now < (board.get("blocked_until") or 0):
-        return False
-    if now - (board.get("last_edit") or 0) < _BOARD_MIN_EDIT_GAP_S:
-        return False
-    channel = await _get_channel(bot, channel_id)
-    if channel is None:
-        return False
-    message_id = board.get("message_id")
-    message = None
-    if message_id:
-        try:
-            message = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            log.info("[watch] board message gone for channel %s; "
-                     "posting fresh", channel_id)
-            message_id = None
-            board["message_id"] = None
-        except discord.HTTPException as exc:
-            log.warning("[watch] board fetch failed for channel %s (%s)",
-                        channel_id, exc)
-            return False
-    edited = False
-    try:
-        if message is not None:
-            await message.edit(content=text,
-                               allowed_mentions=discord.AllowedMentions.none())
-            edited = True
-        else:
-            message = await channel.send(
-                text, allowed_mentions=discord.AllowedMentions.none())
-    except discord.NotFound:
-        # Deleted between fetch and edit: post a fresh one once.
-        try:
-            message = await channel.send(
-                text, allowed_mentions=discord.AllowedMentions.none())
-        except discord.HTTPException as exc:
-            log.warning("[watch] board re-post failed for channel %s (%s)",
-                        channel_id, exc)
-            return False
-    except discord.HTTPException as exc:
-        if getattr(exc, "status", None) == 429:
-            retry_after = getattr(exc, "retry_after", None) or 60
-            board["blocked_until"] = now + float(retry_after)
-            log.warning("[watch] board rate-limited for channel %s; "
-                        "paused %ss", channel_id, retry_after)
-        else:
-            log.warning("[watch] board edit failed for channel %s (%s)",
-                        channel_id, exc)
-        return False
-    new_id = getattr(message, "id", None)
-    if new_id != message_id:
-        board["message_id"] = new_id
-        try:
-            await db.set_live_board(channel_id, new_id)
-        except Exception:
-            pass
-    board["body"] = text
-    board["base_body"] = base
-    board["last_edit"] = now
-    board["blocked_until"] = 0.0
-    if edited:
-        _channel_last_edit[channel_id] = now
-        # Keep the slot timeline honest for every edit, whoever
-        # made it — a button tap must not let a board edit fire
-        # into the same instant, and vice versa.
-        _channel_next_slot[channel_id] = max(
-            _channel_next_slot.get(channel_id, 0.0),
-            time.monotonic() + _CHANNEL_EDIT_GAP_S)
-    return True
+# One tick at a time: the scoreboard calls on_tick once per
+# second, but a slow tick must never overlap the next one.
+def _panel_edit_plan(details: dict, changed: set) -> dict[int, list]:
+    """Order the panels each channel must refresh this tick:
+    content changes first (a goal, a wicket, a new over — the
+    snapshot moved), then the quiet ones oldest-edit-first, so
+    no panel is skipped and no heartbeat jumps ahead of a real
+    score change. Pure function, so the ordering is testable
+    without running a tick."""
+    plan: dict[int, list] = {}
+    for key in details:
+        plan.setdefault(key[0], []).append(key)
+    for keys in plan.values():
+        keys.sort(key=lambda k: (k not in changed,
+                                 _watches.get(k, {}).get("last_panel_edit")
+                                 or 0.0))
+    return plan
 
 
-def _drop_board_worker(task: asyncio.Task, channel_id: int) -> None:
-    _board_workers.pop(channel_id, None)
+def _drop_panel_worker(task: asyncio.Task, key: tuple) -> None:
+    _panel_workers.pop(key, None)
 
 
-def _schedule_board_edits(bot: discord.Client,
-                          board_texts: dict[int, tuple[str, str]]) -> None:
-    """Hand this tick's board refreshes to the per-channel
-    workers. Every channel with a live board gets ONE edit on
-    this tick — that single edit refreshes every game's row at
-    once, which is what makes a true 1s refresh possible inside
-    Discord's per-channel edit budget. A channel with no live
-    rows gets one edit to the empty state, then no heartbeat:
-    an empty board has nothing to prove. A board that was never
-    posted and has no rows is not posted at all."""
-    channels = set(board_texts) | set(_boards)
-    for channel_id in channels:
-        board = _boards.setdefault(channel_id, {
-            "message_id": None, "body": None, "base_body": None,
-            "last_edit": 0.0, "blocked_until": 0.0,
-            "_pending_text": None, "_pending_base": None,
-        })
-        entry = board_texts.get(channel_id)
-        if entry is None:
-            # No live rows: one edit to the empty state, then stop
-            # heartbeat-edits — unless the board is already empty
-            # or was never posted.
-            if board.get("message_id") is None:
+def _schedule_panel_edits(bot: discord.Client, details: dict,
+                          changed: set) -> None:
+    """Hand this tick's panel refreshes to the per-panel workers.
+    Every panel gets its edit on this tick — content changes
+    first, heartbeats after — instead of the old take-turns
+    design where the stagger gate let only one panel per channel
+    edit per tick. The workers space the edits 0.35s apart per
+    channel (see _panel_edit_worker), so the tick itself returns
+    at once and the scoreboard loop keeps its 1s cadence. A
+    panel that already has a worker running just gets fresher
+    detail handed to it — never a second worker."""
+    plan = _panel_edit_plan(details, changed)
+    for channel_id, keys in plan.items():
+        for key in keys:
+            watch = _watches.get(key)
+            if watch is None:
                 continue
-            empty_base = render_board([], updated=None)
-            if board.get("base_body") == empty_base:
-                continue
-            text = render_board([], updated=now_npt_str())
-            board["_pending_text"] = text
-            board["_pending_base"] = empty_base
-        else:
-            text, base = entry
-            board["_pending_text"] = text
-            board["_pending_base"] = base
-        if channel_id not in _board_workers:
-            task = asyncio.create_task(
-                _board_edit_worker(bot, channel_id))
-            _board_workers[channel_id] = task
-            task.add_done_callback(
-                lambda t, c=channel_id: _drop_board_worker(t, c))
+            watch["_pending_detail"] = details[key]
+            if key not in _panel_workers:
+                task = asyncio.create_task(
+                    _panel_edit_worker(bot, channel_id, key))
+                _panel_workers[key] = task
+                task.add_done_callback(
+                    lambda t, k=key: _drop_panel_worker(t, k))
 
 
-async def _board_edit_worker(bot: discord.Client, channel_id: int) -> None:
-    """One channel's board edit loop. Waits for this channel's
-    next edit slot (0.35s after the previous edit in the
-    channel), then edits the board with the FRESHEST pending
-    text — a newer tick may have replaced it while we waited —
-    and loops while fresh work keeps arriving. Exits when the
-    board is gone, there is nothing pending, or the board is
-    rate-limited (the next tick retries it). Never raises: a
-    failed edit is retried on the next tick, never a crash.
-    A 429 pauses ONLY this channel's board."""
+async def _panel_edit_worker(bot: discord.Client, channel_id: int,
+                             key: tuple) -> None:
+    """One panel's edit loop. Waits for this channel's next edit
+    slot (0.35s after the previous edit in the channel), then
+    edits the panel with the FRESHEST pending detail — a newer
+    tick may have replaced it while we waited — and loops while
+    fresh work keeps arriving. Exits when the watch is gone,
+    there is nothing pending, or the panel is rate-limited (the
+    next tick retries it). Never raises: a failed edit is
+    retried on the next tick, never a crash. A 429 pauses ONLY
+    this panel (via _refresh_panel's panel_blocked_until); the
+    other panels keep ticking."""
+    game_id = key[1]
     global _panel_log_edits
     try:
         while True:
-            board = _boards.get(channel_id)
-            if board is None:
+            watch = _watches.get(key)
+            if watch is None:
                 return
-            text = board.get("_pending_text")
-            if text is None:
+            detail = watch.get("_pending_detail")
+            if detail is None:
                 return
-            base = board.get("_pending_base")
-            if time.monotonic() < (board.get("blocked_until") or 0):
-                # Rate-limited: leave the text pending; the next
+            if time.monotonic() < (watch.get("panel_blocked_until") or 0):
+                # Rate-limited: leave the detail pending; the next
                 # tick starts a fresh worker after the pause ends.
                 return
             # Take this channel's next slot: edits in one channel
@@ -2630,42 +2442,40 @@ async def _board_edit_worker(bot: discord.Client, channel_id: int) -> None:
             _channel_next_slot[channel_id] = slot + _CHANNEL_EDIT_GAP_S
             if slot > now:
                 await asyncio.sleep(slot - now)
-                board = _boards.get(channel_id)
-                if board is None:
+                watch = _watches.get(key)
+                if watch is None:
                     return
-                text = board.get("_pending_text")
-                if text is None:
+                detail = watch.get("_pending_detail")
+                if detail is None:
                     return
-                base = board.get("_pending_base")
-                if time.monotonic() < (board.get("blocked_until") or 0):
+                if time.monotonic() < (watch.get("panel_blocked_until") or 0):
                     return
-            edited = await _refresh_board(bot, channel_id, text, base,
-                                          board)
+            edited = await _refresh_panel(bot, channel_id, game_id,
+                                          watch, detail)
             if not edited:
                 # Nothing changed, gated, or failed — leave the
-                # text pending; the next tick retries it.
+                # detail pending; the next tick retries it.
                 return
             _panel_log_edits += 1
-            # Only clear the pending text if it is still the
+            # Only clear the pending detail if it is still the
             # one we just edited — a newer tick may have replaced
             # it while we waited; then loop and edit the fresh one.
-            if board.get("_pending_text") is text:
-                board["_pending_text"] = None
-                board["_pending_base"] = None
+            if watch.get("_pending_detail") is detail:
+                watch["_pending_detail"] = None
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log.warning("[watch] board worker failed for channel %s (%s)",
-                    channel_id, type(exc).__name__)
+        log.warning("[watch] panel worker failed for %s (%s)",
+                    game_id, type(exc).__name__)
 
 
 def _maybe_log_panel_cadence() -> None:
-    """Once a minute, log how many games are watched and how
-    many board edits actually landed in the last 60s — the number
+    """Once a minute, log how many panels are registered and how
+    many tick edits actually landed in the last 60s — the number
     the VM journal can prove the refresh cadence from. (One
-    board editing every second contributes ~60; the old
-    per-panel design shared Discord's per-channel edit budget,
-    so four panels in one channel only totalled ~49.)"""
+    panel editing every second contributes ~60; four panels in
+    one channel share Discord's per-channel edit budget, so
+    their total is whatever that budget allows.)"""
     global _panel_log_window_start, _panel_log_edits
     if not _watches:
         _panel_log_window_start = 0.0
@@ -2712,7 +2522,7 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
     await maybe_auto_watch_barca()
     await maybe_team_follow_check()
     _maybe_log_panel_cadence()
-    if not _watches and not _boards:
+    if not _watches:
         return
     by_id: dict[str, dict] = {}
     for g in raw_games or []:
@@ -2720,10 +2530,15 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
         if gid:
             by_id[gid] = g
     # This loop collects each live game's fresh detail (and
-    # detects its events); the board refresh itself happens in
-    # _schedule_board_edits below — one edit per channel per tick
-    # refreshes every game's row at once.
+    # detects its events); the panel refreshes themselves happen
+    # in _schedule_panel_edits below, via the per-panel workers
+    # — every panel gets its edit on this tick, content changes
+    # first, spaced 0.35s apart per channel.
     details: dict[tuple, dict] = {}
+    # Keys whose snapshot moved this tick (a goal, a wicket, a
+    # new over — and a football clock, which advances every
+    # second): their panels go first in the edit order.
+    changed: set = set()
     for key, watch in list(_watches.items()):
         channel_id, game_id = key
         try:
@@ -2824,26 +2639,25 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
                     # Send failed: do not record, do not advance the
                     # snapshot — the next tick retries the same events.
                     continue
-            # Live board: routine changes (clock, score, overs)
-            # only ever edit the board in place — never a new
-            # message. A paused watch stays silent; its row keeps
-            # the last known state, frozen, until it resumes
-            # (see _board_texts). The board edit itself happens
-            # in the channel's worker (see _schedule_board_edits
-            # below) — this loop only hands it the fresh detail.
+            # Live panel: routine changes (clock, score, overs) only
+            # ever edit the panel in place — never a new message.
+            # A paused watch stays silent, panel included. The
+            # edit itself happens in the panel's worker (see
+            # _schedule_panel_edits below) — this loop only hands
+            # it the fresh detail and notes whether the game
+            # actually changed, so content changes go first.
             if not paused:
                 details[key] = detail
-                watch["_last_board_detail"] = detail
+                if snapshot != old:
+                    changed.add(key)
             watch["snapshot"] = snapshot
             await db.update_watch_snapshot(channel_id, game_id, snapshot)
             if is_terminal:
                 # Final state first, in place — the watch is
-                # removed below, so its panel would never tick
-                # again. The board shows this final row once,
-                # then drops it on the next tick.
+                # removed below, so its worker would never run.
+                # (Same inline edit as before the worker rework.)
                 await _refresh_panel(bot, channel_id, game_id, watch,
                                      detail, heartbeat=False)
-                _board_finals.setdefault(channel_id, {})[game_id] = detail
                 await history.record_match_result(
                     game_id, watch["home"], watch["away"],
                     watch.get("league", ""), str(detail.get("sport") or ""),
@@ -2857,46 +2671,10 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
             log.warning("[watch] tick failed for %s (%s)", game_id,
                         type(exc).__name__)
 
-    # Live board: one message per channel, edited once a second
-    # — that single edit refreshes every game's row at once,
-    # which is what makes a true 1s refresh possible inside
-    # Discord's per-channel edit budget. (The old per-panel
-    # design let only one panel per channel edit per tick at
-    # first, then all of them — and Discord's budget still
-    # capped the total at ~1 edit/sec/channel, so four panels
-    # each landed only about every 3-4s.)
-    _schedule_board_edits(bot, _board_texts(details))
-
-
-def _board_texts(details: dict) -> dict[int, tuple[str, str]]:
-    """Board (full text, base text) per channel for this tick.
-    Rows follow the watch order, so games never jump around.
-    A game with no fresh detail this tick (paused, or a failed
-    detail build) keeps its last row, frozen at its last known
-    state; a game that ended full-time shows its final row once,
-    then drops off on the next tick."""
-    now = time.monotonic()
-    rows: dict[int, list] = {}
-    for key, watch in list(_watches.items()):
-        if not _board_included(watch):
-            continue
-        detail = details.get(key)
-        if detail is not None:
-            clock = _panel_clock(watch, detail, now)
-            rows.setdefault(key[0], []).append((detail, clock, False))
-            continue
-        last = watch.get("_last_board_detail")
-        if last is None:
-            continue
-        clock = (watch.get("snapshot") or {}).get("clock") or ""
-        rows.setdefault(key[0], []).append((last, clock, False))
-    for channel_id, finals in _board_finals.items():
-        for game_id, detail in finals.items():
-            rows.setdefault(channel_id, []).append((detail, "", True))
-    _board_finals.clear()
-    out: dict[int, tuple[str, str]] = {}
-    for channel_id, channel_rows in rows.items():
-        base = render_board(channel_rows, updated=None)
-        out[channel_id] = (render_board(channel_rows,
-                                        updated=now_npt_str()), base)
-    return out
+    # Panel refreshes: every panel gets its edit on this tick —
+    # content changes first, heartbeats after — via the per-panel
+    # workers, which space the edits 0.35s apart per channel.
+    # (The old phase 2 let only one panel per channel edit per
+    # tick, so four panels in one channel took turns and each
+    # panel's Updated footer only advanced about every 4s.)
+    _schedule_panel_edits(bot, details, changed)

@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+import barcelona_reminder
 import db
 import providers as prov
 
@@ -702,6 +703,86 @@ _watches: dict[tuple[int, str], dict] = {}
 _loaded = False
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# BARÇA AUTO-WATCH — rides the shared 1s tick, no second poller.
+#
+# When an FC Barcelona match goes live, start a SIMPLE watch for it
+# in #general so goal alerts post there with no one typing /watch.
+# Silent by design: nothing is sent before kickoff or outside the
+# match — no "now watching" notice, no pre-match chatter. The
+# first message is whatever the normal on-change alerts send
+# (kickoff, then goals/cards/half-time/full-time) while the game
+# is live. The 12h reminder in barcelona_reminder.py is untouched.
+# ══════════════════════════════════════════════════════════════════════════
+
+# One auto-watch check per tick is too much (the search also reads
+# the fixture lists) — the 1s tick is cheap only when the check is
+# throttled, and a match only goes live once.
+_BARCA_CHECK_EVERY_S = 30.0
+_barca_last_check = 0.0
+
+# Statuses that mean "live right now" for a searched game.
+# "live" is the line-feed word for a fixture past kickoff; FT and
+# "?" / upcoming are never live.
+_BARCA_LIVE_STATUSES = ("live", "1h", "2h", "et", "pen", "ht",
+                        "half-time", "1st innings", "2nd innings")
+
+
+def _barca_already_watched(channel_id: int) -> bool:
+    """A Barcelona game already watched in this channel — manual
+    or auto — so the auto-watch never double-starts one."""
+    for (cid, _gid), w in _watches.items():
+        if cid != channel_id:
+            continue
+        if barcelona_reminder._is_barcelona(
+                {"home": w.get("home", ""), "away": w.get("away", "")}):
+            return True
+    return False
+
+
+async def maybe_auto_watch_barca() -> dict | None:
+    """Start a SIMPLE watch for a live Barcelona game in #general.
+    The game id comes from onex_search("Barcelona") against the
+    live list — never invented; if Barcelona is not live, start
+    nothing and stay silent. Returns the started game or None.
+    Never raises — a failed search just skips this check."""
+    global _barca_last_check
+    channel_id = barcelona_reminder.GENERAL_CHANNEL_ID
+    if not channel_id:
+        return None
+    if _barca_already_watched(channel_id):
+        return None
+    now = time.monotonic()
+    if now - _barca_last_check < _BARCA_CHECK_EVERY_S:
+        return None
+    _barca_last_check = now
+    try:
+        result = await prov.onex_search("Barcelona")
+    except Exception as exc:
+        log.warning("[barca-watch] search failed (%s)", type(exc).__name__)
+        return None
+    live = [g for g in (result or {}).get("games") or []
+            if str(g.get("status") or "").lower() in _BARCA_LIVE_STATUSES
+            and barcelona_reminder._is_barcelona(g)]
+    if not live:
+        return None
+    game = live[0]
+    entry = {"id": str(game["onex_id"]), "home": game.get("home", ""),
+             "away": game.get("away", ""), "league": game.get("league", ""),
+             "status": game.get("status", "")}
+    try:
+        started = await start_watch(channel_id, entry, DETAIL_SIMPLE)
+    except Exception as exc:
+        log.warning("[barca-watch] start failed (%s)", type(exc).__name__)
+        return None
+    if not started:
+        return None
+    log.info("[barca-watch] auto-watch started %s vs %s (game %s) "
+             "in channel %s", started["home"], started["away"],
+             started["game_id"], channel_id)
+    return started
+
+
 async def load_watches() -> None:
     """Load persisted watches into memory (called once at startup)."""
     global _loaded
@@ -946,6 +1027,10 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
     """One shared tick: diff every watched game against its stored
     snapshot and send ONLY on a real change. Called from
     scoreboard_loop — never raises, never sends duplicates."""
+    # Barça auto-watch rides this same tick — no second poller.
+    # It runs before the early return below so it also fires when
+    # no game is watched yet.
+    await maybe_auto_watch_barca()
     if not _watches:
         return
     by_id: dict[str, dict] = {}

@@ -22,6 +22,7 @@ from providers import (
     apf_upcoming, free_fixtures_for_day,
     sportsdb_day, sportsdb_live_matches,
     sofa_live_matches, apf_live, espn_live, onex_live_matches,
+    onex_all_live_matches,
     onex_search,
 )
 import watch
@@ -281,12 +282,50 @@ async def cmd_ai(interaction: discord.Interaction, prompt: str):
 
 
 # ── /live ────────────────────────────────────────────────────────────────────────
+LIVE_RENDER_CAP = 15  # most embeds one /live reply sends
+
+
+def _live_has_score(m: dict) -> bool:
+    """A game worth showing first: it has a score (0–0 counts) or a minute."""
+    return (m.get("home_score") is not None
+            or m.get("away_score") is not None
+            or isinstance(m.get("minute"), int))
+
+
+def merge_live_matches(sportsdb: list[dict], sofa: list[dict],
+                       apf: list[dict], onex: list[dict],
+                       espn: list[dict]) -> list[dict]:
+    """Merge + dedup the /live providers (SportsDB/SofaScore/
+    API-Football first, then ESPN, then 1xBet), preferring games
+    with a score/minute — a scoreless game never pushes a live
+    score off the cap. Pure: no network, no Discord. The caller
+    slices [:LIVE_RENDER_CAP]."""
+    seen_pairs = ({(m["home"], m["away"]) for m in sportsdb}
+                  | {(m["home"], m["away"]) for m in sofa}
+                  | {(m["home"], m["away"]) for m in apf})
+    combined = list(sportsdb) + list(sofa) + list(apf)
+    for m in espn:
+        pair = (m["home"], m["away"])
+        if pair not in seen_pairs:
+            combined.append(m)
+            seen_pairs.add(pair)
+    for m in onex:
+        pair = (m["home"], m["away"])
+        if pair not in seen_pairs:
+            combined.append(m)
+            seen_pairs.add(pair)
+    # Stable sort: scored games first, merge order kept inside
+    # each group.
+    combined.sort(key=lambda m: 0 if _live_has_score(m) else 1)
+    return combined
+
+
 @bot.tree.command(name="live", description="All live matches right now")
 async def cmd_live(interaction: discord.Interaction):
     await interaction.response.defer()
     espn_tasks = [espn_live(slug, lid) for lid, slug in ESPN_LEAGUE_MAP.items()]
     results = await asyncio.gather(
-        sportsdb_live_matches(), sofa_live_matches(), apf_live(), onex_live_matches(), *espn_tasks,
+        sportsdb_live_matches(), sofa_live_matches(), apf_live(), onex_all_live_matches(), *espn_tasks,
         return_exceptions=True,
     )
     sportsdb, sofa, apf, onex, *espn_results = results
@@ -299,19 +338,16 @@ async def cmd_live(interaction: discord.Interaction):
         if isinstance(r, tuple):
             espn.extend(r[0])
 
-    # Deduplicate: SportsDB/SofaScore/API-Football take priority over ESPN and 1xBet
-    seen_pairs = {(m["home"], m["away"]) for m in sportsdb} | {(m["home"], m["away"]) for m in sofa} | {(m["home"], m["away"]) for m in apf}
-    combined   = sportsdb + sofa + apf
-    for m in espn:
-        pair = (m["home"], m["away"])
-        if pair not in seen_pairs:
-            combined.append(m)
-            seen_pairs.add(pair)
-    for m in onex:
-        pair = (m["home"], m["away"])
-        if pair not in seen_pairs:
-            combined.append(m)
-            seen_pairs.add(pair)
+    if not onex:
+        # Full live list empty — fall back to the featured games
+        # rather than showing nothing.
+        try:
+            featured = await onex_live_matches()
+        except Exception:
+            featured = []
+        onex = featured if isinstance(featured, list) else []
+
+    combined = merge_live_matches(sportsdb, sofa, apf, onex, espn)
 
     # Cross-link APF fixture IDs onto SofaScore/ESPN matches so Stats/Events buttons work
     _crosslink_apf(combined, apf)
@@ -319,10 +355,11 @@ async def cmd_live(interaction: discord.Interaction):
     if not combined:
         await interaction.followup.send("No live matches right now.")
         return
-    for m in combined[:5]:
+    shown = combined[:LIVE_RENDER_CAP]
+    for m in shown:
         await interaction.followup.send(embed=match_embed(m), view=MatchView(m))
-    if len(combined) > 5:
-        await interaction.followup.send(f"…and {len(combined)-5} more live matches.")
+    if len(combined) > len(shown):
+        await interaction.followup.send(f"…and {len(combined)-len(shown)} more live matches.")
 
 
 # ── /scoreboard ───────────────────────────────────────────────────────────────

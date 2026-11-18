@@ -1435,5 +1435,305 @@ class TestSportFilter(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Cricket", sports)
 
 
+def _live_match(home, away, hs=None, aws=None, minute=None,
+                provider="onexbet"):
+    """A /live Match dict, as _onex_norm_match builds it."""
+    return {"id": f"m_{home}", "sofa_id": None, "apf_id": None,
+            "onex_id": None, "home": home, "away": away,
+            "home_norm": home.lower(), "away_norm": away.lower(),
+            "home_score": hs, "away_score": aws,
+            "home_logo": "", "away_logo": "",
+            "status": "2H" if minute is not None else "?",
+            "status_code": 0, "minute": minute,
+            "league": "Test League", "league_id": 0, "sofa_lid": 0,
+            "date": "", "stadium": "", "referee": "",
+            "provider": provider, "finished": False}
+
+
+class TestAllLiveMatches(unittest.IsolatedAsyncioTestCase):
+    """Feature B, provider side: onex_all_live_matches returns the
+    FULL live list (games1x2 + topGamesByStat), not just featured."""
+
+    def setUp(self):
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {"771747666": _load("gameinfo_771747666.json")}
+        self.stub = StubHttp(self)
+        prov.hc.get = self.stub.get
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+
+    async def test_full_list_beats_featured(self):
+        all_live = await prov.onex_all_live_matches()
+        featured = await prov.onex_live_matches()
+        ids = {str(m["onex_id"]) for m in all_live}
+        # 5 games1x2 + 1 game only in topGamesByStat.
+        self.assertEqual(len(all_live), 6)
+        self.assertIn("771747999", ids)
+        self.assertEqual(len(featured), 2)
+        self.assertTrue(len(all_live) > len(featured))
+
+    async def test_empty_when_nothing_live(self):
+        self.games1x2 = []
+        self.top = []
+        prov._onex_reset_caches()
+        self.assertEqual(await prov.onex_all_live_matches(), [])
+
+
+class TestLiveMerge(unittest.TestCase):
+    """Feature B, merge side: dedup kept, scored games first."""
+
+    def test_dedup_keeps_first_provider(self):
+        first = _live_match("Alpha", "Beta", 1, 0, 55,
+                            provider="sportsdb")
+        dup = _live_match("Alpha", "Beta", 1, 0, 55,
+                          provider="onexbet")
+        import bot as botmod
+        out = botmod.merge_live_matches([first], [], [], [dup], [])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["provider"], "sportsdb")
+
+    def test_scored_games_first(self):
+        plain = _live_match("Plain", "Team")
+        scored = _live_match("Scored", "Team", 2, 1, 70)
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [plain, scored], [])
+        self.assertEqual([m["home"] for m in out],
+                         ["Scored", "Plain"])
+
+    def test_zero_zero_counts_as_scored(self):
+        plain = _live_match("Plain", "Team")
+        nil = _live_match("Nil", "Draw", 0, 0, 12)
+        import bot as botmod
+        out = botmod.merge_live_matches([], [], [], [plain, nil], [])
+        self.assertEqual(out[0]["home"], "Nil")
+
+
+class _RecordingFollowup:
+    """FakeFollowup that also keeps embeds (FakeFollowup drops them)."""
+
+    def __init__(self):
+        self.embeds = []
+        self.texts = []
+        self.views = []
+
+    async def send(self, content=None, ephemeral=False, view=None,
+                   **kwargs):
+        if kwargs.get("embed") is not None:
+            self.embeds.append(kwargs["embed"])
+        if content is not None:
+            self.texts.append(content)
+        self.views.append(view)
+
+
+class TestLiveCommand(unittest.IsolatedAsyncioTestCase):
+    """Feature B, command side: /live renders the full list, capped
+    at 15, and falls back to featured when the full list is empty."""
+
+    def _run_live(self, interaction, onex_all, featured):
+        import bot as botmod
+
+        return patch.object(botmod, "sportsdb_live_matches",
+                            new=AsyncMock(return_value=[])), \
+            patch.object(botmod, "sofa_live_matches",
+                         new=AsyncMock(return_value=[])), \
+            patch.object(botmod, "apf_live",
+                         new=AsyncMock(return_value=[])), \
+            patch.object(botmod, "onex_all_live_matches",
+                         new=AsyncMock(return_value=onex_all)), \
+            patch.object(botmod, "onex_live_matches",
+                         new=AsyncMock(return_value=featured)), \
+            patch.object(botmod, "espn_live",
+                         new=AsyncMock(return_value=([], None)))
+
+    async def test_full_list_capped_at_fifteen(self):
+        import bot as botmod
+
+        plains = [_live_match(f"Plain{i:02d}", "Opp") for i in range(10)]
+        scored = [_live_match(f"Scored{i:02d}", "Opp", 1, 0, 60)
+                  for i in range(10)]
+        interaction = FakeInteraction()
+        interaction.followup = _RecordingFollowup()
+        patches = self._run_live(interaction, plains + scored, [])
+        with patches[0], patches[1], patches[2], \
+                patches[3], patches[4], patches[5]:
+            await botmod.cmd_live.callback(interaction)
+        titles = " ".join(e.title for e in interaction.followup.embeds)
+        self.assertEqual(len(interaction.followup.embeds), 15)
+        self.assertEqual(interaction.followup.texts,
+                         ["…and 5 more live matches."])
+        # All 10 scored games shown first, then the first 5 plains.
+        for i in range(10):
+            self.assertIn(f"Scored{i:02d}", titles)
+        self.assertIn("Plain04", titles)
+        self.assertNotIn("Plain05", titles)
+
+    async def test_empty_full_list_falls_back_to_featured(self):
+        import bot as botmod
+
+        featured = [_live_match("Feat", "Team", 1, 1, 33)]
+        interaction = FakeInteraction()
+        interaction.followup = _RecordingFollowup()
+        patches = self._run_live(interaction, [], featured)
+        with patches[0], patches[1], patches[2], \
+                patches[3], patches[4], patches[5]:
+            await botmod.cmd_live.callback(interaction)
+        titles = [e.title for e in interaction.followup.embeds]
+        self.assertEqual(len(titles), 1)
+        self.assertIn("Feat", titles[0])
+        self.assertEqual(interaction.followup.texts, [])
+
+    async def test_no_games_at_all(self):
+        import bot as botmod
+
+        interaction = FakeInteraction()
+        interaction.followup = _RecordingFollowup()
+        patches = self._run_live(interaction, [], [])
+        with patches[0], patches[1], patches[2], \
+                patches[3], patches[4], patches[5]:
+            await botmod.cmd_live.callback(interaction)
+        self.assertEqual(interaction.followup.embeds, [])
+        self.assertEqual(interaction.followup.texts,
+                         ["No live matches right now."])
+
+
+class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
+    """Feature A: a live Barcelona game starts a silent SIMPLE watch
+    in #general — no announcement, no pre-match chatter. The first
+    message is whatever the normal on-change alerts send."""
+
+    def setUp(self):
+        import barcelona_reminder as barca
+
+        self._barca = barca
+        self._orig_channel = barca.GENERAL_CHANNEL_ID
+        barca.GENERAL_CHANNEL_ID = 777
+        self._orig_get = prov.hc.get
+        self.games1x2 = _load("games1x2_barca.json")
+        self.top = _load("top.json")
+        self.line_npl = _load("line_npl.json")
+        self.gameinfo = {}
+        self.stub = StubHttp(self)
+        prov.hc.get = self.stub.get
+        prov._onex_reset_caches()
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp3"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        self._orig_check = wmod._barca_last_check
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._barca_last_check = 0.0
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        wmod._barca_last_check = self._orig_check
+        self._barca.GENERAL_CHANNEL_ID = self._orig_channel
+        prov.hc.get = self._orig_get
+        prov._onex_reset_caches()
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    async def test_starts_once_for_live_barca_game(self):
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(wmod._watches), 1)
+        key, entry = next(iter(wmod._watches.items()))
+        self.assertEqual(key, (777, "771800001"))
+        self.assertEqual(entry["detail"], "simple")
+        self.assertEqual(entry["home"], "FC Barcelona")
+        rows = await db.list_watches(777)
+        self.assertEqual(len(rows), 1)
+        # Silent: no announcement message in the channel.
+        self.assertEqual(len(self.channel.sent), 0)
+        # Second tick: still one watch, still silent.
+        wmod._barca_last_check = 0.0
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(wmod._watches), 1)
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_no_start_when_barca_not_live(self):
+        self.games1x2 = _load("games1x2.json")
+        prov._onex_reset_caches()
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(wmod._watches, {})
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_no_double_start_when_already_watched(self):
+        # A manual watch for the same game in #general (advanced):
+        # the auto-watch must not start a second one.
+        snap = wmod.snapshot_from_detail(
+            {"home": "FC Barcelona", "away": "Real Madrid",
+             "home_score": 1, "away_score": 0, "status": "2H",
+             "minute": 65, "clock": "65:00", "stats": None,
+             "cricket": None})
+        snap["_home"], snap["_away"] = "FC Barcelona", "Real Madrid"
+        wmod._watches[(777, "771800001")] = {
+            "home": "FC Barcelona", "away": "Real Madrid",
+            "league": "Spain. LaLiga", "detail": "advanced", "fmt": "",
+            "snapshot": snap, "missing": 0,
+        }
+        await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(wmod._watches), 1)
+        self.assertEqual(
+            wmod._watches[(777, "771800001")]["detail"], "advanced")
+
+    async def test_upcoming_barca_does_not_start(self):
+        upcoming = {"onex_id": 771800002, "home": "FC Barcelona",
+                    "away": "Villarreal", "league": "Spain. LaLiga",
+                    "status": "upcoming", "home_score": None,
+                    "away_score": None}
+        with patch.object(wmod.prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [upcoming],
+                                                      "detail": None})):
+            await wmod.on_tick(self.bot, [])
+        self.assertEqual(wmod._watches, {})
+
+    async def test_barca_b_does_not_start(self):
+        b_team = {"onex_id": 771800003, "home": "FC Barcelona B",
+                  "away": "Someone", "league": "Spain. Segunda",
+                  "status": "2H", "home_score": 1, "away_score": 0}
+        with patch.object(wmod.prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [b_team],
+                                                      "detail": None})):
+            await wmod.on_tick(self.bot, [])
+        self.assertEqual(wmod._watches, {})
+
+    async def test_check_throttled_to_thirty_seconds(self):
+        self.games1x2 = _load("games1x2.json")
+        prov._onex_reset_caches()
+        with patch.object(wmod.prov, "onex_search",
+                          wraps=wmod.prov.onex_search) as spy:
+            await wmod.on_tick(self.bot, [])
+            await wmod.on_tick(self.bot, [])
+            self.assertEqual(spy.call_count, 1)
+            wmod._barca_last_check = 0.0
+            await wmod.on_tick(self.bot, [])
+            self.assertEqual(spy.call_count, 2)
+
+    async def test_no_search_when_channel_not_configured(self):
+        self._barca.GENERAL_CHANNEL_ID = 0
+        with patch.object(wmod.prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": None})) as spy:
+            await wmod.on_tick(self.bot, [])
+            spy.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

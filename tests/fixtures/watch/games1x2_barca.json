@@ -1,0 +1,53 @@
+[
+ {
+  "id": 771800001,
+  "mainGameId": 771800001,
+  "liga": {
+   "id": 140,
+   "name": "Spain. LaLiga"
+  },
+  "opponent1": {
+   "fullName": "FC Barcelona"
+  },
+  "opponent2": {
+   "fullName": "Real Madrid"
+  },
+  "startTs": 1794931200,
+  "matchInfoObj": {
+   "location": "Spotify Camp Nou",
+   "matchFormat": "",
+   "weatherDescription": "Clear skies",
+   "temperature": "+20\u00b0C"
+  },
+  "scores": {
+   "scoreOpp1": 1,
+   "scoreOpp2": 0,
+   "timer": {
+    "timeSec": 3900
+   },
+   "statusLineStr": "65 minutes",
+   "currentPeriod": 2,
+   "currentPeriodName": "2nd half",
+   "tabloStats": {
+    "0": [
+     {
+      "id": 1,
+      "s1": "2",
+      "s2": "1",
+      "name": "Yellow cards"
+     },
+     {
+      "id": 2,
+      "s1": "0",
+      "s2": "0",
+      "name": "Red card"
+     }
+    ]
+   }
+  },
+  "sport": {
+   "id": 1,
+   "name": "Football"
+  }
+ }
+]

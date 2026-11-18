@@ -925,6 +925,27 @@ async def onex_live_matches(use_cache: bool = True) -> list[Match]:
     return [m for g in data if (m := _onex_norm_match(g)) is not None]
 
 
+async def onex_all_live_matches() -> list[Match]:
+    """Every live game from 1xBet (games1x2 + topGamesByStat merged,
+    via the shared tick cache) — the full live list, not just the
+    ~5 featured games topGamesByStat returns. Served from the same
+    cache /game and /watch use, so no extra 1xBet calls. [] when
+    1xBet answers with no live games."""
+    raw = await onex_live_raw()
+    out: list[Match] = []
+    seen: set[str] = set()
+    for g in raw:
+        m = _onex_norm_match(g)
+        if m is None:
+            continue
+        gid = str(m["onex_id"])
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append(m)
+    return out
+
+
 async def onex_events(game_id: int, home: str, away: str) -> list[Event]:
     """Match timeline (goals, penalty goals, substitutions) from chronoLine.
 

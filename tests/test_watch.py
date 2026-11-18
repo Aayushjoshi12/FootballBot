@@ -558,7 +558,8 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         await wmod.on_tick(self.bot, self.games1x2)
         self.assertEqual(len(self.channel.sent), 0)
         # And the panel itself is not edited either — no change,
-        # no heartbeat yet (the seed's edit is seconds old).
+        # no heartbeat yet (the seed's edit is moments old, under
+        # the 1s heartbeat).
         self.assertEqual(len(self.channel.messages[2001].edits), 0)
 
     async def test_advanced_alert_keeps_stats_table_and_has_buttons(self):
@@ -2738,9 +2739,11 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
     def _reset_gaps(self):
         # The 1s per-panel gap and the channel stagger are real
         # time — reset them so a second tick in the test can edit.
-        # Two seconds ago, not 0.0: that defeats the 1s gap but
-        # keeps the 30s heartbeat quiet, so a second tick with no
-        # change does not heartbeat-edit the panel again.
+        # Two seconds ago, not 0.0: that defeats the 1s gap. Note
+        # the 1s heartbeat now fires on a no-change tick, so this
+        # helper is only used before ticks that change something
+        # (or the stagger test, where the two-phase tick keeps a
+        # heartbeat from taking the slot ahead of a score change).
         for watch in wmod._watches.values():
             watch["last_panel_edit"] = time.monotonic() - 2.0
         wmod._channel_last_edit.clear()
@@ -2918,6 +2921,53 @@ class TestGamePanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(b.edits), 1)
         self.assertEqual(len(self.channel.sent), 0)
 
+    async def test_live_panel_edits_every_second_via_footer(self):
+        # The 1s heartbeat: a live football panel whose score and
+        # clock have not moved still edits once a second, on its
+        # Updated footer alone — no new message.
+        msg = self._seed_game_panel()
+        clock = {"n": 0}
+
+        def _ticking_time():
+            clock["n"] += 1
+            return f"12:00:0{clock['n']}"
+
+        with patch.object(wmod, "now_npt_str",
+                          side_effect=_ticking_time):
+            await wmod.on_tick(self.bot, self.games1x2)
+            self.assertEqual(len(self.channel.sent), 0)
+            self.assertEqual(len(msg.edits), 1)
+            self.assertIn("-# Updated 12:00:01 NPT", msg.edits[0])
+            # A second later: the footer advances again.
+            self._reset_gaps()
+            await wmod.on_tick(self.bot, self.games1x2)
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 2)
+        self.assertIn("-# Updated 12:00:02 NPT", msg.edits[1])
+
+    async def test_content_change_is_not_starved_by_heartbeats(self):
+        # Two panels in one channel: one idle (heartbeat only),
+        # one with a real score change pending. The score change
+        # lands on the first tick (phase 1); the idle panel's
+        # heartbeat waits and catches up on the next tick —
+        # heartbeats never starve a score change, and there is
+        # still only one edit per channel per tick (no storm).
+        idle = self._seed_game_panel()
+        stale = self._seed_panel_for_raw(2, 2002, "771750037")
+        await wmod.on_tick(self.bot, [self.games1x2[0],
+                                      self.games1x2[2]])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(stale.edits), 1)
+        self.assertEqual(len(idle.edits), 0)
+        # Next tick: the idle panel's heartbeat catches up.
+        self._reset_gaps()
+        await wmod.on_tick(self.bot, [self.games1x2[0],
+                                      self.games1x2[2]])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(idle.edits), 1)
+        self.assertIn("-# Updated", idle.edits[0])
+        self.assertEqual(len(stale.edits), 1)
+
     async def test_game_panel_persists_across_restart(self):
         import bot as botmod
 
@@ -3028,8 +3078,8 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
             "panel_base_body": body,
             "panel_static": wmod._panel_static_from_detail(detail),
             "panel_momentum": None, "panel_momentum_ts": 0.0,
-            # Edited 2s ago: the 1s gap passes, the 30s
-            # heartbeat does not fire.
+            # Edited 2s ago: the 1s gap passes, so a no-change
+            # tick heartbeat-edits the footer (1s heartbeat).
             "last_panel_edit": time.monotonic() - 2,
             "panel_blocked_until": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
@@ -3078,13 +3128,35 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msg.edits), 1)
         self.assertIn("77/2", msg.edits[0])
 
-    async def test_cricket_no_change_edits_nothing(self):
+    async def test_cricket_no_change_heartbeat_edits_every_second(self):
+        # The 1s heartbeat: a cricket panel whose score has not
+        # moved still edits once a second, on its Updated footer
+        # alone — no new message, score unchanged.
         msg = self._seed_cricket_panel()
-        await wmod.on_tick(self.bot, self.npl)
-        self.assertEqual(len(self.channel.sent), 0)
-        self.assertEqual(len(msg.edits), 0)
+        clock = {"n": 0}
 
-    async def test_cricket_heartbeat_edits_after_30s_idle(self):
+        def _ticking_time():
+            clock["n"] += 1
+            return f"12:00:0{clock['n']}"
+
+        with patch.object(wmod, "now_npt_str",
+                          side_effect=_ticking_time):
+            await wmod.on_tick(self.bot, self.npl)
+            self.assertEqual(len(self.channel.sent), 0)
+            self.assertEqual(len(msg.edits), 1)
+            self.assertIn("10.5 ov", msg.edits[0])
+            self.assertIn("-# Updated 12:00:01 NPT", msg.edits[0])
+            # A second later: the footer advances again.
+            wmod._watches[(777, "771678099")]["last_panel_edit"] = \
+                time.monotonic() - 2
+            wmod._channel_last_edit.clear()
+            await wmod.on_tick(self.bot, self.npl)
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 2)
+        self.assertIn("10.5 ov", msg.edits[1])
+        self.assertIn("-# Updated 12:00:02 NPT", msg.edits[1])
+
+    async def test_cricket_heartbeat_edits_after_1s_idle(self):
         detail = self._detail()
         base = wmod.render_detail(detail, wmod.DETAIL_SIMPLE)
         msg = FakeMessage(2001, base + "\n\n-# Updated 00:00:01 NPT")
@@ -3099,17 +3171,19 @@ class TestCricketPanel(unittest.IsolatedAsyncioTestCase):
             "panel_body": msg.content, "panel_base_body": base,
             "panel_static": {}, "panel_momentum": None,
             "panel_momentum_ts": 0.0,
-            # Nothing changed for over 30s: the heartbeat fires.
-            "last_panel_edit": time.monotonic() - 31,
+            # Nothing changed for over 1s: the heartbeat fires.
+            "last_panel_edit": time.monotonic() - 2,
             "panel_blocked_until": 0.0,
             "panel_timer_sec": None, "panel_timer_ts": 0.0,
         }
-        await wmod.on_tick(self.bot, self.npl)
+        with patch.object(wmod, "now_npt_str",
+                          return_value="12:00:05"):
+            await wmod.on_tick(self.bot, self.npl)
         self.assertEqual(len(self.channel.sent), 0)
         self.assertEqual(len(msg.edits), 1)
         # The score is unchanged; only the Updated time moved.
         self.assertIn("10.5 ov", msg.edits[0])
-        self.assertIn("-# Updated", msg.edits[0])
+        self.assertIn("-# Updated 12:00:05 NPT", msg.edits[0])
         self.assertNotIn("00:00:01", msg.edits[0])
 
     async def test_detail_button_adopts_static_card_and_it_ticks(self):

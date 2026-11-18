@@ -19,10 +19,11 @@ goals, wickets, cards and other big events send a separate
 notification. When the game ends the panel shows the final score
 and stops ticking. The panel proves it is alive with an
 "Updated HH:MM:SS NPT" footer: the footer advances on every
-edit, and when the game itself has not changed for 30s the tick
-heartbeat-edits the footer alone, so a cricket panel whose score
-has not moved for an over still shows life without an edit every
-second. Detail / Live / Simple / Advanced / Refresh switch the
+edit, and when the game itself has not changed the tick
+heartbeat-edits the footer alone every second, so a cricket
+panel whose score has not moved for an over still shows life —
+the panel edits once a second, like the ticking clock on the
+site. Detail / Live / Simple / Advanced / Refresh switch the
 panel's view IN PLACE (never a fresh static snapshot); a button
 tapped on a /game reply that was never registered adopts that
 message as the panel. Timeline stays a one-off ephemeral list
@@ -1435,15 +1436,24 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
 
 
 # Panel heartbeat: a panel whose game has not changed still
-# proves it is alive — the Updated line advances at most every
-# 30s, the way the scoreboard force-refreshes every 5 min.
-# Score/overs/clock changes still land within a second; the
-# heartbeat only fires when nothing else changed, so a quiet
-# cricket panel shows life without an edit every second. The
-# Updated time is the LAST-EDIT time, not a promise the score
-# moved — honest, and it is the only thing that can move when
-# no ball has been bowled.
-_PANEL_HEARTBEAT_S = 30.0
+# proves it is alive — the Updated line advances every second,
+# like the ticking clock on the site. Score/overs/clock changes
+# still land within a second; the heartbeat only fires when
+# nothing else changed, so a quiet cricket panel edits once a
+# second on its footer alone. The Updated time is the LAST-EDIT
+# time, not a promise the score moved — honest, and it is the
+# only thing that can move when no ball has been bowled.
+# The heartbeat must never starve a real score change: each
+# tick refreshes panels whose game changed first (phase 1) and
+# only then heartbeats the quiet ones, oldest edit first
+# (phase 2) — a heartbeat never takes the channel slot ahead
+# of a score change, and idle panels take turns instead of the
+# first one hogging the slot every tick.
+_PANEL_HEARTBEAT_S = 1.0
+# Analytics momentum stays on its old 30s cadence — it is a db
+# read, not a visible edit, and nothing about it needs to move
+# every second.
+_PANEL_MOMENTUM_REFRESH_S = 30.0
 # Panel edits: at most one per second per panel (the tick itself),
 # and a 429 pauses that panel until the retry time — the same
 # discipline as the scoreboard's edits, but the ticking clock
@@ -1526,7 +1536,8 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
                          game_id: str, watch: dict,
                          detail: dict | None = None,
                          text: str | None = None,
-                         post_if_missing: bool = True) -> bool:
+                         post_if_missing: bool = True,
+                         heartbeat: bool = True) -> bool:
     """Post the watch panel on its first tick, then edit it in
     place whenever its text changes. Pass text to edit the panel to
     a fixed line (e.g. the ended state) instead of rendering from
@@ -1539,10 +1550,13 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     The tick compares the render WITHOUT the Updated footer
     (panel_base_body): a score/overs/clock change edits at once,
     and when nothing about the game changed the panel still
-    heartbeat-edits its footer every 30s so it visibly proves it
-    is alive. The base is only stored after a successful edit —
+    heartbeat-edits its footer every second so it visibly proves
+    it is alive. The base is only stored after a successful edit —
     a failed edit must be retried, not swallowed by the
-    heartbeat."""
+    heartbeat. heartbeat=False skips the heartbeat edit (a
+    content change still edits) — the tick's first pass uses it
+    so a heartbeat never takes the channel slot ahead of a score
+    change."""
     new_base = None
     if text is None:
         if detail is None:
@@ -1550,9 +1564,10 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
         now = time.monotonic()
         if watch.get("panel_kind") == "analytics" and \
                 now - (watch.get("panel_momentum_ts") or 0) \
-                >= _PANEL_HEARTBEAT_S:
+                >= _PANEL_MOMENTUM_REFRESH_S:
             # The momentum estimate stays fresh without a db read
-            # on every tick — same 30s cadence as the heartbeat.
+            # on every tick — still a 30s cadence, even though the
+            # heartbeat itself is now 1s.
             try:
                 watch["panel_momentum"] = await history.momentum_summary(game_id)
             except Exception:
@@ -1562,6 +1577,8 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
         base = _render_panel_view(detail, watch, clock, updated=None)
         if base == watch.get("panel_base_body"):
             # Nothing about the game changed: heartbeat only.
+            if not heartbeat:
+                return False
             if now - (watch.get("last_panel_edit") or 0) \
                     < _PANEL_HEARTBEAT_S:
                 return False
@@ -2142,6 +2159,10 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
         gid = str(g.get("id") or g.get("mainGameId") or "")
         if gid:
             by_id[gid] = g
+    # Phase 1 (this loop) refreshes panels whose game changed;
+    # phase 2 (below) heartbeats the quiet ones. Details are
+    # collected here so phase 2 does not re-derive them.
+    details: dict[tuple, dict] = {}
     for key, watch in list(_watches.items()):
         channel_id, game_id = key
         try:
@@ -2246,8 +2267,9 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
             # ever edit the panel in place — never a new message.
             # A paused watch stays silent, panel included.
             if not paused:
+                details[key] = detail
                 await _refresh_panel(bot, channel_id, game_id, watch,
-                                     detail)
+                                     detail, heartbeat=False)
             watch["snapshot"] = snapshot
             await db.update_watch_snapshot(channel_id, game_id, snapshot)
             if is_terminal:
@@ -2263,3 +2285,24 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
         except Exception as exc:
             log.warning("[watch] tick failed for %s (%s)", game_id,
                         type(exc).__name__)
+
+    # Phase 2 — heartbeat: panels whose game did not change still
+    # edit once a second on their Updated footer. Content changes
+    # already had their turn in phase 1, so a heartbeat never
+    # starves a real score change; oldest edit first, so several
+    # idle panels in one channel take turns instead of the first
+    # one hogging the slot every tick. A panel whose phase-1
+    # content edit was stagger-deferred retries here, in the same
+    # oldest-first order.
+    if details:
+        for key in sorted(
+                (k for k in details if k in _watches),
+                key=lambda k: (_watches[k].get("last_panel_edit")
+                               or 0.0)):
+            channel_id, game_id = key
+            try:
+                await _refresh_panel(bot, channel_id, game_id,
+                                     _watches[key], details[key])
+            except Exception as exc:
+                log.warning("[watch] heartbeat failed for %s (%s)",
+                            game_id, type(exc).__name__)

@@ -217,6 +217,18 @@ def ensure_running(bot) -> None:
     task = getattr(bot, "barcelona_task", None)
     if task is None or task.done():
         if task is not None and not task.cancelled() and task.exception() is not None:
+            exc = task.exception()
             log.error("[barcelona] restarting failed worker")
+            # Feature 7: record the recovery attempt (never raise
+            # here). Local import: health imports scoreboard and
+            # barcelona_reminder's caller chain, so keep it local.
+            try:
+                import health
+                asyncio.create_task(health.log_recovery(
+                    "barcelona_reminder",
+                    "reminder worker failed; restarted",
+                    {"error": type(exc).__name__} if exc else None))
+            except Exception:
+                pass
         bot.barcelona_task = asyncio.create_task(poll_loop(bot), name="barcelona-reminders")
     bot.barcelona_wake.set()

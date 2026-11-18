@@ -29,6 +29,7 @@ import discord
 
 import barcelona_reminder
 import db
+import history
 import providers as prov
 
 log = logging.getLogger("watch")
@@ -36,6 +37,27 @@ NEPAL = ZoneInfo("Asia/Kathmandu")
 
 DETAIL_SIMPLE = "simple"
 DETAIL_ADVANCED = "advanced"
+
+# Every event kind the engine can detect. Prefs (Feature 5)
+# filter on these; history (Feature 6) records them.
+EVENT_KINDS = (
+    "goal", "wicket", "yellow", "red", "penalty", "sub",
+    "kickoff", "ht", "second_half", "ft", "break", "correction",
+    "postponed", "suspended", "abandoned", "cancelled",
+)
+# Statuses that end a match without a final whistle on the
+# scoreboard: the feed may report them for a fixture that never
+# starts or is stopped. Normalised lower-case -> (kind, icon, label).
+TERMINAL_STATUSES: dict[str, tuple[str, str, str]] = {
+    "postponed": ("postponed", "📅", "Match postponed"),
+    "pst": ("postponed", "📅", "Match postponed"),
+    "suspended": ("suspended", "⏸", "Match suspended"),
+    "interrupted": ("suspended", "⏸", "Match suspended"),
+    "abandoned": ("abandoned", "⚠️", "Match abandoned"),
+    "abd": ("abandoned", "⚠️", "Match abandoned"),
+    "cancelled": ("cancelled", "❌", "Match cancelled"),
+    "canc": ("cancelled", "❌", "Match cancelled"),
+}
 
 # A watched game that vanishes from the live list for this many
 # 1-second ticks is treated as finished/removed (it can flicker
@@ -159,6 +181,65 @@ def render_detail(d: dict, level: str = DETAIL_SIMPLE) -> str:
     return "\n".join(lines)
 
 
+# Preferred stat order for the analytics table (Feature 4);
+# any stat the feed sends that is not listed here is appended
+# after these, in the order it arrived. "Fouls" is not in the
+# feed's stats, so it never appears — nothing is invented.
+_ANALYTICS_ORDER = (
+    "Possession %", "Shots on target", "Shots off target", "Corner",
+    "Yellow cards", "Red card", "Attacks", "Dangerous attacks",
+    "xG", "Saves", "Penalty", "Substitutions", "Key Passes",
+    "Passing Accuracy %", "Crosses",
+)
+_ANALYTICS_LABELS = {"Possession %": "Possession", "Corner": "Corners"}
+
+
+def render_analytics(d: dict, momentum: str | None = None) -> str:
+    """Advanced analytics view: home/away comparison table from
+    the stats the feed actually carries, plus cricket target/
+    need/run-rate when present and a momentum estimate when one
+    was computed from real snapshots. Ends with the Game ID line
+    so the panel buttons on this message keep resolving."""
+    lines = [f"**{d.get('home', '?')} {_score_str(d)} {d.get('away', '?')}**"]
+    if d.get("league"):
+        lines.append(str(d["league"]))
+    lines.append("")
+    lines.append(_clock_str(d))
+    stats = d.get("stats") or []
+    by_name = {str(s.get("name")): s for s in stats}
+    ordered = [n for n in _ANALYTICS_ORDER if n in by_name]
+    ordered += [n for n in by_name if n not in _ANALYTICS_ORDER]
+    if ordered:
+        lines.append("")
+        lines.append("**Match statistics**")
+        lines.append("| Statistic | Home | Away |")
+        lines.append("|---|---:|---:|")
+        for name in ordered:
+            s = by_name[name]
+            label = _ANALYTICS_LABELS.get(name, name)
+            lines.append(f"| {label} | {s.get('home', '')} | {s.get('away', '')} |")
+    else:
+        lines.append("")
+        lines.append("No match statistics available yet.")
+    cricket = d.get("cricket") or {}
+    if cricket.get("target") is not None:
+        lines.append(f"Target: {cricket['target']}")
+        need = cricket.get("need")
+        balls = cricket.get("balls_left")
+        if need is not None:
+            lines.append(f"Need: {need} off {balls} balls" if balls is not None
+                         else f"Need: {need} runs")
+    if cricket.get("run_rate"):
+        lines.append(f"Run rate: {cricket['run_rate']}")
+    if momentum:
+        lines.append("")
+        lines.append(momentum)
+    gid = str(d.get("onex_id") or d.get("id") or "?")
+    const = d.get("const_id")
+    lines.append(f"Game ID: {gid}" + (f" · {const}" if const else ""))
+    return "\n".join(lines)
+
+
 def render_match_list(games: list[dict]) -> str:
     """Numbered pick list when a name matches several games."""
     lines = ["Found more than one game — pick one by its ID:\n"]
@@ -249,47 +330,90 @@ def snapshot_from_detail(d: dict) -> dict:
     }
 
 
-def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str]:
-    """Event lines for what changed between two snapshots.
+def _score_runs(score: object) -> int | None:
+    """Numeric score: football "2" -> 2, cricket "120/2" -> 120
+    (runs). None when there is no score yet."""
+    if score is None:
+        return None
+    text = str(score).strip()
+    if not text or text in ("?", "–"):
+        return None
+    try:
+        return int(text.split("/")[0])
+    except ValueError:
+        return None
+
+
+def detect_events(old: dict, new: dict, level: str = DETAIL_SIMPLE,
+                  game_id: str = "") -> list[dict]:
+    """Event dicts for what changed between two snapshots:
+    {"kind", "key", "text"}. key is stable across restarts
+    (game + kind + score + clock/counts) so the history table
+    can dedup it — a restart never re-sends an old event.
     Nothing changed -> []. A cricket score that only moved in
-    runs (no wicket) is NOT an event — it would spam every ball."""
-    events: list[str] = []
+    runs (no wicket) is NOT an event — it would spam every ball.
+    A score that went DOWN is a correction, never a goal."""
+    events: list[dict] = []
     title = f"{new.get('_home', '?')} {new['home_score']}–{new['away_score']} {new.get('_away', '?')}"
     clock = new.get("clock") or ""
     suffix = f" ({clock})" if clock else ""
 
+    def _key(kind: str, extra: str = "") -> str:
+        base = f"{game_id}|{kind}|{new.get('home_score')}–{new.get('away_score')}|{clock}"
+        return base + (f"|{extra}" if extra else "")
+
+    def _add(kind: str, text: str, extra: str = "") -> None:
+        events.append({"kind": kind, "key": _key(kind, extra), "text": text})
+
     old_status, new_status = old.get("status", ""), new.get("status", "")
     if old_status in ("upcoming", "", "?") and new_status == "live":
-        events.append(f"▶ **Kickoff** — {title}{suffix}")
+        _add("kickoff", f"▶ **Kickoff** — {title}{suffix}")
     if new_status == "HT" and old_status != "HT":
-        events.append(f"⏸ **Half-time** — {title}{suffix}")
+        _add("ht", f"⏸ **Half-time** — {title}{suffix}")
+    if old_status == "HT" and new_status == "2H":
+        _add("second_half", f"▶ **Second-half start** — {title}{suffix}")
     if new_status == "FT" and old_status != "FT":
-        events.append(f"⏱ **Full-time** — {title}")
+        _add("ft", f"⏱ **Full-time** — {title}")
+        return events
+    terminal = TERMINAL_STATUSES.get(str(new_status).strip().lower())
+    if terminal and old_status != new_status:
+        kind, icon, label = terminal
+        _add(kind, f"{icon} **{label}** — {title}")
         return events
     if new.get("is_break") and not old.get("is_break"):
-        events.append(f"☕ **Innings break** — {title}{suffix}")
+        _add("break", f"☕ **Innings break** — {title}{suffix}")
     if old.get("home_score") != new.get("home_score") or old.get("away_score") != new.get("away_score"):
         # First sighting ("" -> "0") is kickoff, not a goal.
         first = (old.get("home_score") in (None, "")
                  and old.get("away_score") in (None, ""))
         if first:
             return events
-        old_wk = _wickets(old.get("home_score"))
-        new_wk = _wickets(new.get("home_score"))
-        old_wk2 = _wickets(old.get("away_score"))
-        new_wk2 = _wickets(new.get("away_score"))
-        if ((old_wk is not None and new_wk is not None and new_wk > old_wk)
-                or (old_wk2 is not None and new_wk2 is not None and new_wk2 > old_wk2)):
-            events.append(f"🏏 **WICKET** — {title}{suffix}")
-        elif new.get("status") not in ("upcoming", "", "?"):
-            # Football score change is a goal; cricket runs alone
-            # (no wicket) are skipped above by the wicket check —
-            # but a football score has no "/" so _wickets returns 0
-            # for both sides and this branch fires correctly.
-            if "/" not in (new.get("home_score") or "") and "/" not in (new.get("away_score") or ""):
-                events.append(f"⚽ **GOAL** — {title}{suffix}")
+        old_h, old_a = _score_runs(old.get("home_score")), _score_runs(old.get("away_score"))
+        new_h, new_a = _score_runs(new.get("home_score")), _score_runs(new.get("away_score"))
+        if ((old_h is not None and new_h is not None and new_h < old_h)
+                or (old_a is not None and new_a is not None and new_a < old_a)):
+            # Score went DOWN: a correction (reversed goal), not a goal.
+            _add("correction",
+                 f"✏️ **Score corrected** — was {old.get('home_score')}–{old.get('away_score')}, "
+                 f"now {title}{suffix}")
+        else:
+            old_wk = _wickets(old.get("home_score"))
+            new_wk = _wickets(new.get("home_score"))
+            old_wk2 = _wickets(old.get("away_score"))
+            new_wk2 = _wickets(new.get("away_score"))
+            if ((old_wk is not None and new_wk is not None and new_wk > old_wk)
+                    or (old_wk2 is not None and new_wk2 is not None and new_wk2 > old_wk2)):
+                _add("wicket", f"🏏 **WICKET** — {title}{suffix}")
+            elif new.get("status") not in ("upcoming", "", "?"):
+                # Football score change is a goal; cricket runs alone
+                # (no wicket) are skipped above by the wicket check —
+                # but a football score has no "/" so _wickets returns 0
+                # for both sides and this branch fires correctly.
+                if "/" not in (new.get("home_score") or "") and "/" not in (new.get("away_score") or ""):
+                    _add("goal", f"⚽ **GOAL** — {title}{suffix}")
     old_stats, new_stats = old.get("stats") or {}, new.get("stats") or {}
-    for label, icon in (("Yellow cards", "🟨"), ("Red card", "🟥")):
+    for label, icon, kind in (("Yellow cards", "🟨", "yellow"),
+                              ("Red card", "🟥", "red")):
         o = old_stats.get(label)
         n = new_stats.get(label)
         if o is None or n is None:
@@ -300,23 +424,43 @@ def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str
         except ValueError:
             continue
         if nh > oh:
-            events.append(f"{icon} **Yellow card** — {title}{suffix} (home {nh}, was {oh})" if label == "Yellow cards" else f"{icon} **RED CARD** — {title}{suffix} (home {nh}, was {oh})")
+            _add(kind, f"{icon} **{'Yellow card' if kind == 'yellow' else 'RED CARD'}** — {title}{suffix} (home {nh}, was {oh})", f"home:{nh}")
         if na > oa:
-            events.append(f"{icon} **Yellow card** — {title}{suffix} (away {na}, was {oa})" if label == "Yellow cards" else f"{icon} **RED CARD** — {title}{suffix} (away {na}, was {oa})")
+            _add(kind, f"{icon} **{'Yellow card' if kind == 'yellow' else 'RED CARD'}** — {title}{suffix} (away {na}, was {oa})", f"away:{na}")
+    # Penalty awarded: a major event at both levels (a scored
+    # penalty also fires its own GOAL line above; a missed one
+    # only shows here). Substitutions stay advanced-only — simple
+    # watches chose minimal alerts.
+    o = old_stats.get("Penalty")
+    n = new_stats.get("Penalty")
+    if o is not None and n is not None:
+        try:
+            oh, oa = int(o[0] or 0), int(o[1] or 0)
+            nh, na = int(n[0] or 0), int(n[1] or 0)
+        except ValueError:
+            oh = oa = nh = na = 0
+        if nh > oh or na > oa:
+            _add("penalty", f"🎯 **Penalty** — {title}{suffix} (now {nh}–{na}, was {oh}–{oa})", f"{nh}–{na}")
     if level == DETAIL_ADVANCED:
-        for label, icon in (("Penalty", "🎯"), ("Substitutions", "🔄")):
-            o = old_stats.get(label)
-            n = new_stats.get(label)
-            if o is None or n is None:
-                continue
+        o = old_stats.get("Substitutions")
+        n = new_stats.get("Substitutions")
+        if o is not None and n is not None:
             try:
                 oh, oa = int(o[0] or 0), int(o[1] or 0)
                 nh, na = int(n[0] or 0), int(n[1] or 0)
             except ValueError:
-                continue
+                oh = oa = nh = na = 0
             if nh > oh or na > oa:
-                events.append(f"{icon} **{label}** — {title}{suffix} (now {nh}–{na}, was {oh}–{oa})")
+                _add("sub", f"🔄 **Substitutions** — {title}{suffix} (now {nh}–{na}, was {oh}–{oa})", f"{nh}–{na}")
     return events
+
+
+def detect_changes(old: dict, new: dict, level: str = DETAIL_SIMPLE) -> list[str]:
+    """Event lines for what changed between two snapshots.
+    Nothing changed -> []. Kept as the plain-text wrapper around
+    detect_events (same texts, same order) for callers that only
+    need the lines."""
+    return [e["text"] for e in detect_events(old, new, level)]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -783,6 +927,77 @@ async def maybe_auto_watch_barca() -> dict | None:
     return started
 
 
+async def _prefs_for(channel_id: int, game_id: str) -> tuple[set[str] | None, bool, str]:
+    """Effective notification prefs for a watch: (allowed kinds
+    or None for "all", paused, detail override or ""). A missing
+    row or an empty events list means "everything, not paused".
+    Never raises — a failed read means defaults."""
+    try:
+        row = await db.get_prefs(channel_id, game_id)
+    except Exception as exc:
+        log.warning("[watch] prefs read failed (%s)", type(exc).__name__)
+        return None, False, ""
+    if row is None:
+        return None, False, ""
+    events = row.get("events") or []
+    allowed = set(events) if events else None
+    return allowed, bool(row.get("paused")), str(row.get("detail") or "")
+
+
+# Team follows (Feature 5): same throttled pattern as the Barça
+# auto-watch — one check per 30s, reads the tick cache only.
+_TEAM_CHECK_EVERY_S = 30.0
+_team_last_check = 0.0
+
+
+async def maybe_team_follow_check() -> None:
+    """Start watches for live games involving a followed team.
+    Silent: nothing is sent before kickoff or outside the match
+    — the normal on-change alerts do the talking."""
+    global _team_last_check
+    now = time.monotonic()
+    if now - _team_last_check < _TEAM_CHECK_EVERY_S:
+        return
+    _team_last_check = now
+    try:
+        follows = await db.get_all_team_follows()
+    except Exception as exc:
+        log.warning("[team-follow] read failed (%s)", type(exc).__name__)
+        return
+    for follow in follows:
+        try:
+            channel_id = int(follow["channel_id"])
+            team_name = str(follow.get("team_name") or "")
+            team_norm = str(follow.get("team_norm") or "")
+            if not team_name or not channel_id:
+                continue
+            already = any(
+                cid == channel_id
+                and _norm(team_norm) in _norm(f"{w.get('home', '')} {w.get('away', '')}")
+                for (cid, _gid), w in _watches.items())
+            if already:
+                continue
+            result = await prov.onex_search(team_name)
+            live = [g for g in (result or {}).get("games") or []
+                    if str(g.get("status") or "").lower() in _BARCA_LIVE_STATUSES
+                    and _norm(team_norm) in _norm(f"{g.get('home', '')} {g.get('away', '')}")]
+            if not live:
+                continue
+            game = live[0]
+            entry = {"id": str(game["onex_id"]), "home": game.get("home", ""),
+                     "away": game.get("away", ""), "league": game.get("league", ""),
+                     "status": game.get("status", "")}
+            started = await start_watch(
+                channel_id, entry, str(follow.get("detail") or DETAIL_SIMPLE))
+            if started:
+                log.info("[team-follow] auto-watch started %s vs %s "
+                         "(game %s) in channel %s for team %s",
+                         started["home"], started["away"],
+                         started["game_id"], channel_id, team_name)
+        except Exception as exc:
+            log.warning("[team-follow] check failed (%s)", type(exc).__name__)
+
+
 async def load_watches() -> None:
     """Load persisted watches into memory (called once at startup)."""
     global _loaded
@@ -928,32 +1143,58 @@ def _resolve_game_id(interaction: discord.Interaction) -> str | None:
     return None
 
 
+# Refresh cooldown: one manual refresh per user per game per 10s,
+# so a button cannot hammer the provider.
+_REFRESH_COOLDOWN_S = 10.0
+_refresh_cooldown: dict[tuple[int, str], float] = {}
+
+
 class WatchAlertView(discord.ui.View):
-    """Buttons on a watch alert or a detail reply. Persistent
-    (timeout=None) with STATIC custom_ids ("watch:detail" /
-    "watch:live") — the game id is resolved from the message the
-    button sits on, so one view registered in setup_hook covers
-    every button on every message, even after a restart. A
-    per-game custom_id ("watch:detail:<id>") still works as a
-    fallback when the view was built with a game id."""
+    """Buttons on a watch alert or a detail reply — the live match
+    panel (Feature 2). Persistent (timeout=None) with STATIC
+    custom_ids ("watch:detail" / "watch:live" / "panel:*") — the
+    game id is resolved from the message the button sits on, so
+    one view registered in setup_hook covers every button on
+    every message, even after a restart. A per-game custom_id
+    ("watch:detail:<id>", "panel:refresh:<id>", ...) still works
+    as a fallback when the view was built with a game id.
+
+    Detail / Live are the original two buttons. Refresh updates
+    a detail card in place (or answers with a fresh live line);
+    Timeline shows the chronoLine events; Simple / Advanced show
+    that level of detail; Follow / Unfollow start or stop a
+    watch for this game in this channel."""
 
     def __init__(self, game_id: str | None = None):
         super().__init__(timeout=None)
         self.game_id = str(game_id) if game_id else None
-        detail_id = (f"watch:detail:{self.game_id}" if self.game_id
-                     else "watch:detail")
-        live_id = (f"watch:live:{self.game_id}" if self.game_id
-                   else "watch:live")
-        detail_btn = discord.ui.Button(
-            label="📊 Detail", style=discord.ButtonStyle.primary,
-            custom_id=detail_id)
-        detail_btn.callback = self._on_detail
-        self.add_item(detail_btn)
-        live_btn = discord.ui.Button(
-            label="🔄 Live", style=discord.ButtonStyle.secondary,
-            custom_id=live_id)
-        live_btn.callback = self._on_live
-        self.add_item(live_btn)
+
+        def _cid(prefix: str) -> str:
+            return f"{prefix}:{self.game_id}" if self.game_id else prefix
+
+        specs = [
+            ("📊 Detail", discord.ButtonStyle.primary, _cid("watch:detail"),
+             self._on_detail),
+            ("🔄 Live", discord.ButtonStyle.secondary, _cid("watch:live"),
+             self._on_live),
+            ("🔄 Refresh", discord.ButtonStyle.secondary, _cid("panel:refresh"),
+             self._on_refresh),
+            ("📜 Timeline", discord.ButtonStyle.secondary, _cid("panel:timeline"),
+             self._on_timeline),
+            ("🟢 Simple", discord.ButtonStyle.secondary, _cid("panel:simple"),
+             self._on_simple),
+            ("🔵 Advanced", discord.ButtonStyle.secondary, _cid("panel:advanced"),
+             self._on_advanced),
+            ("🔔 Follow", discord.ButtonStyle.success, _cid("panel:follow"),
+             self._on_follow),
+            ("🔕 Unfollow", discord.ButtonStyle.danger, _cid("panel:unfollow"),
+             self._on_unfollow),
+        ]
+        for label, style, custom_id, callback in specs:
+            btn = discord.ui.Button(label=label, style=style,
+                                    custom_id=custom_id)
+            btn.callback = callback
+            self.add_item(btn)
 
     async def _on_detail(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -983,6 +1224,168 @@ class WatchAlertView(discord.ui.View):
                 "That game is no longer live.", ephemeral=True)
             return
         await interaction.followup.send(live_line(detail), ephemeral=True)
+
+    async def _on_refresh(self, interaction: discord.Interaction):
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.response.send_message(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        user_id = getattr(getattr(interaction, "user", None), "id", 0)
+        now = time.monotonic()
+        last = _refresh_cooldown.get((user_id, game_id), 0.0)
+        if now - last < _REFRESH_COOLDOWN_S:
+            await interaction.response.send_message(
+                "Give it a few seconds before refreshing again.",
+                ephemeral=True)
+            return
+        _refresh_cooldown[(user_id, game_id)] = now
+        # Non-ephemeral defer: edit_original_response below edits
+        # the message the button sits on.
+        await interaction.response.defer()
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        content = getattr(getattr(interaction, "message", None),
+                          "content", "") or ""
+        if content.startswith("**") and "Game ID:" in content:
+            level = (DETAIL_ADVANCED if "Match stats" in content
+                     else DETAIL_SIMPLE)
+            await interaction.edit_original_response(
+                content=render_detail(detail, level),
+                view=WatchAlertView(game_id))
+        else:
+            await interaction.followup.send(live_line(detail), ephemeral=True)
+
+    async def _on_timeline(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        try:
+            gid = int(game_id)
+        except (TypeError, ValueError):
+            await interaction.followup.send(
+                "Could not read this game's timeline.", ephemeral=True)
+            return
+        events = await prov.onex_events(
+            gid, detail.get("home", ""), detail.get("away", ""))
+        if not events:
+            await interaction.followup.send(
+                "No timeline events yet for this game.", ephemeral=True)
+            return
+        lines = [f"**{detail.get('home', '?')} {_score_str(detail)} "
+                 f"{detail.get('away', '?')}** — timeline\n"]
+        for ev in sorted(events, key=lambda e: e.get("minute_int") or 0):
+            lines.append(f"{ev.get('icon', '')} **{ev.get('minute', '?')}'** "
+                         f"{ev.get('detail', '')} — {ev.get('player', '')} "
+                         f"({ev.get('team', '')})")
+        await interaction.followup.send("\n".join(lines)[:2000],
+                                        ephemeral=True)
+
+    async def _on_simple(self, interaction: discord.Interaction):
+        await self._on_level(interaction, DETAIL_SIMPLE)
+
+    async def _on_advanced(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        momentum = await history.momentum_summary(game_id)
+        await interaction.followup.send(
+            render_analytics(detail, momentum), ephemeral=True)
+
+    async def _on_level(self, interaction: discord.Interaction, level: str):
+        await interaction.response.defer(ephemeral=True)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            render_detail(detail, level), ephemeral=True)
+
+    async def _on_follow(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        channel_id = getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            await interaction.followup.send(
+                "Could not tell which channel this is.", ephemeral=True)
+            return
+        if (channel_id, game_id) in _watches:
+            await interaction.followup.send(
+                "That game is already watched in this channel.",
+                ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        entry = {"id": game_id, "home": detail.get("home", ""),
+                 "away": detail.get("away", ""),
+                 "league": detail.get("league", ""),
+                 "status": detail.get("status", "")}
+        started = await start_watch(channel_id, entry, DETAIL_SIMPLE)
+        if not started:
+            await interaction.followup.send(
+                "Could not start watching that game.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"👀 Watching **{started['home']} vs {started['away']}** — "
+            f"simple alerts, only when the game changes.", ephemeral=True)
+
+    async def _on_unfollow(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        game_id = _resolve_game_id(interaction)
+        if game_id is None:
+            await interaction.followup.send(
+                "Could not tell which game this is.", ephemeral=True)
+            return
+        channel_id = getattr(interaction, "channel_id", None)
+        if channel_id is None:
+            await interaction.followup.send(
+                "Could not tell which channel this is.", ephemeral=True)
+            return
+        detail = await _fetch_live_detail(game_id)
+        if detail is None:
+            await interaction.followup.send(
+                "That game is no longer live.", ephemeral=True)
+            return
+        removed = await remove_watch(channel_id, game_id)
+        if removed:
+            await interaction.followup.send(
+                f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
+                ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "That game is not watched in this channel.", ephemeral=True)
 
 
 async def _send_to_channel(bot: discord.Client, channel_id: int,
@@ -1023,14 +1426,31 @@ def _detail_for_tick(raw: dict, fmt: str) -> dict | None:
     return detail
 
 
+# One tick at a time: the scoreboard calls on_tick once per
+# second, but a slow tick must never overlap the next one.
+_tick_lock = asyncio.Lock()
+
+# Momentum snapshots: one stat sample per watched game per 30s.
+_MOMENTUM_EVERY_S = 30.0
+_last_momentum_snapshot: dict[tuple[int, str], float] = {}
+
+
 async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
     """One shared tick: diff every watched game against its stored
     snapshot and send ONLY on a real change. Called from
-    scoreboard_loop — never raises, never sends duplicates."""
+    scoreboard_loop — never raises, never sends duplicates, and
+    never re-sends an event recorded in the history table (so a
+    restart cannot repeat an old alert)."""
+    async with _tick_lock:
+        await _on_tick_locked(bot, raw_games)
+
+
+async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
     # Barça auto-watch rides this same tick — no second poller.
     # It runs before the early return below so it also fires when
     # no game is watched yet.
     await maybe_auto_watch_barca()
+    await maybe_team_follow_check()
     if not _watches:
         return
     by_id: dict[str, dict] = {}
@@ -1049,6 +1469,12 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
                         bot, channel_id,
                         f"🏁 **{watch['home']} vs {watch['away']}** is no longer live — "
                         f"the watch has ended.")
+                    await history.record_match_result(
+                        game_id, watch["home"], watch["away"],
+                        watch.get("league", ""), "",
+                        (watch.get("snapshot") or {}).get("home_score"),
+                        (watch.get("snapshot") or {}).get("away_score"),
+                        "ended")
                     await remove_watch(channel_id, game_id)
                     log.info("[watch] ended %s vs %s (gone from live list)",
                              watch["home"], watch["away"])
@@ -1057,38 +1483,82 @@ async def on_tick(bot: discord.Client, raw_games: list[dict]) -> None:
             detail = _detail_for_tick(raw, watch.get("fmt") or "")
             if detail is None:
                 continue
+            # Momentum sample: real stat snapshots, one per 30s.
+            if detail.get("sport") == "Football" and detail.get("stats"):
+                last = _last_momentum_snapshot.get(key, 0.0)
+                now = time.monotonic()
+                if now - last >= _MOMENTUM_EVERY_S:
+                    _last_momentum_snapshot[key] = now
+                    await history.record_stat_snapshot(
+                        game_id, {str(s.get("name")): (str(s.get("home", "")),
+                                                       str(s.get("away", "")))
+                                  for s in detail["stats"]})
             snapshot = snapshot_from_detail(detail)
             snapshot["_home"], snapshot["_away"] = detail.get("home", ""), detail.get("away", "")
             old = watch.get("snapshot") or {}
             old = dict(old)
             old.setdefault("_home", watch.get("home", ""))
             old.setdefault("_away", watch.get("away", ""))
-            events = detect_changes(old, snapshot, watch.get("detail") or DETAIL_SIMPLE)
-            if not events:
-                continue
-            text = "\n".join(events)
-            # Automatic alert stays exactly as before: event line(s)
-            # PLUS the full stats table for advanced watches. The
-            # buttons below are only for on-demand detail / live.
-            if watch.get("detail") == DETAIL_ADVANCED:
-                table = format_stats_table(detail.get("stats"))
-                if table:
-                    text += "\n\n**Match stats**\n" + "\n".join(table)
-            # The buttons resolve the game from the message, so the
-            # alert carries its id like the detail card does.
-            text += f"\nGame ID: {game_id}"
-            if await _send_to_channel(bot, channel_id, text,
-                                      view=WatchAlertView()):
-                log.info("[watch] alert for %s vs %s: %s",
-                         watch["home"], watch["away"], events[0][:80])
+            allowed, paused, detail_override = await _prefs_for(channel_id, game_id)
+            level = detail_override or watch.get("detail") or DETAIL_SIMPLE
+            events = detect_events(old, snapshot, level, game_id)
+            status = str(snapshot.get("status") or "")
+            terminal = TERMINAL_STATUSES.get(status.strip().lower())
+            is_terminal = status == "FT" or terminal is not None
+            # Prefs filter: paused stops everything; an event-kind
+            # list drops the kinds the user turned off. Terminal
+            # events (full-time, postponed...) always pass the
+            # kind filter — the watch is ending and the user needs
+            # to know — but a paused watch stays silent.
+            sendable = []
+            for ev in events:
+                if paused:
+                    continue
+                if allowed is not None and ev["kind"] not in allowed \
+                        and ev["kind"] not in ("ft", "postponed",
+                                               "suspended", "abandoned",
+                                               "cancelled"):
+                    continue
+                if await history.event_seen(ev["key"]):
+                    continue
+                sendable.append(ev)
+            if sendable:
+                text = "\n".join(ev["text"] for ev in sendable)
+                # Automatic alert stays exactly as before: event line(s)
+                # PLUS the full stats table for advanced watches. The
+                # buttons below are only for on-demand detail / live.
+                if level == DETAIL_ADVANCED:
+                    table = format_stats_table(detail.get("stats"))
+                    if table:
+                        text += "\n\n**Match stats**\n" + "\n".join(table)
+                # The buttons resolve the game from the message, so the
+                # alert carries its id like the detail card does.
+                text += f"\nGame ID: {game_id}"
+                if await _send_to_channel(bot, channel_id, text,
+                                          view=WatchAlertView()):
+                    for ev in sendable:
+                        await history.record_sent_event(
+                            ev["key"], game_id, channel_id, ev["kind"], ev["text"])
+                        await history.record_notification(
+                            game_id, channel_id, ev["kind"], ev["text"], True)
+                    log.info("[watch] alert for %s vs %s: %s",
+                             watch["home"], watch["away"], sendable[0]["text"][:80])
+                else:
+                    # Send failed: do not record, do not advance the
+                    # snapshot — the next tick retries the same events.
+                    continue
             watch["snapshot"] = snapshot
             await db.update_watch_snapshot(channel_id, game_id, snapshot)
-            if snapshot.get("status") == "FT":
-                # The FT event above already carries the result;
-                # just end the watch quietly.
+            if is_terminal:
+                await history.record_match_result(
+                    game_id, watch["home"], watch["away"],
+                    watch.get("league", ""), str(detail.get("sport") or ""),
+                    snapshot.get("home_score"), snapshot.get("away_score"),
+                    "FT" if status == "FT" else status)
                 await remove_watch(channel_id, game_id)
-                log.info("[watch] ended %s vs %s (full-time)",
-                         watch["home"], watch["away"])
+                log.info("[watch] ended %s vs %s (%s)",
+                         watch["home"], watch["away"],
+                         "full-time" if status == "FT" else status)
         except Exception as exc:
             log.warning("[watch] tick failed for %s (%s)", game_id,
                         type(exc).__name__)

@@ -37,8 +37,24 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+import db
+import history
+import providers as prov
 from providers import onex_fetch_tick
 import watch
+
+# Health-monitor state (Feature 7): monotonic timestamps the
+# /health snapshot reads. last_tick_ts moves every loop iteration
+# (even a failed one); last_good_tick_ts only when the tick
+# actually returned live entries.
+last_tick_ts: float = 0.0
+last_good_tick_ts: float = 0.0
+STALE_AFTER_S = 60.0
+_stale_episode = False
+# Feature 6: retention cleanup (30 days, history tables only)
+# runs at most once an hour from the existing loop — no new task.
+_last_cleanup_ts: float = 0.0
+_CLEANUP_EVERY_S = 3600.0
 
 log = logging.getLogger("scoreboard")
 NEPAL = ZoneInfo("Asia/Kathmandu")
@@ -299,6 +315,7 @@ async def _fetch_all() -> tuple[list[dict], list[dict], list[dict]]:
 
 async def scoreboard_loop(bot: discord.Client) -> None:
     """Watch 1xBet every second; edit only when the score changes."""
+    global last_tick_ts, last_good_tick_ts, _stale_episode, _last_cleanup_ts
     log.info("[scoreboard] watch started (1s poll, edits only on change)")
     await bot.wait_until_ready()
     interval = WATCH_SECONDS
@@ -306,6 +323,33 @@ async def scoreboard_loop(bot: discord.Client) -> None:
     while not bot.is_closed():
         try:
             npl, games, raw = await _fetch_all()
+            last_tick_ts = time.monotonic()
+            if last_tick_ts - _last_cleanup_ts >= _CLEANUP_EVERY_S:
+                _last_cleanup_ts = last_tick_ts
+                asyncio.create_task(history.cleanup_old_history())
+            if raw:
+                last_good_tick_ts = last_tick_ts
+                if _stale_episode:
+                    _stale_episode = False
+                    log.info("[scoreboard] live data again after stale "
+                             "episode — tick cache recovered")
+            elif (last_good_tick_ts
+                    and last_tick_ts - last_good_tick_ts > STALE_AFTER_S
+                    and not _stale_episode):
+                # Stale data: no live entries for over a minute. Log
+                # the recovery attempt and reset the tick cache once
+                # per episode (never loop, never restart the bot).
+                _stale_episode = True
+                log.warning("[scoreboard] no live data for >%ds — "
+                            "resetting tick cache once", STALE_AFTER_S)
+                prov._onex_reset_caches()
+                try:
+                    await db.log_health(
+                        "scoreboard", "warning",
+                        "no live data for over 60s — tick cache reset "
+                        f"(empty_ticks={empty_ticks})")
+                except Exception:
+                    pass
             text = render_scoreboard(npl, games)
             # Game watches share this tick's raw data.
             await watch.on_tick(bot, raw)
@@ -346,7 +390,19 @@ def ensure_running(bot: discord.Client) -> None:
     task = getattr(bot, "scoreboard_task", None)
     if task is None or task.done():
         if task is not None and not task.cancelled() and task.exception() is not None:
+            exc = task.exception()
             log.error("[scoreboard] restarting failed worker")
+            # Feature 7: record the recovery attempt (never raise
+            # here — a logging failure must not break the restart).
+            # Local import: health imports scoreboard, so a top-level
+            # import would be circular.
+            try:
+                import health
+                asyncio.create_task(health.log_recovery(
+                    "scoreboard", "scoreboard worker failed; restarted",
+                    {"error": type(exc).__name__} if exc else None))
+            except Exception:
+                pass
         bot.scoreboard_task = asyncio.create_task(
             scoreboard_loop(bot), name="scoreboard")
 

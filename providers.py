@@ -1431,6 +1431,12 @@ async def onex_live_raw() -> list[dict]:
     return out
 
 
+def onex_last_success_ts() -> float:
+    """Monotonic timestamp of the last successful live-feed fetch
+    (0.0 if never) — for the health monitor's data-freshness check."""
+    return _live_cache["ts"]
+
+
 async def onex_fetch_tick() -> tuple[list[dict], list[dict], list[dict]]:
     """One watch tick's data, from exactly two 1xBet calls:
     (npl_matches, featured_matches, raw_live_entries). The

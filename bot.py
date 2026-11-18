@@ -1,15 +1,20 @@
 """Football Discord Bot using verified public football-data sources."""
 import asyncio
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 import discord
 from discord import app_commands
 import google.generativeai as genai
 
+import assistant
 import db
+import health
+import history
 import http_client as hc
 import barcelona_reminder
+import notify_manager
 import scoreboard
 from config import (
     DISCORD_BOT_TOKEN, TRACKED_LEAGUES,
@@ -70,6 +75,8 @@ class FootballBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
+        # Health monitor uptime (Feature 7).
+        self.start_time = time.time()
 
     async def setup_hook(self):
         await db.init()
@@ -183,7 +190,9 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="🔍 Follow a game", value=(
         "`/watch` — follow one game, alerts on goals/wickets/cards\n"
         "`/unwatch` — stop following a game\n"
-        "`/watching` — games this channel follows"
+        "`/watching` — games this channel follows\n"
+        "`/notifications` — manage alerts for watched games\n"
+        "`/history` — past matches and alerts that were sent"
     ), inline=True)
     embed.add_field(name="📅 Fixtures", value=(
         "`/today` — today's fixtures\n"
@@ -194,7 +203,8 @@ async def cmd_help(interaction: discord.Interaction):
         "`/ping` — bot connection health\n"
         "`/health` — service and reminder status\n"
         "`/nextbarca` — Barcelona's next match\n"
-        "`/ai` — ask Gemini a question"
+        "`/ai` — ask Gemini a question\n"
+        "`/ask` — ask about live matches in plain words"
     ), inline=True)
     leagues = "\n".join(f"`{lid}` {name}" for lid, name in TRACKED_LEAGUES.items() if lid in SPORTSDB_LEAGUE_MAP)
     embed.add_field(name="🏆 Available Leagues", value=leagues, inline=False)
@@ -225,6 +235,16 @@ async def cmd_health(interaction: discord.Interaction):
         ), inline=False)
     embed.add_field(name="Provider status", value=f"```\n{stats_summary()}\n```", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    # Feature 7: the full health snapshot (workers, data
+    # freshness, recent recovery attempts) as a followup.
+    try:
+        summary = await health.snapshot(bot)
+        stale = await health.stale_check()
+        if stale:
+            summary += f"\n\n⚠️ {stale}"
+        await interaction.followup.send(summary, ephemeral=True)
+    except Exception:
+        log.warning("[health] snapshot followup failed", exc_info=True)
 
 
 @bot.tree.command(name="nextbarca", description="Show Barcelona's next match and reminder time")
@@ -721,6 +741,105 @@ async def cmd_watching(interaction: discord.Interaction):
         lines.append(f"• **{r['home']} vs {r['away']}**{score}{clock} "
                      f"({r['detail']}, ID `{r['game_id']}`)")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+# ── /ask ────────────────────────────────────────────────────────────────────
+@bot.tree.command(name="ask", description="Ask about live matches in plain words")
+@app_commands.describe(text="e.g. 'follow the Gambia game', 'what games are live?', 'when do Barcelona play next?'")
+async def cmd_ask(interaction: discord.Interaction, text: str):
+    guild = getattr(interaction, "guild", None)
+    guild_channels: list[dict] = []
+    if guild is not None:
+        for ch in getattr(guild, "text_channels", []) or []:
+            guild_channels.append({"id": ch.id,
+                                   "name": getattr(ch, "name", "")})
+    await assistant.handle_ask(interaction, text, ai_model, guild_channels)
+
+
+# ── /notifications ──────────────────────────────────────────────────────────
+@bot.tree.command(name="notifications", description="Manage alerts for the games watched in this channel")
+async def cmd_notifications(interaction: discord.Interaction):
+    await notify_manager.show_notifications(interaction)
+
+
+# ── /history ────────────────────────────────────────────────────────────────
+class HistoryView(discord.ui.View):
+    """◀ ▶ pagination for /history. Short-lived (3 min) and
+    non-persistent: the pages live only in this view, so after a
+    restart the user just runs /history again."""
+
+    def __init__(self, pages: list[str]):
+        super().__init__(timeout=180)
+        self.pages = pages
+        self.index = 0
+        self._refresh()
+
+    def _refresh(self):
+        self.prev_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+        self.index = max(0, self.index - 1)
+        self._refresh()
+        await interaction.response.edit_message(
+            content=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._refresh()
+        await interaction.response.edit_message(
+            content=self.pages[self.index], view=self)
+
+
+def _history_pages(matches: list[dict], notes: list[dict]) -> list[str]:
+    """Match history + notification log as short pages."""
+    pages: list[str] = []
+    if not matches and not notes:
+        return ["📜 No match history yet — finished games and sent "
+                "alerts will appear here."]
+    for i in range(0, len(matches), 5):
+        chunk = matches[i:i + 5]
+        lines = ["📜 **Match history**\n"]
+        for m in chunk:
+            score = ""
+            fh, fa = m.get("final_home"), m.get("final_away")
+            if fh not in (None, "") or fa not in (None, ""):
+                score = f" {fh}–{fa}"
+            lines.append(f"• **{m.get('home', '?')} vs {m.get('away', '?')}**"
+                         f"{score} — {m.get('status', '')}")
+        pages.append("\n".join(lines))
+    for i in range(0, len(notes), 8):
+        chunk = notes[i:i + 8]
+        lines = ["🔔 **Recent alerts sent**\n"]
+        for n in chunk:
+            lines.append(f"• [{n.get('kind', '')}] "
+                         f"{str(n.get('text', ''))[:120]}")
+        pages.append("\n".join(lines))
+    if len(pages) > 1:
+        for i, page in enumerate(pages):
+            pages[i] = page + f"\n\nPage {i + 1}/{len(pages)}"
+    return pages
+
+
+@bot.tree.command(name="history", description="Past matches and alerts that were sent")
+async def cmd_history(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        matches = await history.recent_matches(limit=25)
+    except Exception:
+        matches = []
+    try:
+        notes = await history.recent_notifications(limit=24)
+    except Exception:
+        notes = []
+    pages = _history_pages(matches, notes)
+    await interaction.followup.send(pages[0], ephemeral=True,
+                                    view=HistoryView(pages)
+                                    if len(pages) > 1 else None)
 
 
 # ══════════════════════════════════════════════════════════════════════════

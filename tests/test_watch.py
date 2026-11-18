@@ -508,9 +508,13 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Possession", msg.content)
         self.assertIsNotNone(msg.view)
         labels = [b.label for b in msg.view.children]
-        self.assertEqual(labels, ["📊 Detail", "🔄 Live"])
+        self.assertEqual(labels, ["📊 Detail", "🔄 Live", "🔄 Refresh",
+                                  "📜 Timeline", "🟢 Simple", "🔵 Advanced",
+                                  "🔔 Follow", "🔕 Unfollow"])
         self.assertEqual([b.custom_id for b in msg.view.children],
-                         ["watch:detail", "watch:live"])
+                         ["watch:detail", "watch:live", "panel:refresh",
+                          "panel:timeline", "panel:simple", "panel:advanced",
+                          "panel:follow", "panel:unfollow"])
         self.assertIn("Game ID: 771747666", msg.content)
 
     async def test_event_line_shows_mmss_clock(self):
@@ -535,8 +539,15 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeResponse:
+    def __init__(self):
+        self.sent: list[str] = []
+
     async def defer(self, ephemeral=False, thinking=False, **kwargs):
         return None
+
+    async def send_message(self, content=None, ephemeral=False,
+                           view=None, **kwargs):
+        self.sent.append(content)
 
 
 class FakeFollowup:
@@ -574,6 +585,12 @@ class FakeInteraction:
         self.data = data
         self.response = FakeResponse()
         self.followup = FakeFollowup()
+        self.user = SimpleNamespace(id=42)
+        self.edited: list[tuple] = []
+
+    async def edit_original_response(self, content=None, view=None,
+                                     **kwargs):
+        self.edited.append((content, view))
 
 
 class SlowModel:
@@ -929,7 +946,9 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
     async def test_view_has_static_custom_ids(self):
         view = self._view()
         self.assertEqual([b.custom_id for b in view.children],
-                         ["watch:detail", "watch:live"])
+                         ["watch:detail", "watch:live", "panel:refresh",
+                          "panel:timeline", "panel:simple", "panel:advanced",
+                          "panel:follow", "panel:unfollow"])
 
     async def test_detail_button_resolves_game_from_message(self):
         # Static custom_id: the game comes from the message's
@@ -1062,9 +1081,14 @@ class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Game ID: 771747666", interaction.followup.sent[0])
         view = interaction.followup.sent_views[0]
         self.assertIsNotNone(view)
-        self.assertEqual(self._labels(view), ["📊 Detail", "🔄 Live"])
+        self.assertEqual(self._labels(view),
+                         ["📊 Detail", "🔄 Live", "🔄 Refresh", "📜 Timeline",
+                          "🟢 Simple", "🔵 Advanced", "🔔 Follow",
+                          "🔕 Unfollow"])
         self.assertEqual(self._ids(view),
-                         ["watch:detail", "watch:live"])
+                         ["watch:detail", "watch:live", "panel:refresh",
+                          "panel:timeline", "panel:simple", "panel:advanced",
+                          "panel:follow", "panel:unfollow"])
 
     async def test_watch_detail_action_reply_has_buttons(self):
         import bot as botmod
@@ -1090,9 +1114,14 @@ class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Game ID: 771747666", interaction.followup.sent[0])
         view = interaction.followup.sent_views[0]
         self.assertIsNotNone(view)
-        self.assertEqual(self._labels(view), ["📊 Detail", "🔄 Live"])
+        self.assertEqual(self._labels(view),
+                         ["📊 Detail", "🔄 Live", "🔄 Refresh", "📜 Timeline",
+                          "🟢 Simple", "🔵 Advanced", "🔔 Follow",
+                          "🔕 Unfollow"])
         self.assertEqual(self._ids(view),
-                         ["watch:detail", "watch:live"])
+                         ["watch:detail", "watch:live", "panel:refresh",
+                          "panel:timeline", "panel:simple", "panel:advanced",
+                          "panel:follow", "panel:unfollow"])
 
 
 class TestMmssClock(unittest.TestCase):
@@ -1733,6 +1762,379 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
                                                       "detail": None})) as spy:
             await wmod.on_tick(self.bot, [])
             spy.assert_not_called()
+
+
+class TestDetectEventsEngine(unittest.TestCase):
+    """Feature 1: detect_events kinds, dedup keys, corrections,
+    second-half start, terminal statuses."""
+
+    def test_score_down_is_correction_not_goal(self):
+        old = _snap("2", "0")
+        new = _snap("1", "0")
+        events = wmod.detect_events(old, new, "simple", "111")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "correction")
+        self.assertIn("Score corrected", events[0]["text"])
+        self.assertNotIn("GOAL", events[0]["text"])
+
+    def test_cricket_runs_down_is_correction(self):
+        old = _snap("120/2", "0/0", status="live")
+        new = _snap("100/2", "0/0", status="live")
+        events = wmod.detect_events(old, new, "simple", "111")
+        self.assertTrue(any(e["kind"] == "correction" for e in events))
+        self.assertFalse(any(e["kind"] == "goal" for e in events))
+
+    def test_second_half_start(self):
+        old = _snap("1", "0", status="HT")
+        new = _snap("1", "0", status="2H")
+        events = wmod.detect_events(old, new, "simple", "111")
+        self.assertTrue(any(e["kind"] == "second_half" for e in events))
+        self.assertTrue(any("Second-half" in e["text"] for e in events))
+
+    def test_half_time(self):
+        old = _snap("1", "0", status="2H")
+        new = _snap("1", "0", status="HT")
+        events = wmod.detect_events(old, new, "simple", "111")
+        self.assertTrue(any(e["kind"] == "ht" for e in events))
+
+    def test_penalty_fires_at_both_levels(self):
+        old = _snap("0", "0", stats={"Penalty": ("0", "0")})
+        new = _snap("0", "0", stats={"Penalty": ("1", "0")})
+        for level in ("simple", "advanced"):
+            events = wmod.detect_events(old, new, level, "111")
+            self.assertTrue(any(e["kind"] == "penalty" for e in events),
+                            level)
+
+    def test_substitution_advanced_only(self):
+        old = _snap("0", "0", stats={"Substitutions": ("1", "1")})
+        new = _snap("0", "0", stats={"Substitutions": ("2", "1")})
+        self.assertEqual(
+            [e for e in wmod.detect_events(old, new, "simple", "111")
+             if e["kind"] == "sub"], [])
+        self.assertTrue(any(
+            e["kind"] == "sub"
+            for e in wmod.detect_events(old, new, "advanced", "111")))
+
+    def test_terminal_statuses(self):
+        for status, kind, label in (
+                ("postponed", "postponed", "Match postponed"),
+                ("suspended", "suspended", "Match suspended"),
+                ("abandoned", "abandoned", "Match abandoned"),
+                ("cancelled", "cancelled", "Match cancelled")):
+            old = _snap("0", "0", status="2H")
+            new = _snap("0", "0", status=status)
+            events = wmod.detect_events(old, new, "simple", "111")
+            self.assertTrue(any(e["kind"] == kind for e in events), status)
+            self.assertTrue(any(label in e["text"] for e in events), status)
+
+    def test_dedup_keys_stable_and_game_scoped(self):
+        old = _snap("0", "0")
+        new = _snap("1", "0", minute=67)
+        first = wmod.detect_events(old, new, "simple", "111")
+        second = wmod.detect_events(old, new, "simple", "111")
+        other_game = wmod.detect_events(old, new, "simple", "222")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["key"], second[0]["key"])
+        self.assertNotEqual(first[0]["key"], other_game[0]["key"])
+        self.assertIn("111", first[0]["key"])
+
+    def test_ft_early_return_suppresses_score_event(self):
+        old = _snap("1", "0", status="2H")
+        new = _snap("2", "0", status="FT")
+        events = wmod.detect_events(old, new, "simple", "111")
+        self.assertEqual([e["kind"] for e in events], ["ft"])
+
+
+class TestOnTickEngine(unittest.IsolatedAsyncioTestCase):
+    """Feature 1 on the tick: prefs enforcement, restart-safe
+    dedup, terminal ends the watch and records history."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp3"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _seed_watch(self, game_id="771747666", level="simple"):
+        snap = wmod.snapshot_from_detail(
+            {"home": "Republic of the Gambia", "away": "Ivory Coast",
+             "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
+             "clock": "67'", "stats": [{"name": "Yellow cards", "home": "3", "away": "1"},
+                                       {"name": "Red card", "home": "0", "away": "0"}],
+             "cricket": None})
+        snap["_home"], snap["_away"] = "Republic of the Gambia", "Ivory Coast"
+        wmod._watches[(777, game_id)] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": level, "fmt": "",
+            "snapshot": snap, "missing": 0,
+        }
+
+    def _changed_raw(self, **score_changes):
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        for key, value in score_changes.items():
+            changed["scores"][key] = value
+        return changed
+
+    async def test_paused_prefs_silence_goal(self):
+        self._seed_watch()
+        await db.set_prefs(777, "771747666", paused=True)
+        await wmod.on_tick(self.bot, [self._changed_raw(scoreOpp1=1)])
+        self.assertEqual(len(self.channel.sent), 0)
+        # The watch itself survives a paused tick.
+        self.assertIn((777, "771747666"), wmod._watches)
+
+    async def test_prefs_event_filter_blocks_yellow_allows_goal(self):
+        self._seed_watch()
+        await db.set_prefs(777, "771747666", events=["goal"])
+        # Yellow cards 3 -> 4 (fixture tabloStats row 0): no send.
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["tabloStats"]["0"][0]["s1"] = "4"
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(self.channel.sent), 0)
+        # A goal still sends.
+        await wmod.on_tick(self.bot, [self._changed_raw(scoreOpp1=1)])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("GOAL", self.channel.sent[0].content)
+
+    async def test_event_not_resent_after_restart(self):
+        import history
+        self._seed_watch()
+        await wmod.on_tick(self.bot, [self._changed_raw(scoreOpp1=1)])
+        self.assertEqual(len(self.channel.sent), 1)
+        # Simulate a restart: the watch reloads with its OLD
+        # snapshot, but the event key is already in the history
+        # table, so the same tick must not send again.
+        self._seed_watch()
+        await wmod.on_tick(self.bot, [self._changed_raw(scoreOpp1=1)])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertTrue(await history.event_seen(
+            "771747666|goal|1–1|67:00"))
+
+    async def test_ft_ends_watch_and_records_history(self):
+        import history
+        self._seed_watch()
+        changed = self._changed_raw()
+        changed["scores"]["statusLineStr"] = "Full time"
+        await wmod.on_tick(self.bot, [changed])
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        matches = await history.recent_matches(limit=5)
+        self.assertTrue(any(m["game_id"] == "771747666"
+                            for m in matches))
+
+    async def test_score_correction_message_on_tick(self):
+        self._seed_watch()
+        # Away score 1 -> 0: a correction, never a goal.
+        await wmod.on_tick(self.bot, [self._changed_raw(scoreOpp2=0)])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("Score corrected", self.channel.sent[0].content)
+        self.assertNotIn("GOAL", self.channel.sent[0].content)
+
+    async def test_gone_game_ends_watch_and_records_history(self):
+        import history
+        self._seed_watch()
+        for _ in range(wmod.MISSING_TICKS_TO_END):
+            await wmod.on_tick(self.bot, [])
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("no longer live", self.channel.sent[0].content)
+        matches = await history.recent_matches(limit=5)
+        self.assertTrue(any(m["game_id"] == "771747666"
+                            and m["status"] == "ended" for m in matches))
+
+
+class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
+    """Feature 2: Refresh / Timeline / Simple / Advanced /
+    Follow / Unfollow on the watch panel."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp4"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._refresh_cooldown.clear()
+        self.games1x2 = _load("games1x2.json")
+        self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _view(self, game_id=None):
+        return wmod.WatchAlertView(game_id)
+
+    def _interaction(self, custom_id, content=None):
+        if content is None:
+            content = wmod.render_detail(self.detail, wmod.DETAIL_ADVANCED)
+        return FakeInteraction(
+            message=SimpleNamespace(content=content),
+            data={"custom_id": custom_id})
+
+    def _mock_search(self, detail):
+        return patch.object(
+            prov, "onex_search",
+            new=AsyncMock(return_value={"games": [], "detail": detail}))
+
+    def _seed_watch(self, game_id="771747666"):
+        snap = wmod.snapshot_from_detail(
+            {"home": "Republic of the Gambia", "away": "Ivory Coast",
+             "home_score": 0, "away_score": 1, "status": "2H", "minute": 67,
+             "clock": "67'", "stats": [], "cricket": None})
+        snap["_home"], snap["_away"] = "Republic of the Gambia", "Ivory Coast"
+        wmod._watches[(777, game_id)] = {
+            "home": "Republic of the Gambia", "away": "Ivory Coast",
+            "league": "Africa Cup of Nations", "detail": "simple",
+            "fmt": "", "snapshot": snap, "missing": 0,
+        }
+
+    async def test_refresh_edits_detail_card_in_place(self):
+        view = self._view()
+        interaction = self._interaction("panel:refresh")
+        new_detail = dict(self.detail)
+        new_detail["home_score"] = 1
+        with self._mock_search(new_detail):
+            await view.children[2].callback(interaction)
+        self.assertEqual(len(interaction.edited), 1)
+        content, edited_view = interaction.edited[0]
+        self.assertIn("1 – 1", content)
+        self.assertIn("Game ID: 771747666", content)
+        self.assertIsInstance(edited_view, wmod.WatchAlertView)
+        self.assertEqual(len(interaction.followup.sent), 0)
+
+    async def test_refresh_cooldown_blocks_second_click(self):
+        view = self._view()
+        first = self._interaction("panel:refresh")
+        with self._mock_search(self.detail):
+            await view.children[2].callback(first)
+        second = self._interaction("panel:refresh")
+        with self._mock_search(self.detail):
+            await view.children[2].callback(second)
+        self.assertEqual(second.response.sent,
+                         ["Give it a few seconds before refreshing again."])
+        self.assertEqual(len(second.edited), 0)
+
+    async def test_refresh_on_alert_message_sends_live_line(self):
+        view = self._view()
+        alert = ("⚽ **GOAL** — Republic of the Gambia 1–1 Ivory Coast (67')\n"
+                 "Game ID: 771747666")
+        interaction = self._interaction("panel:refresh", content=alert)
+        with self._mock_search(self.detail):
+            await view.children[2].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertIn("67:00", interaction.followup.sent[0])
+        self.assertEqual(len(interaction.edited), 0)
+
+    async def test_timeline_lists_events(self):
+        view = self._view()
+        interaction = self._interaction("panel:timeline")
+        events = [{"minute_int": 23, "minute": "23", "icon": "⚽",
+                   "detail": "Goal", "player": "S. Mane",
+                   "team": "Ivory Coast"},
+                  {"minute_int": 41, "minute": "41", "icon": "🟨",
+                   "detail": "Yellow Card", "player": "J. Doe",
+                   "team": "Republic of the Gambia"}]
+        with self._mock_search(self.detail), \
+                patch.object(prov, "onex_events",
+                             new=AsyncMock(return_value=events)):
+            await view.children[3].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Goal", text)
+        self.assertIn("23'", text)
+        self.assertIn("Yellow Card", text)
+
+    async def test_timeline_empty_says_none_yet(self):
+        view = self._view()
+        interaction = self._interaction("panel:timeline")
+        with self._mock_search(self.detail), \
+                patch.object(prov, "onex_events",
+                             new=AsyncMock(return_value=[])):
+            await view.children[3].callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["No timeline events yet for this game."])
+
+    async def test_simple_button_has_no_stats(self):
+        view = self._view()
+        interaction = self._interaction("panel:simple")
+        with self._mock_search(self.detail):
+            await view.children[4].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertNotIn("Match stats", interaction.followup.sent[0])
+
+    async def test_advanced_button_shows_analytics(self):
+        view = self._view()
+        interaction = self._interaction("panel:advanced")
+        with self._mock_search(self.detail):
+            await view.children[5].callback(interaction)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        text = interaction.followup.sent[0]
+        self.assertIn("Match statistics", text)
+        self.assertIn("Possession", text)
+
+    async def test_follow_starts_watch(self):
+        view = self._view()
+        interaction = self._interaction("panel:follow")
+        with self._mock_search(self.detail):
+            await view.children[6].callback(interaction)
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertIn("Watching", interaction.followup.sent[0])
+
+    async def test_follow_already_watched(self):
+        self._seed_watch()
+        view = self._view()
+        interaction = self._interaction("panel:follow")
+        with self._mock_search(self.detail):
+            await view.children[6].callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is already watched in this channel."])
+
+    async def test_unfollow_removes_watch(self):
+        self._seed_watch()
+        view = self._view()
+        interaction = self._interaction("panel:unfollow")
+        with self._mock_search(self.detail):
+            await view.children[7].callback(interaction)
+        self.assertNotIn((777, "771747666"), wmod._watches)
+        self.assertIn("Stopped watching", interaction.followup.sent[0])
+
+    async def test_unfollow_not_watched(self):
+        view = self._view()
+        interaction = self._interaction("panel:unfollow")
+        with self._mock_search(self.detail):
+            await view.children[7].callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is not watched in this channel."])
 
 
 if __name__ == "__main__":

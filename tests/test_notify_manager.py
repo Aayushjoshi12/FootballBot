@@ -241,19 +241,26 @@ class TestNotifyManagerDb(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("all events" in s
                             for s in interaction.response.sent))
 
-    async def test_unfollow_removes_watch_and_prefs(self):
+    async def test_unfollow_keeps_panel_stops_alerts(self):
         await self._seed_watch()
         await db.set_prefs(CHANNEL_ID, GAME_ID, events=["goal"])
         view = _view()
         interaction = FakeInteraction()
         await self._select_game(view, interaction)
         await view.children[4].callback(interaction)
-        self.assertEqual(wmod._watches, {})
-        self.assertEqual(await db.list_watches(CHANNEL_ID), [])
+        # The panel (and its db row) stays — only the alerts stop.
+        self.assertIn((CHANNEL_ID, GAME_ID), wmod._watches)
+        self.assertFalse(wmod._watches[(CHANNEL_ID, GAME_ID)]["notify"])
+        rows = await db.list_watches(CHANNEL_ID)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["notify"], 0)
         self.assertIsNone(await db.get_prefs(CHANNEL_ID, GAME_ID))
-        self.assertTrue(any("Stopped watching" in s
+        self.assertTrue(any("Notifications off" in s
                             for s in interaction.response.sent))
-        # The game select now shows the empty state again.
+        self.assertTrue(any("live panel keeps ticking" in s
+                            for s in interaction.response.sent))
+        # The game select now shows the empty state again — a
+        # view-only panel is not a watched game.
         self.assertEqual(view.children[0].options[0].label,
                          "No games watched in this channel")
 

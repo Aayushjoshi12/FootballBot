@@ -251,13 +251,13 @@ async def cmd_help(interaction: discord.Interaction):
     )
     embed.add_field(name="📡 Live", value=(
         "`/live` — all live matches right now\n"
-        "`/game` — detail for one game (ID or team name)\n"
+        "`/game` — detail for one game; the reply ticks live every second while the game is on\n"
         "`/scoreboard` — live scoreboard (test channel only)\n"
         "`/stopscoreboard` — stop the scoreboard in this channel"
     ), inline=False)
     embed.add_field(name="👀 Follow a game", value=(
         "`/watch` — follow a game; its panel ticks live, alerts on goals, wickets and cards\n"
-        "`/unwatch` — stop following a game\n"
+        "`/unwatch` — stop alerts for a game (its live panel keeps ticking)\n"
         "`/watching` — games this channel follows\n"
         "`/notifications` — manage alerts for watched games\n"
         "`/history` — past matches and alerts that were sent"
@@ -562,6 +562,27 @@ async def cmd_stopscoreboard(interaction: discord.Interaction):
 
 
 # ── /game ─────────────────────────────────────────────────────────────────────
+async def _send_game_detail(interaction: discord.Interaction,
+                            detail: dict, level: str) -> None:
+    """Send a /game detail reply and, when the game is live, make
+    the reply itself the live panel: the shared 1s tick edits it
+    in place (score + MM:SS clock) until full-time, with no new
+    messages. When the game already has a panel in this channel
+    the reply stays a static detail card."""
+    body = watch.render_detail(detail, level)
+    msg = await interaction.followup.send(
+        body, view=watch.WatchAlertView(), wait=True)
+    status = str(detail.get("status") or "")
+    if status not in ("1H", "2H", "ET", "PEN", "HT", "Live",
+                      "1st innings", "2nd innings"):
+        return
+    game_id = str(detail.get("onex_id") or detail.get("id") or "")
+    if not game_id or msg is None:
+        return
+    await watch.register_game_panel(
+        interaction.channel_id, game_id, msg.id, body, detail, level)
+
+
 @bot.tree.command(name="game", description="Detail for one game — by ID or team name")
 @app_commands.describe(query="Team, league or game ID", detail="Simple or advanced detail")
 @app_commands.choices(detail=[
@@ -593,9 +614,7 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
             "Could not reach the live scores right now. Please try again shortly.")
         return
     if result.get("detail"):
-        await interaction.followup.send(
-            watch.render_detail(result["detail"], detail),
-            view=watch.WatchAlertView())
+        await _send_game_detail(interaction, result["detail"], detail)
         return
     games = result.get("games") or []
     if len(games) == 1:
@@ -604,13 +623,9 @@ async def cmd_game(interaction: discord.Interaction, query: str, detail: str = "
         except Exception:
             again = {"detail": None}
         if again.get("detail"):
-            await interaction.followup.send(
-                watch.render_detail(again["detail"], detail),
-                view=watch.WatchAlertView())
+            await _send_game_detail(interaction, again["detail"], detail)
             return
-        await interaction.followup.send(
-            watch.render_detail(games[0], detail),
-            view=watch.WatchAlertView())
+        await _send_game_detail(interaction, games[0], detail)
         return
     if games:
         await interaction.followup.send(watch.render_match_list(games))
@@ -712,14 +727,15 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
             await interaction.followup.send(msg, ephemeral=True)
         return
     if resolved.get("action") == "unfollow" and resolved.get("game_id"):
-        await watch.delete_panel_message(
-            getattr(interaction, "client", None), target.id,
-            str(resolved["game_id"]))
-        removed = await watch.remove_watch(target.id, str(resolved["game_id"]))
-        if removed:
+        # Unfollow stops the alerts; the live panel keeps ticking
+        # in place while the game is live.
+        entry = await watch.set_notify(
+            target.id, str(resolved["game_id"]), False)
+        if entry:
             await interaction.followup.send(
-                f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
-                ephemeral=True)
+                f"🔕 Notifications off for **{entry['home']} vs "
+                f"{entry['away']}** — the live panel keeps ticking "
+                f"here while the game is live.", ephemeral=True)
         else:
             await interaction.followup.send(
                 "That game is not watched in this channel.", ephemeral=True)
@@ -761,6 +777,16 @@ async def cmd_watch(interaction: discord.Interaction, what: str,
     if not started:
         await interaction.followup.send(
             "Could not find that game right now.", ephemeral=True)
+        return
+    # The game already has a live panel in this channel (a /game
+    # reply): Follow switches its alerts on and the panel keeps
+    # ticking — never a second panel message.
+    if started.get("panel_exists"):
+        await interaction.followup.send(
+            f"🔔 Now following **{started['home']} vs {started['away']}** "
+            f"({started['league']}) — the live panel in this channel "
+            f"keeps ticking; {level} alerts only for goals, wickets "
+            f"and cards.{channel_note}", ephemeral=True)
         return
     # The panel IS the reply when the game is live: one public
     # message in the target channel, ticking in place every
@@ -824,15 +850,14 @@ async def cmd_unwatch(interaction: discord.Interaction, game: str):
             f"No watched game matches '{game}' in this channel. "
             "Use `/watching` to see what is watched here.", ephemeral=True)
         return
-    # Stopping on purpose also removes the live panel, so no frozen
-    # panel is left behind in the channel.
-    await watch.delete_panel_message(
-        getattr(interaction, "client", None), interaction.channel_id,
-        picked["game_id"])
-    removed = await watch.remove_watch(interaction.channel_id, picked["game_id"])
-    if removed:
+    # Unfollow stops the alerts; the live panel keeps ticking in
+    # place while the game is live.
+    entry = await watch.set_notify(
+        interaction.channel_id, picked["game_id"], False)
+    if entry:
         await interaction.followup.send(
-            f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
+            f"🔕 Stopped following **{entry['home']} vs {entry['away']}** — "
+            f"the live panel keeps ticking here while the game is live.",
             ephemeral=True)
     else:
         await interaction.followup.send("That watch is already gone.", ephemeral=True)

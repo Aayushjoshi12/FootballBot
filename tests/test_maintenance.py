@@ -141,6 +141,7 @@ class TestMaintenanceFlag(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
+        wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)

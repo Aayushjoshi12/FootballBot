@@ -476,6 +476,7 @@ class TestOnTick(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
+        wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
@@ -1050,11 +1051,22 @@ class TestAlertButtons(unittest.IsolatedAsyncioTestCase):
     async def test_gone_game_says_no_longer_live(self):
         view = self._view()
         for child in view.children:
+            # Unfollow never fetches the game — it only flips the
+            # notification flag, and with no watch here it says so.
+            if child.custom_id == "panel:unfollow":
+                continue
             interaction = self._interaction(child.custom_id)
             with self._mock_search(None):
                 await child.callback(interaction)
             self.assertEqual(interaction.followup.sent,
                              ["That game is no longer live."])
+
+    async def test_unfollow_with_no_watch_says_not_watched(self):
+        view = self._view()
+        interaction = self._interaction("panel:unfollow")
+        await view.children[7].callback(interaction)
+        self.assertEqual(interaction.followup.sent,
+                         ["That game is not watched in this channel."])
 
     async def test_gone_game_score_less_detail_says_no_longer_live(self):
         gone = {"home": "", "away": "", "home_score": None,
@@ -1100,8 +1112,30 @@ class TestDetailRepliesHaveButtons(unittest.IsolatedAsyncioTestCase):
     the 📊 Detail / 🔄 Live buttons too, not just on_tick alerts."""
 
     def setUp(self):
+        # /game registers its live panel in sqlite, so this class
+        # needs a database like the other command tests.
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp7"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        wmod._watches = {}
+        wmod._loaded = True
         self.games1x2 = _load("games1x2.json")
         self.detail = prov._onex_detail_from_raw(self.games1x2[0])
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
 
     @staticmethod
     def _labels(view):
@@ -1838,6 +1872,7 @@ class TestBarcaAutoWatch(unittest.IsolatedAsyncioTestCase):
         wmod._watches = {}
         wmod._loaded = True
         wmod._barca_last_check = 0.0
+        wmod._channel_last_edit.clear()
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
 
@@ -2043,6 +2078,7 @@ class TestOnTickEngine(unittest.IsolatedAsyncioTestCase):
         self._orig_loaded = wmod._loaded
         wmod._watches = {}
         wmod._loaded = True
+        wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
@@ -2315,14 +2351,16 @@ class TestPanelButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(interaction.followup.sent,
                          ["That game is already watched in this channel."])
 
-    async def test_unfollow_removes_watch(self):
+    async def test_unfollow_keeps_panel_stops_alerts(self):
         self._seed_watch()
         view = self._view()
         interaction = self._interaction("panel:unfollow")
-        with self._mock_search(self.detail):
-            await view.children[7].callback(interaction)
-        self.assertNotIn((777, "771747666"), wmod._watches)
-        self.assertIn("Stopped watching", interaction.followup.sent[0])
+        await view.children[7].callback(interaction)
+        # The watch stays — only the alerts stop; the panel keeps
+        # ticking until full-time.
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertFalse(wmod._watches[(777, "771747666")]["notify"])
+        self.assertIn("Notifications off", interaction.followup.sent[0])
 
     async def test_unfollow_not_watched(self):
         view = self._view()
@@ -2349,6 +2387,7 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         wmod._watches = {}
         wmod._loaded = True
         wmod._refresh_cooldown = {}
+        wmod._channel_last_edit.clear()
         self.games1x2 = _load("games1x2.json")
         self.channel = FakeChannel()
         self.bot = FakeBot(self.channel)
@@ -2507,24 +2546,22 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(panel.edits), 1)
         self.assertIn("Innings break", panel.edits[0])
 
-    async def test_unfollow_deletes_panel(self):
+    async def test_unfollow_keeps_panel(self):
         self._seed_watch(with_panel=True)
         view = wmod.WatchAlertView("771747666")
         interaction = FakeInteraction(
             message=SimpleNamespace(content=""),
             data={"custom_id": "panel:unfollow:771747666"})
-        interaction.client = self.bot
-        detail = prov._onex_detail_from_raw(self.games1x2[0])
-        with patch.object(prov, "onex_search",
-                          new=AsyncMock(return_value={"games": [],
-                                                      "detail": detail})):
-            await view.children[7].callback(interaction)
-        self.assertNotIn((777, "771747666"), wmod._watches)
+        await view.children[7].callback(interaction)
+        # The watch stays — only the alerts stop; the panel is NOT
+        # deleted and keeps ticking until full-time.
+        self.assertIn((777, "771747666"), wmod._watches)
+        self.assertFalse(wmod._watches[(777, "771747666")]["notify"])
         panel = self.channel.messages[2001]
-        self.assertTrue(panel.deleted)
+        self.assertFalse(panel.deleted)
         self.assertEqual(
             interaction.followup.sent,
-            ["🔕 Stopped watching **Republic of the Gambia vs Ivory Coast**."])
+            ["🔕 Notifications off for **Republic of the Gambia vs Ivory Coast** — the live panel keeps ticking here while the game is live."])
 
     async def test_refresh_on_panel_edits_panel_in_place(self):
         view = wmod.WatchAlertView("771747666")
@@ -2609,6 +2646,271 @@ class TestWatchPanel(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("🔴 LIVE", text)
         watch = wmod._watches[(777, "771747666")]
         self.assertIsNone(watch["panel_message_id"])
+
+
+class TestGamePanel(unittest.IsolatedAsyncioTestCase):
+    """The /game reply is a live panel: one message, edited in
+    place every second (score + MM:SS clock), no new messages for
+    routine changes. Follow controls notifications only; Unfollow
+    stops the alerts and the panel keeps ticking until full-time.
+    Several panels in one channel take turns editing."""
+
+    def setUp(self):
+        self._orig_db = db._DB
+        self._tmp = Path(__file__).resolve().parent / ".watch-test-tmp6"
+        self._tmp.mkdir(exist_ok=True)
+        db._DB = str(self._tmp / "test.db")
+        self._orig_watches = dict(wmod._watches)
+        self._orig_loaded = wmod._loaded
+        self._orig_channel_last = dict(wmod._channel_last_edit)
+        wmod._watches = {}
+        wmod._loaded = True
+        wmod._channel_last_edit = {}
+        self.games1x2 = _load("games1x2.json")
+        self.channel = FakeChannel()
+        self.bot = FakeBot(self.channel)
+
+    async def asyncSetUp(self):
+        await db.init()
+
+    async def asyncTearDown(self):
+        await db.close()
+        db._DB = self._orig_db
+        wmod._watches = self._orig_watches
+        wmod._loaded = self._orig_loaded
+        wmod._channel_last_edit = self._orig_channel_last
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _detail(self, idx=0):
+        return prov._onex_detail_from_raw(self.games1x2[idx])
+
+    def _reset_gaps(self):
+        # The 1s per-panel gap and the channel stagger are real
+        # time — reset them so a second tick in the test can edit.
+        for watch in wmod._watches.values():
+            watch["last_panel_edit"] = 0.0
+        wmod._channel_last_edit.clear()
+
+    def _seed_game_panel(self, game_id="771747666", idx=0, notify=False):
+        """A /game reply already registered as a live panel."""
+        detail = self._detail(idx)
+        body = wmod.render_detail(detail, wmod.DETAIL_SIMPLE)
+        msg = FakeMessage(2001, body)
+        self.channel.messages[2001] = msg
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = (detail.get("home", ""),
+                                        detail.get("away", ""))
+        wmod._watches[(777, game_id)] = {
+            "home": detail.get("home", ""), "away": detail.get("away", ""),
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": str(detail.get("format") or ""), "snapshot": snap,
+            "missing": 0, "notify": notify, "panel_kind": "detail",
+            "panel_message_id": 2001, "panel_body": body,
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        return msg
+
+    def _seed_panel_for_raw(self, idx, mid, game_id):
+        """A compact watch panel whose body is stale, so the next
+        tick wants to edit it (used by the stagger test)."""
+        detail = self._detail(idx)
+        msg = FakeMessage(mid, "stale")
+        self.channel.messages[mid] = msg
+        snap = wmod.snapshot_from_detail(detail)
+        snap["_home"], snap["_away"] = (detail.get("home", ""),
+                                        detail.get("away", ""))
+        wmod._watches[(777, game_id)] = {
+            "home": detail.get("home", ""), "away": detail.get("away", ""),
+            "league": detail.get("league", ""), "detail": "simple",
+            "fmt": str(detail.get("format") or ""), "snapshot": snap,
+            "missing": 0, "notify": True, "panel_kind": "compact",
+            "panel_message_id": mid, "panel_body": "stale",
+            "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+            "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        }
+        return msg
+
+    def _raw_with_timer(self, seconds, idx=0):
+        raw = json.loads(json.dumps(self.games1x2[idx]))
+        raw["scores"]["timer"]["timeSec"] = seconds
+        return raw
+
+    def _button_interaction(self, custom_id):
+        content = wmod.render_detail(self._detail(), wmod.DETAIL_SIMPLE)
+        return FakeInteraction(
+            message=SimpleNamespace(content=content),
+            data={"custom_id": custom_id})
+
+    async def test_game_reply_is_a_live_panel(self):
+        import bot as botmod
+
+        detail = self._detail()
+        interaction = FakeInteraction()
+        with patch.object(botmod, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await botmod.cmd_game.callback(interaction, "Gambia")
+        # Exactly one message — the reply IS the panel.
+        self.assertEqual(len(interaction.followup.sent), 1)
+        body = interaction.followup.sent[0]
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast", body)
+        self.assertIn("Game ID: 771747666", body)
+        view = interaction.followup.sent_views[0]
+        self.assertIsInstance(view, wmod.WatchAlertView)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertFalse(watch["notify"])
+        self.assertEqual(watch["panel_kind"], "detail")
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(watch["panel_body"], body)
+
+    async def test_game_panel_edits_in_place_on_clock_change(self):
+        msg = self._seed_game_panel()
+        await wmod.on_tick(self.bot, [self._raw_with_timer(4080)])
+        # No new message — the reply itself was edited.
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("68:00", msg.content)
+        self.assertIn("Republic of the Gambia 0 – 1 Ivory Coast",
+                      msg.content)
+
+    async def test_follow_sends_notification_only_on_goal(self):
+        msg = self._seed_game_panel(notify=False)
+        view = wmod.WatchAlertView()
+        interaction = self._button_interaction("panel:follow")
+        await view.children[6].callback(interaction)
+        self.assertTrue(wmod._watches[(777, "771747666")]["notify"])
+        self.assertIn("Now following", interaction.followup.sent[0])
+        # A clock tick after Follow: the panel edits, no message.
+        await wmod.on_tick(self.bot, [self._raw_with_timer(4080)])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 1)
+        # A goal: one notification AND the panel ticks.
+        self._reset_gaps()
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        changed["scores"]["timer"]["timeSec"] = 4080
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertIn("GOAL", self.channel.sent[0].content)
+        self.assertEqual(len(msg.edits), 2)
+        self.assertIn("1 – 1", msg.content)
+
+    async def test_unfollow_stops_notifications_but_panel_keeps_ticking(self):
+        msg = self._seed_game_panel(notify=True)
+        view = wmod.WatchAlertView()
+        interaction = self._button_interaction("panel:unfollow")
+        await view.children[7].callback(interaction)
+        watch = wmod._watches[(777, "771747666")]
+        self.assertFalse(watch["notify"])
+        # The panel is NOT deleted — it keeps ticking.
+        self.assertEqual(watch["panel_message_id"], 2001)
+        self.assertFalse(msg.deleted)
+        self.assertIn("Notifications off", interaction.followup.sent[0])
+        # A goal now: no notification, but the panel still ticks.
+        changed = json.loads(json.dumps(self.games1x2[0]))
+        changed["scores"]["scoreOpp1"] = 1
+        changed["scores"]["timer"]["timeSec"] = 4080
+        await wmod.on_tick(self.bot, [changed])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 1)
+        self.assertIn("1 – 1", msg.content)
+        # And a clock tick still edits the panel in place.
+        self._reset_gaps()
+        later = json.loads(json.dumps(changed))
+        later["scores"]["timer"]["timeSec"] = 4140
+        await wmod.on_tick(self.bot, [later])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 2)
+        self.assertIn("69:00", msg.content)
+
+    async def test_panel_stops_at_full_time(self):
+        msg = self._seed_game_panel()
+        raw = json.loads(json.dumps(self.games1x2[0]))
+        raw["scores"]["statusLineStr"] = "Full time"
+        await wmod.on_tick(self.bot, [raw])
+        self.assertIn("Full-time", msg.content)
+        self.assertEqual(wmod._watches, {})
+        self.assertEqual(len(self.channel.sent), 0)
+        # Nothing more ticks after full-time.
+        await wmod.on_tick(self.bot, [raw])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(msg.edits), 1)
+
+    async def test_deleted_game_panel_stops_quietly(self):
+        self._seed_game_panel()
+        del self.channel.messages[2001]
+        await wmod.on_tick(self.bot, [self._raw_with_timer(4080)])
+        # No re-post, no new message — the panel just stops.
+        self.assertEqual(wmod._watches, {})
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_channel_edits_are_staggered(self):
+        # Two panels ticking in one channel: one tick edits only
+        # one of them; the other catches up on the next tick.
+        a = self._seed_panel_for_raw(0, 2001, "771747666")
+        b = self._seed_panel_for_raw(2, 2002, "771750037")
+        await wmod.on_tick(self.bot, [self.games1x2[0], self.games1x2[2]])
+        self.assertEqual(len(self.channel.sent), 0)
+        self.assertEqual(len(a.edits) + len(b.edits), 1)
+        self._reset_gaps()
+        await wmod.on_tick(self.bot, [self.games1x2[0], self.games1x2[2]])
+        self.assertEqual(len(a.edits), 1)
+        self.assertEqual(len(b.edits), 1)
+        self.assertEqual(len(self.channel.sent), 0)
+
+    async def test_game_panel_persists_across_restart(self):
+        import bot as botmod
+
+        detail = self._detail()
+        interaction = FakeInteraction()
+        with patch.object(botmod, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await botmod.cmd_game.callback(interaction, "Gambia")
+        wmod._watches = {}
+        wmod._loaded = False
+        await wmod.load_watches()
+        watch = wmod._watches[(777, "771747666")]
+        self.assertFalse(watch["notify"])
+        self.assertEqual(watch["panel_kind"], "detail")
+        self.assertEqual(watch["panel_message_id"], 4001)
+
+    async def test_watch_on_game_panel_switches_alerts_on_without_new_panel(self):
+        import bot as botmod
+
+        detail = self._detail()
+        interaction = FakeInteraction()
+        with patch.object(botmod, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await botmod.cmd_game.callback(interaction, "Gambia")
+        resolved = {"game_id": "771747666", "action": "follow",
+                    "detail": None, "candidates": [],
+                    "entry": {"id": "771747666",
+                              "home": "Republic of the Gambia",
+                              "away": "Ivory Coast",
+                              "league": "Africa Cup of Nations",
+                              "status": "2H"},
+                    "source": "id"}
+        interaction2 = FakeInteraction()
+        with patch.object(wmod, "resolve_watch",
+                          new=AsyncMock(return_value=resolved)), \
+             patch.object(prov, "onex_search",
+                          new=AsyncMock(return_value={"games": [],
+                                                      "detail": detail})):
+            await botmod.cmd_watch.callback(interaction2, "771747666")
+        # One ephemeral confirmation — the /game panel itself is
+        # the live view, no second panel was posted.
+        self.assertEqual(len(interaction2.followup.sent), 1)
+        self.assertIn("Now following", interaction2.followup.sent[0])
+        self.assertNotIn("🔴 LIVE", interaction2.followup.sent[0])
+        watch = wmod._watches[(777, "771747666")]
+        self.assertTrue(watch["notify"])
+        self.assertEqual(watch["panel_message_id"], 4001)
+        self.assertEqual(watch["panel_kind"], "detail")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,13 @@ goals, wickets, cards and other big events send a separate
 notification. When the game ends the panel shows the final score
 and stops ticking.
 
+A /game reply IS a panel too: the same tick edits the detail card
+in place (panel_kind "detail") while the game is live. Follow
+controls notifications ONLY, not the live view — a followed game
+ticks its panel and sends event alerts; Unfollow stops the alerts
+and the panel keeps ticking until full-time. One registry, one
+tick, one edit discipline for every panel.
+
 AI resolution: /watch takes free text. The text is resolved
 deterministically first (game ID, exact team name, unique partial
 name); only if that fails does Gemini see it — grounded on the
@@ -1037,6 +1044,10 @@ async def load_watches() -> None:
             "home": row.get("home", ""), "away": row.get("away", ""),
             "league": row.get("league", ""), "detail": row.get("detail") or DETAIL_SIMPLE,
             "fmt": row.get("fmt") or "", "snapshot": snapshot, "missing": 0,
+            # notify / panel_kind default to the old behaviour for
+            # rows written before the /game-panel change.
+            "notify": bool(row.get("notify", 1)),
+            "panel_kind": row.get("panel_kind") or "compact",
             "panel_message_id": int(panel_id) if panel_id else None,
             "panel_body": None, "last_panel_edit": 0.0,
             "panel_blocked_until": 0.0,
@@ -1046,10 +1057,15 @@ async def load_watches() -> None:
         log.info("[watch] loaded %d watches", len(_watches))
 
 
-async def start_watch(channel_id: int, entry: dict, level: str) -> dict | None:
+async def start_watch(channel_id: int, entry: dict, level: str,
+                    notify: bool = True) -> dict | None:
     """Start watching one game in a channel. entry is a grounding
     dict ({id, home, away, league, status}); the detail is fetched
-    fresh so the snapshot starts from live data."""
+    fresh so the snapshot starts from live data. When the game
+    already has a live panel in this channel (e.g. a /game reply),
+    the panel is kept — same message, same kind — and only the
+    notification flag is switched on. The result says whether a
+    panel already existed, so the caller never posts a second one."""
     game_id = str(entry["id"])
     detail = None
     try:
@@ -1062,6 +1078,11 @@ async def start_watch(channel_id: int, entry: dict, level: str) -> dict | None:
         # onex_search resolves alias ids to the live game — watch
         # under the live id or the tick lookup never matches.
         game_id = str(detail.get("onex_id") or game_id)
+    # The panel lookup runs after the alias resolution above, so a
+    # /game panel registered under the live id is found.
+    old = _watches.get((channel_id, game_id))
+    panel_exists = bool(old and old.get("panel_message_id"))
+    panel_kind = (old.get("panel_kind") if old else None) or "compact"
     if detail is None:
         detail = {
             "onex_id": game_id, "home": entry.get("home", ""),
@@ -1075,21 +1096,29 @@ async def start_watch(channel_id: int, entry: dict, level: str) -> dict | None:
     fmt = str(detail.get("format") or "")
     await db.add_watch(channel_id, game_id, detail.get("home", ""),
                        detail.get("away", ""), detail.get("league", ""),
-                       level, fmt, snapshot)
+                       level, fmt, snapshot, notify=notify,
+                       panel_kind=panel_kind)
+    # A re-follow keeps the old panel's message id, body and
+    # clock anchor, so the tick edits the same message.
+    kept = old or {}
     _watches[(channel_id, game_id)] = {
         "home": detail.get("home", ""), "away": detail.get("away", ""),
         "league": detail.get("league", ""), "detail": level, "fmt": fmt,
         "snapshot": snapshot, "missing": 0,
+        "notify": bool(notify), "panel_kind": panel_kind,
         # Live panel: posted on the next 1s tick (see _refresh_panel)
         # and edited in place after that — never a second message.
-        "panel_message_id": None, "panel_body": None,
-        "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
-        "panel_timer_sec": None, "panel_timer_ts": 0.0,
+        "panel_message_id": kept.get("panel_message_id"),
+        "panel_body": kept.get("panel_body"),
+        "last_panel_edit": kept.get("last_panel_edit") or 0.0,
+        "panel_blocked_until": kept.get("panel_blocked_until") or 0.0,
+        "panel_timer_sec": kept.get("panel_timer_sec"),
+        "panel_timer_ts": kept.get("panel_timer_ts") or 0.0,
     }
     return {"game_id": game_id, "home": detail.get("home", ""),
             "away": detail.get("away", ""), "league": detail.get("league", ""),
             "status": detail.get("status", ""), "detail": level,
-            "live_detail": detail}
+            "live_detail": detail, "panel_exists": panel_exists}
 
 
 async def set_panel_message(channel_id: int, game_id: str,
@@ -1115,6 +1144,51 @@ async def post_panel_now(bot, channel_id: int, game_id: str,
     return await _refresh_panel(bot, channel_id, watch, detail)
 
 
+async def register_game_panel(channel_id: int, game_id: str,
+                              message_id: int, body: str,
+                              detail: dict, level: str) -> bool:
+    """Turn a /game reply into a live panel: the same 1s tick
+    edits this message in place (score + MM:SS clock) while the
+    game is live, but no event alerts are sent — Follow switches
+    alerts on later. False when the game already has a panel in
+    this channel (the reply stays a static detail card instead of
+    a second ticking message)."""
+    game_id = str(game_id)
+    if (channel_id, game_id) in _watches:
+        return False
+    snapshot = snapshot_from_detail(detail)
+    snapshot["_home"], snapshot["_away"] = detail.get("home", ""), detail.get("away", "")
+    fmt = str(detail.get("format") or "")
+    await db.add_watch(channel_id, game_id, detail.get("home", ""),
+                       detail.get("away", ""), detail.get("league", ""),
+                       level, fmt, snapshot, notify=False,
+                       panel_kind="detail")
+    await db.set_watch_panel(channel_id, game_id, message_id)
+    _watches[(channel_id, game_id)] = {
+        "home": detail.get("home", ""), "away": detail.get("away", ""),
+        "league": detail.get("league", ""), "detail": level, "fmt": fmt,
+        "snapshot": snapshot, "missing": 0,
+        "notify": False, "panel_kind": "detail",
+        "panel_message_id": message_id, "panel_body": body,
+        "last_panel_edit": 0.0, "panel_blocked_until": 0.0,
+        "panel_timer_sec": None, "panel_timer_ts": 0.0,
+    }
+    return True
+
+
+async def set_notify(channel_id: int, game_id: str,
+                     notify: bool) -> dict | None:
+    """Follow / Unfollow: switch event alerts for a game without
+    touching its live panel — the panel keeps ticking either way.
+    Returns the entry, or None when the game has no panel here."""
+    watch = _watches.get((channel_id, str(game_id)))
+    if watch is None:
+        return None
+    watch["notify"] = bool(notify)
+    await db.set_watch_notify(channel_id, str(game_id), bool(notify))
+    return watch
+
+
 async def remove_watch(channel_id: int, game_id: str) -> dict | None:
     entry = _watches.pop((channel_id, str(game_id)), None)
     await db.remove_watch(channel_id, str(game_id))
@@ -1125,6 +1199,10 @@ async def list_channel_watches(channel_id: int) -> list[dict]:
     rows = await db.list_watches(channel_id)
     out = []
     for row in rows:
+        # View-only /game panels are not watches — /watching and
+        # /unwatch only ever see games with alerts on.
+        if not row.get("notify", 1):
+            continue
         try:
             snapshot = json.loads(row.get("snapshot") or "{}")
         except json.JSONDecodeError:
@@ -1224,6 +1302,13 @@ def _panel_clock(watch: dict, detail: dict, now: float) -> str:
 # discipline as the scoreboard's edits, but the ticking clock
 # needs the panel to update as fast as the tick allows.
 _PANEL_MIN_EDIT_GAP_S = 1.0
+# Channel stagger: at most one panel edit per channel per 0.35s,
+# so several panels ticking in one channel take turns editing
+# instead of all editing on the same tick — a deferred panel
+# catches up on the next tick. A lone panel still edits every
+# second; only a crowded channel slows each panel down.
+_CHANNEL_EDIT_GAP_S = 0.35
+_channel_last_edit: dict[int, float] = {}
 
 
 async def _get_channel(bot: discord.Client, channel_id: int):
@@ -1248,13 +1333,22 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     a fixed line (e.g. the ended state) instead of rendering from
     detail. Returns True when a send/edit happened. Never raises —
     a failed edit is retried on the next tick, a 429 pauses this
-    panel until Discord says otherwise, and a deleted panel is
-    re-posted once."""
+    panel until Discord says otherwise, a deleted watch panel is
+    re-posted once, and a deleted /game panel stops quietly (its
+    reply stays deleted, no new message)."""
     if text is None:
         if detail is None:
             return False
-        text = render_panel(detail, _panel_clock(watch, detail,
-                                                 time.monotonic()))
+        clock = _panel_clock(watch, detail, time.monotonic())
+        if watch.get("panel_kind") == "detail":
+            # The /game reply keeps its full detail card and ticks
+            # in place — same render, fresh data, ticking clock.
+            ticking = dict(detail)
+            ticking["clock"] = clock
+            text = render_detail(ticking,
+                                 watch.get("detail") or DETAIL_SIMPLE)
+        else:
+            text = render_panel(detail, clock)
     if text == watch.get("panel_body"):
         return False
     now = time.monotonic()
@@ -1275,6 +1369,13 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound:
+            if watch.get("panel_kind") == "detail":
+                # A deleted /game reply stays deleted — the panel
+                # stops quietly instead of posting a new message.
+                log.info("[watch] game panel deleted for %s; stopping",
+                         game_id)
+                await remove_watch(channel_id, game_id)
+                return False
             log.info("[watch] panel message gone for %s; posting fresh",
                      game_id)
             if not post_if_missing:
@@ -1285,16 +1386,34 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
             log.warning("[watch] panel fetch failed for %s (%s)",
                         game_id, exc)
             return False
+    # The stagger below governs EDITS only: the first post of a
+    # panel is a single send, not a flood, and a panel posted and
+    # edited in quick succession (the clock test fakes 5s passing)
+    # must not be blocked by its own post.
+    edited = False
     try:
         if message is not None:
+            # Stagger: several panels ticking in one channel take
+            # turns editing, so the channel never floods the API —
+            # a deferred panel catches up on the next tick.
+            if now - _channel_last_edit.get(channel_id, 0.0) \
+                    < _CHANNEL_EDIT_GAP_S:
+                return False
             await message.edit(content=text, view=view,
                                allowed_mentions=discord.AllowedMentions.none())
+            edited = True
         else:
             message = await channel.send(
                 text, view=view,
                 allowed_mentions=discord.AllowedMentions.none())
     except discord.NotFound:
-        # Deleted between fetch and edit — post a fresh one once.
+        # Deleted between fetch and edit. A /game panel stops
+        # quietly; a watch panel posts a fresh one once.
+        if watch.get("panel_kind") == "detail":
+            log.info("[watch] game panel deleted for %s; stopping",
+                     game_id)
+            await remove_watch(channel_id, game_id)
+            return False
         if not post_if_missing:
             return False
         try:
@@ -1325,6 +1444,8 @@ async def _refresh_panel(bot: discord.Client, channel_id: int,
     watch["panel_body"] = text
     watch["last_panel_edit"] = now
     watch["panel_blocked_until"] = 0.0
+    if edited:
+        _channel_last_edit[channel_id] = now
     return True
 
 
@@ -1607,9 +1728,21 @@ class WatchAlertView(discord.ui.View):
             await interaction.followup.send(
                 "Could not tell which channel this is.", ephemeral=True)
             return
-        if (channel_id, game_id) in _watches:
+        existing = _watches.get((channel_id, game_id))
+        if existing is not None:
+            # Follow controls notifications ONLY, not the live
+            # view: a /game panel here keeps ticking, it just
+            # starts sending event alerts too. No new message.
+            if existing.get("notify", True):
+                await interaction.followup.send(
+                    "That game is already watched in this channel.",
+                    ephemeral=True)
+                return
+            await set_notify(channel_id, game_id, True)
             await interaction.followup.send(
-                "That game is already watched in this channel.",
+                f"🔔 Now following **{existing['home']} vs "
+                f"{existing['away']}** — alerts on goals, wickets "
+                f"and cards. The live panel keeps ticking here.",
                 ephemeral=True)
             return
         detail = await _fetch_live_detail(game_id)
@@ -1643,23 +1776,20 @@ class WatchAlertView(discord.ui.View):
             await interaction.followup.send(
                 "Could not tell which channel this is.", ephemeral=True)
             return
-        detail = await _fetch_live_detail(game_id)
-        if detail is None:
-            await interaction.followup.send(
-                "That game is no longer live.", ephemeral=True)
-            return
-        # Stopping on purpose also removes the live panel, so no
-        # frozen panel is left behind in the channel.
-        await delete_panel_message(getattr(interaction, "client", None),
-                                   channel_id, game_id)
-        removed = await remove_watch(channel_id, game_id)
-        if removed:
-            await interaction.followup.send(
-                f"🔕 Stopped watching **{removed['home']} vs {removed['away']}**.",
-                ephemeral=True)
-        else:
+        # Unfollow stops notifications ONLY — the live panel keeps
+        # ticking in place while the game is live, and stops on
+        # its own at full-time. The panel is the live view, not
+        # the subscription.
+        entry = _watches.get((channel_id, game_id))
+        if entry is None:
             await interaction.followup.send(
                 "That game is not watched in this channel.", ephemeral=True)
+            return
+        await set_notify(channel_id, game_id, False)
+        await interaction.followup.send(
+            f"🔕 Notifications off for **{entry['home']} vs "
+            f"{entry['away']}** — the live panel keeps ticking here "
+            f"while the game is live.", ephemeral=True)
 
 
 async def _send_to_channel(bot: discord.Client, channel_id: int,
@@ -1752,10 +1882,13 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
                         text=(f"🏁 **{watch['home']} vs {watch['away']}**"
                               f" — no longer live\nGame ID: {game_id}"),
                         post_if_missing=False)
-                    await _send_to_channel(
-                        bot, channel_id,
-                        f"🏁 **{watch['home']} vs {watch['away']}** is no longer live — "
-                        f"the watch has ended.")
+                    # A view-only /game panel ends silently — its
+                    # panel already says the game is over.
+                    if watch.get("notify", True):
+                        await _send_to_channel(
+                            bot, channel_id,
+                            f"🏁 **{watch['home']} vs {watch['away']}** is no longer live — "
+                            f"the watch has ended.")
                     await history.record_match_result(
                         game_id, watch["home"], watch["away"],
                         watch.get("league", ""), "",
@@ -1809,7 +1942,7 @@ async def _on_tick_locked(bot: discord.Client, raw_games: list[dict]) -> None:
                 if await history.event_seen(ev["key"]):
                     continue
                 sendable.append(ev)
-            if sendable:
+            if sendable and watch.get("notify", True):
                 text = "\n".join(ev["text"] for ev in sendable)
                 # Automatic alert stays exactly as before: event line(s)
                 # PLUS the full stats table for advanced watches. The

@@ -290,7 +290,11 @@ class NotifyManagerView(discord.ui.View):
             return
         game_id = str(row["game_id"])
         try:
-            removed = await watch.remove_watch(self.channel_id, game_id)
+            # Unfollow stops the alerts; the live panel keeps
+            # ticking in place while the game is live (same rule
+            # as the 🔕 button on a panel). The prefs go with the
+            # subscription, as before.
+            entry = await watch.set_notify(self.channel_id, game_id, False)
             await db.delete_prefs(self.channel_id, game_id)
         except Exception as exc:
             log.warning("[notify] unfollow failed (%s)", type(exc).__name__)
@@ -304,10 +308,11 @@ class NotifyManagerView(discord.ui.View):
         self.selected_game_id = None
         self._refresh_game_options()
         self._refresh_button_labels()
-        name = (f"**{removed['home']} vs {removed['away']}**" if removed
+        name = (f"**{entry['home']} vs {entry['away']}**" if entry
                 else f"game `{game_id}`")
         await interaction.response.send_message(
-            f"🔕 Stopped watching {name}.", ephemeral=True)
+            f"🔕 Notifications off for {name} — the live panel keeps "
+            f"ticking here.", ephemeral=True)
 
 
 async def show_notifications(interaction: discord.Interaction) -> None:

@@ -54,6 +54,12 @@ async def init() -> None:
             fmt        TEXT    NOT NULL DEFAULT '',
             snapshot   TEXT    NOT NULL DEFAULT '{}',
             panel_message_id INTEGER NOT NULL DEFAULT 0,
+            -- notify: 1 = event alerts on (/watch); 0 = view-only
+            -- live panel (/game) — Follow flips this, it never
+            -- removes the panel. panel_kind: 'compact' (the /watch
+            -- panel) or 'detail' (the /game detail card).
+            notify     INTEGER NOT NULL DEFAULT 1,
+            panel_kind TEXT    NOT NULL DEFAULT 'compact',
             PRIMARY KEY (channel_id, game_id)
         );
         -- Sent-event dedup keys (Feature 1): one row per alert
@@ -139,6 +145,19 @@ async def init() -> None:
         await _conn.execute(
             "ALTER TABLE watches ADD COLUMN "
             "panel_message_id INTEGER NOT NULL DEFAULT 0")
+        await _conn.commit()
+    # Migration (18 Nov 2026): /game live panels — notify flips
+    # alerts on/off without removing the panel, panel_kind says
+    # which render the tick uses. Old rows gain both in place.
+    if "notify" not in _cols:
+        await _conn.execute(
+            "ALTER TABLE watches ADD COLUMN "
+            "notify INTEGER NOT NULL DEFAULT 1")
+        await _conn.commit()
+    if "panel_kind" not in _cols:
+        await _conn.execute(
+            "ALTER TABLE watches ADD COLUMN "
+            "panel_kind TEXT NOT NULL DEFAULT 'compact'")
         await _conn.commit()
     log.info("[db] Initialized.")
 
@@ -230,15 +249,36 @@ async def get_favorites(user_id: int) -> list[dict]:
 
 async def add_watch(channel_id: int, game_id: str, home: str, away: str,
                     league: str, detail: str, fmt: str,
-                    snapshot: dict) -> None:
+                    snapshot: dict, notify: bool = True,
+                    panel_kind: str = "compact") -> None:
     import json as _json
     conn = _require_conn()
+    # ON CONFLICT, not REPLACE: re-adding a game (e.g. Follow on
+    # a /game panel) must never wipe the stored panel message id.
     await conn.execute(
-        "INSERT OR REPLACE INTO watches "
-        "(channel_id, game_id, home, away, league, detail, fmt, snapshot) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO watches "
+        "(channel_id, game_id, home, away, league, detail, fmt, "
+        "snapshot, notify, panel_kind) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(channel_id, game_id) DO UPDATE SET "
+        "home=excluded.home, away=excluded.away, "
+        "league=excluded.league, detail=excluded.detail, "
+        "fmt=excluded.fmt, snapshot=excluded.snapshot, "
+        "notify=excluded.notify, panel_kind=excluded.panel_kind",
         (channel_id, str(game_id), home, away, league, detail, fmt,
-         _json.dumps(snapshot)),
+         _json.dumps(snapshot), 1 if notify else 0, panel_kind),
+    )
+    await conn.commit()
+
+
+async def set_watch_notify(channel_id: int, game_id: str,
+                           notify: bool) -> None:
+    """Flip event alerts for a watch without touching its panel —
+    Follow / Unfollow only change this flag."""
+    conn = _require_conn()
+    await conn.execute(
+        "UPDATE watches SET notify=? WHERE channel_id=? AND game_id=?",
+        (1 if notify else 0, channel_id, str(game_id)),
     )
     await conn.commit()
 
@@ -256,7 +296,7 @@ async def list_watches(channel_id: int) -> list[dict]:
     conn = _require_conn()
     cur = await conn.execute(
         "SELECT channel_id, game_id, home, away, league, detail, fmt, "
-        "snapshot, panel_message_id "
+        "snapshot, panel_message_id, notify, panel_kind "
         "FROM watches WHERE channel_id=?",
         (channel_id,),
     )
@@ -268,7 +308,7 @@ async def get_all_watches() -> list[dict]:
     conn = _require_conn()
     cur = await conn.execute(
         "SELECT channel_id, game_id, home, away, league, detail, fmt, "
-        "snapshot, panel_message_id "
+        "snapshot, panel_message_id, notify, panel_kind "
         "FROM watches",
     )
     rows = await cur.fetchall()

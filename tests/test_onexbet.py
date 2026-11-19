@@ -378,5 +378,90 @@ class TestOnexSearchBarca(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["games"], [])
 
 
+class TestNplScorecard(unittest.IsolatedAsyncioTestCase):
+    """NPL official-API scorecard: striker / bowler / partnership
+    for Advanced. Fixture is the real live-scores.php response
+    for Qualifier 2, Sudurpaschim vs Chitwan, 19 Nov 2026
+    (photo URLs stripped — the parser never reads them)."""
+
+    def setUp(self):
+        self.data = _load("npl_live_scorecard.json")
+        prov._onex_reset_caches()
+
+    def tearDown(self):
+        prov._onex_reset_caches()
+
+    def test_parse_live_card(self):
+        card = prov._npl_scorecard_from_api(
+            self.data, "Sudurpaschim Royals", "Chitwan Rhinos")
+        self.assertIsNotNone(card)
+        self.assertEqual(card["striker"]["name"], "Tharindu Ratnayake")
+        self.assertEqual(card["striker"]["runs"], "44")
+        self.assertEqual(card["non_striker"]["name"], "Fabian Allen")
+        self.assertEqual(card["bowler"]["name"], "Rijan Dhakal")
+        self.assertEqual(card["bowler"]["wickets"], "1")
+        self.assertEqual(card["partnership"], "22 (16)")
+        self.assertEqual(card["last_wicket"]["name"], "Aarif Sheikh")
+        self.assertEqual(card["last_wicket"]["fow"], "102")
+        self.assertEqual(card["crr"], "6.7")
+        self.assertEqual(card["last_over"], "6/0")
+        self.assertEqual(len(card["batting"]), 8)
+        self.assertEqual(len(card["bowling"]), 6)
+        marked = [b for b in card["batting"]
+                  if b.get("on_strike") is True]
+        self.assertEqual([b["name"] for b in marked],
+                         ["Tharindu Ratnayake"])
+
+    def test_teams_match_either_order(self):
+        card = prov._npl_scorecard_from_api(
+            self.data, "Chitwan Rhinos", "Sudurpaschim Royals")
+        self.assertIsNotNone(card)
+        self.assertEqual(card["striker"]["name"], "Tharindu Ratnayake")
+
+    def test_wrong_teams_is_none(self):
+        self.assertIsNone(prov._npl_scorecard_from_api(
+            self.data, "Lumbini Lions", "Biratnagar Kings"))
+
+    def test_no_live_block_is_none(self):
+        import copy
+        data = copy.deepcopy(self.data)
+        del data["matches"][0]["live"]
+        self.assertIsNone(prov._npl_scorecard_from_api(
+            data, "Sudurpaschim Royals", "Chitwan Rhinos"))
+
+    async def test_fetch_caches_for_10s(self):
+        calls = []
+
+        async def fake_get(url, headers, params=None, cache_key="",
+                           provider="onexbet", refresh_fn=None):
+            calls.append(url)
+            return self.data
+
+        orig = prov.hc.get
+        prov.hc.get = fake_get
+        try:
+            card = await prov.onex_npl_scorecard(
+                "Sudurpaschim Royals", "Chitwan Rhinos")
+            self.assertIsNotNone(card)
+            await prov.onex_npl_scorecard(
+                "Sudurpaschim Royals", "Chitwan Rhinos")
+            self.assertEqual(len(calls), 1)
+        finally:
+            prov.hc.get = orig
+
+    async def test_fetch_failure_is_none_not_raise(self):
+        async def failing_get(url, headers, params=None, cache_key="",
+                              provider="onexbet", refresh_fn=None):
+            raise ConnectionError("down")
+
+        orig = prov.hc.get
+        prov.hc.get = failing_get
+        try:
+            self.assertIsNone(await prov.onex_npl_scorecard(
+                "Sudurpaschim Royals", "Chitwan Rhinos"))
+        finally:
+            prov.hc.get = orig
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1991 @@
+{
+ "fetchedAt": "2026-11-19T15:04:52+00:00",
+ "source": "espn",
+ "matches": [
+  {
+   "id": 1558612,
+   "matchNo": 31,
+   "team1": "Sudurpaschim Royals",
+   "team2": "Chitwan Rhinos",
+   "abbr1": "SPR",
+   "abbr2": "CHR",
+   "matchDesc": "Qualifier 2,  (D/N) at Kirtipur",
+   "series_name": "Nepal Premier League 2026",
+   "status": "live",
+   "statusText": "Sudurpaschim Royals need 6 runs from 8 balls",
+   "delayed": false,
+   "statusLabel": "",
+   "plain": false,
+   "toss": "",
+   "score1": "128/6",
+   "score2": "133/9",
+   "overs1": "18.4",
+   "overs2": "20",
+   "scorecard": {
+    "innings": [
+     {
+      "team": "Chitwan Rhinos",
+      "total": "133/9",
+      "overs": "20",
+      "batting": [
+       {
+        "name": "Dev Khanal",
+        "dismissal": "c Pandey b Airee",
+        "runs": "6",
+        "balls": "9",
+        "fours": "1",
+        "sixes": "0",
+        "sr": "66.66",
+        "crease": ""
+       },
+       {
+        "name": "Kamil Mishara",
+        "dismissal": "c \u2020Bhandari b Kuggeleijn",
+        "runs": "4",
+        "balls": "3",
+        "fours": "1",
+        "sixes": "0",
+        "sr": "133.33",
+        "crease": ""
+       },
+       {
+        "name": "Dawid Malan",
+        "dismissal": "not out",
+        "runs": "71",
+        "balls": "51",
+        "fours": "9",
+        "sixes": "2",
+        "sr": "139.21",
+        "crease": ""
+       },
+       {
+        "name": "Ravi Bopara",
+        "dismissal": "c Airee b Dhami",
+        "runs": "1",
+        "balls": "8",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "12.50",
+        "crease": ""
+       },
+       {
+        "name": "Bibek Yadav",
+        "dismissal": "c Pandey b Ratnayake",
+        "runs": "3",
+        "balls": "11",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "27.27",
+        "crease": ""
+       },
+       {
+        "name": "Kushal Malla",
+        "dismissal": "c Munsey b Pandey",
+        "runs": "1",
+        "balls": "5",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "20.00",
+        "crease": ""
+       },
+       {
+        "name": "Usama Mir",
+        "dismissal": "c Airee b Ratnayake",
+        "runs": "2",
+        "balls": "5",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "40.00",
+        "crease": ""
+       },
+       {
+        "name": "Salahuddin Khan",
+        "dismissal": "c Munsey b Kuggeleijn",
+        "runs": "18",
+        "balls": "16",
+        "fours": "0",
+        "sixes": "1",
+        "sr": "112.50",
+        "crease": ""
+       },
+       {
+        "name": "Kamal Airee",
+        "dismissal": "c Airee b Kuggeleijn",
+        "runs": "10",
+        "balls": "8",
+        "fours": "0",
+        "sixes": "1",
+        "sr": "125.00",
+        "crease": ""
+       },
+       {
+        "name": "Rijan Dhakal",
+        "dismissal": "run out (Kuggeleijn/\u2020Bhandari)",
+        "runs": "3",
+        "balls": "4",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "75.00",
+        "crease": ""
+       }
+      ],
+      "bowling": [
+       {
+        "name": "Hemant Dhami",
+        "overs": "4",
+        "maidens": "0",
+        "runs": "32",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "6",
+        "econ": "8"
+       },
+       {
+        "name": "Scott Kuggeleijn",
+        "overs": "4",
+        "maidens": "0",
+        "runs": "27",
+        "wickets": "3",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "6.75"
+       },
+       {
+        "name": "Dipendra Singh Airee",
+        "overs": "4",
+        "maidens": "1",
+        "runs": "20",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "5"
+       },
+       {
+        "name": "Anil Kharel",
+        "overs": "1",
+        "maidens": "0",
+        "runs": "11",
+        "wickets": "0",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "11"
+       },
+       {
+        "name": "Ishan Pandey",
+        "overs": "3",
+        "maidens": "0",
+        "runs": "17",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "5.67"
+       },
+       {
+        "name": "Tharindu Ratnayake",
+        "overs": "4",
+        "maidens": "0",
+        "runs": "23",
+        "wickets": "2",
+        "noballs": "0",
+        "wides": "1",
+        "econ": "5.75"
+       }
+      ],
+      "yetToBat": [
+       "Ranjit Kumar"
+      ],
+      "fallOfWickets": [
+       {
+        "name": "Kamil Mishara",
+        "score": "15",
+        "over": "1.3"
+       },
+       {
+        "name": "Dev Khanal",
+        "score": "15",
+        "over": "2.3"
+       },
+       {
+        "name": "Ravi Bopara",
+        "score": "31",
+        "over": "5.4"
+       },
+       {
+        "name": "Bibek Yadav",
+        "score": "58",
+        "over": "9.5"
+       },
+       {
+        "name": "Kushal Malla",
+        "score": "59",
+        "over": "10.4"
+       },
+       {
+        "name": "Usama Mir",
+        "score": "62",
+        "over": "11.4"
+       },
+       {
+        "name": "Salahuddin Khan",
+        "score": "102",
+        "over": "16.5"
+       },
+       {
+        "name": "Kamal Airee",
+        "score": "116",
+        "over": "18.1"
+       },
+       {
+        "name": "Rijan Dhakal",
+        "score": "133",
+        "over": "19.6"
+       }
+      ],
+      "extras": {
+       "total": "14",
+       "detail": "wd 11, b 3"
+      },
+      "totalDetail": "20 ov"
+     },
+     {
+      "team": "Sudurpaschim Royals",
+      "total": "128/6",
+      "overs": "18.4",
+      "batting": [
+       {
+        "name": "George Munsey",
+        "dismissal": "c Yadav b Dhakal",
+        "runs": "8",
+        "balls": "15",
+        "fours": "1",
+        "sixes": "0",
+        "sr": "53.33",
+        "crease": ""
+       },
+       {
+        "name": "Binod Bhandari",
+        "dismissal": "c Airee b Kumar",
+        "runs": "23",
+        "balls": "13",
+        "fours": "1",
+        "sixes": "2",
+        "sr": "176.92",
+        "crease": ""
+       },
+       {
+        "name": "Scott Kuggeleijn",
+        "dismissal": "lbw b Usama Mir",
+        "runs": "2",
+        "balls": "5",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "40.00",
+        "crease": ""
+       },
+       {
+        "name": "Ishan Pandey",
+        "dismissal": "c & b Kumar",
+        "runs": "10",
+        "balls": "9",
+        "fours": "2",
+        "sixes": "0",
+        "sr": "111.11",
+        "crease": ""
+       },
+       {
+        "name": "Dipendra Singh Airee",
+        "dismissal": "c \u2020Mishara b Salahuddin Khan",
+        "runs": "15",
+        "balls": "16",
+        "fours": "1",
+        "sixes": "0",
+        "sr": "93.75",
+        "crease": ""
+       },
+       {
+        "name": "Tharindu Ratnayake",
+        "dismissal": "not out",
+        "runs": "44",
+        "balls": "38",
+        "fours": "5",
+        "sixes": "0",
+        "sr": "115.78",
+        "crease": "striker"
+       },
+       {
+        "name": "Aarif Sheikh",
+        "dismissal": "b Airee",
+        "runs": "10",
+        "balls": "10",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "100.00",
+        "crease": ""
+       },
+       {
+        "name": "Fabian Allen",
+        "dismissal": "not out",
+        "runs": "4",
+        "balls": "6",
+        "fours": "0",
+        "sixes": "0",
+        "sr": "66.66",
+        "crease": "non-striker"
+       }
+      ],
+      "bowling": [
+       {
+        "name": "Kamal Airee",
+        "overs": "4",
+        "maidens": "0",
+        "runs": "26",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "6.5"
+       },
+       {
+        "name": "Rijan Dhakal",
+        "overs": "3.4",
+        "maidens": "0",
+        "runs": "25",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "6.82"
+       },
+       {
+        "name": "Ranjit Kumar",
+        "overs": "3",
+        "maidens": "0",
+        "runs": "25",
+        "wickets": "2",
+        "noballs": "0",
+        "wides": "3",
+        "econ": "8.33"
+       },
+       {
+        "name": "Usama Mir",
+        "overs": "4",
+        "maidens": "0",
+        "runs": "14",
+        "wickets": "1",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "3.5"
+       },
+       {
+        "name": "Salahuddin Khan",
+        "overs": "3",
+        "maidens": "0",
+        "runs": "30",
+        "wickets": "1",
+        "noballs": "1",
+        "wides": "2",
+        "econ": "10"
+       },
+       {
+        "name": "Kushal Malla",
+        "overs": "1",
+        "maidens": "0",
+        "runs": "6",
+        "wickets": "0",
+        "noballs": "0",
+        "wides": "0",
+        "econ": "6"
+       }
+      ],
+      "yetToBat": [
+       "Anil Kharel",
+       "Hemant Dhami",
+       "Dipak Bohara"
+      ],
+      "fallOfWickets": [
+       {
+        "name": "George Munsey",
+        "score": "23",
+        "over": "3.6"
+       },
+       {
+        "name": "Binod Bhandari",
+        "score": "31",
+        "over": "4.4"
+       },
+       {
+        "name": "Ishan Pandey",
+        "score": "43",
+        "over": "6.4"
+       },
+       {
+        "name": "Scott Kuggeleijn",
+        "score": "45",
+        "over": "7.2"
+       },
+       {
+        "name": "Dipendra Singh Airee",
+        "score": "76",
+        "over": "12.3"
+       },
+       {
+        "name": "Aarif Sheikh",
+        "score": "102",
+        "over": "15.5"
+       }
+      ],
+      "extras": {
+       "total": "8",
+       "detail": "wd 5, nb 1, lb 2"
+      },
+      "totalDetail": "18.4 ov"
+     }
+    ]
+   },
+   "commentary": [
+    {
+     "seq": 201803,
+     "period": 2,
+     "over": "18.3",
+     "text": "Dhakal to Ratnayake, no run"
+    },
+    {
+     "seq": 201802,
+     "period": 2,
+     "over": "18.2",
+     "text": "Dhakal to Ratnayake, no run"
+    },
+    {
+     "seq": 201801,
+     "period": 2,
+     "over": "18.1",
+     "text": "Dhakal to Ratnayake, 2 runs"
+    },
+    {
+     "seq": 201706,
+     "period": 2,
+     "over": "17.6",
+     "text": "Airee to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201705,
+     "period": 2,
+     "over": "17.5",
+     "text": "Airee to Allen, 1 run"
+    },
+    {
+     "seq": 201704,
+     "period": 2,
+     "over": "17.4",
+     "text": "Airee to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201703,
+     "period": 2,
+     "over": "17.3",
+     "text": "Airee to Ratnayake, FOUR"
+    },
+    {
+     "seq": 201702,
+     "period": 2,
+     "over": "17.2",
+     "text": "Airee to Allen, 1 run"
+    },
+    {
+     "seq": 201701,
+     "period": 2,
+     "over": "17.1",
+     "text": "Airee to Allen, no run"
+    },
+    {
+     "seq": 201606,
+     "period": 2,
+     "over": "16.6",
+     "text": "Salahuddin Khan to Allen, 1 run"
+    },
+    {
+     "seq": 201605,
+     "period": 2,
+     "over": "16.5",
+     "text": "Salahuddin Khan to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201604,
+     "period": 2,
+     "over": "16.4",
+     "text": "Salahuddin Khan to Ratnayake, FOUR"
+    },
+    {
+     "seq": 201603,
+     "period": 2,
+     "over": "16.3",
+     "text": "Salahuddin Khan to Ratnayake, FOUR"
+    },
+    {
+     "seq": 201602,
+     "period": 2,
+     "over": "16.2",
+     "text": "Salahuddin Khan to Allen, 1 run"
+    },
+    {
+     "seq": 201601,
+     "period": 2,
+     "over": "16.1",
+     "text": "Salahuddin Khan to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201506,
+     "period": 2,
+     "over": "15.6",
+     "text": "Airee to Allen, no run"
+    },
+    {
+     "seq": 201505,
+     "period": 2,
+     "over": "15.5",
+     "text": "Airee to Aarif Sheikh, OUT"
+    },
+    {
+     "seq": 201504,
+     "period": 2,
+     "over": "15.4",
+     "text": "Airee to Aarif Sheikh, 2 runs"
+    },
+    {
+     "seq": 201503,
+     "period": 2,
+     "over": "15.3",
+     "text": "Airee to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201502,
+     "period": 2,
+     "over": "15.2",
+     "text": "Airee to Ratnayake, no run"
+    },
+    {
+     "seq": 201501,
+     "period": 2,
+     "over": "15.1",
+     "text": "Airee to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201409,
+     "period": 2,
+     "over": "14.6",
+     "text": "Kumar to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201408,
+     "period": 2,
+     "over": "14.5",
+     "text": "Kumar to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201407,
+     "period": 2,
+     "over": "14.4",
+     "text": "Kumar to Ratnayake, 2 runs"
+    },
+    {
+     "seq": 201406,
+     "period": 2,
+     "over": "14.3",
+     "text": "Kumar to Ratnayake, FOUR"
+    },
+    {
+     "seq": 201405,
+     "period": 2,
+     "over": "14.2",
+     "text": "Kumar to Ratnayake, 2 runs"
+    },
+    {
+     "seq": 201404,
+     "period": 2,
+     "over": "14.1",
+     "text": "Kumar to Ratnayake, no run"
+    },
+    {
+     "seq": 201403,
+     "period": 2,
+     "over": "14.1",
+     "text": "Kumar to Ratnayake, 1 wide"
+    },
+    {
+     "seq": 201402,
+     "period": 2,
+     "over": "14.1",
+     "text": "Kumar to Ratnayake, 1 wide"
+    },
+    {
+     "seq": 201401,
+     "period": 2,
+     "over": "14.1",
+     "text": "Kumar to Ratnayake, 1 wide"
+    },
+    {
+     "seq": 201306,
+     "period": 2,
+     "over": "13.6",
+     "text": "Usama Mir to Aarif Sheikh, 2 runs"
+    },
+    {
+     "seq": 201305,
+     "period": 2,
+     "over": "13.5",
+     "text": "Usama Mir to Aarif Sheikh, no run"
+    },
+    {
+     "seq": 201304,
+     "period": 2,
+     "over": "13.4",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201303,
+     "period": 2,
+     "over": "13.3",
+     "text": "Usama Mir to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201302,
+     "period": 2,
+     "over": "13.2",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201301,
+     "period": 2,
+     "over": "13.1",
+     "text": "Usama Mir to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201207,
+     "period": 2,
+     "over": "12.6",
+     "text": "Salahuddin Khan to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201206,
+     "period": 2,
+     "over": "12.5",
+     "text": "Salahuddin Khan to Ratnayake, 1 leg bye"
+    },
+    {
+     "seq": 201205,
+     "period": 2,
+     "over": "12.4",
+     "text": "Salahuddin Khan to Aarif Sheikh, 1 run"
+    },
+    {
+     "seq": 201204,
+     "period": 2,
+     "over": "12.3",
+     "text": "Salahuddin Khan to Airee, OUT"
+    },
+    {
+     "seq": 201203,
+     "period": 2,
+     "over": "12.2",
+     "text": "Salahuddin Khan to Airee, 2 runs"
+    },
+    {
+     "seq": 201202,
+     "period": 2,
+     "over": "12.1",
+     "text": "Salahuddin Khan to Airee, FOUR"
+    },
+    {
+     "seq": 201201,
+     "period": 2,
+     "over": "12.1",
+     "text": "Salahuddin Khan to Ratnayake, (no ball) 1 run"
+    },
+    {
+     "seq": 201106,
+     "period": 2,
+     "over": "11.6",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201105,
+     "period": 2,
+     "over": "11.5",
+     "text": "Usama Mir to Airee, 1 run"
+    },
+    {
+     "seq": 201104,
+     "period": 2,
+     "over": "11.4",
+     "text": "Usama Mir to Airee, no run"
+    },
+    {
+     "seq": 201103,
+     "period": 2,
+     "over": "11.3",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201102,
+     "period": 2,
+     "over": "11.2",
+     "text": "Usama Mir to Airee, 1 run"
+    },
+    {
+     "seq": 201101,
+     "period": 2,
+     "over": "11.1",
+     "text": "Usama Mir to Airee, no run"
+    },
+    {
+     "seq": 201006,
+     "period": 2,
+     "over": "10.6",
+     "text": "Kushal Malla to Airee, 1 run"
+    },
+    {
+     "seq": 201005,
+     "period": 2,
+     "over": "10.5",
+     "text": "Kushal Malla to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201004,
+     "period": 2,
+     "over": "10.4",
+     "text": "Kushal Malla to Airee, 1 run"
+    },
+    {
+     "seq": 201003,
+     "period": 2,
+     "over": "10.3",
+     "text": "Kushal Malla to Ratnayake, 1 run"
+    },
+    {
+     "seq": 201002,
+     "period": 2,
+     "over": "10.2",
+     "text": "Kushal Malla to Airee, 1 run"
+    },
+    {
+     "seq": 201001,
+     "period": 2,
+     "over": "10.1",
+     "text": "Kushal Malla to Ratnayake, 1 run"
+    },
+    {
+     "seq": 200906,
+     "period": 2,
+     "over": "9.6",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 200905,
+     "period": 2,
+     "over": "9.5",
+     "text": "Usama Mir to Ratnayake, no run"
+    },
+    {
+     "seq": 200904,
+     "period": 2,
+     "over": "9.4",
+     "text": "Usama Mir to Ratnayake, no run"
+    },
+    {
+     "seq": 200903,
+     "period": 2,
+     "over": "9.3",
+     "text": "Usama Mir to Airee, 1 run"
+    },
+    {
+     "seq": 200902,
+     "period": 2,
+     "over": "9.2",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 200901,
+     "period": 2,
+     "over": "9.1",
+     "text": "Usama Mir to Ratnayake, no run"
+    },
+    {
+     "seq": 200808,
+     "period": 2,
+     "over": "8.6",
+     "text": "Salahuddin Khan to Ratnayake, 1 run"
+    },
+    {
+     "seq": 200807,
+     "period": 2,
+     "over": "8.5",
+     "text": "Salahuddin Khan to Ratnayake, FOUR"
+    },
+    {
+     "seq": 200806,
+     "period": 2,
+     "over": "8.5",
+     "text": "Salahuddin Khan to Ratnayake, 1 wide"
+    },
+    {
+     "seq": 200805,
+     "period": 2,
+     "over": "8.4",
+     "text": "Salahuddin Khan to Airee, 1 run"
+    },
+    {
+     "seq": 200804,
+     "period": 2,
+     "over": "8.3",
+     "text": "Salahuddin Khan to Ratnayake, 1 leg bye"
+    },
+    {
+     "seq": 200803,
+     "period": 2,
+     "over": "8.2",
+     "text": "Salahuddin Khan to Ratnayake, no run"
+    },
+    {
+     "seq": 200802,
+     "period": 2,
+     "over": "8.1",
+     "text": "Salahuddin Khan to Ratnayake, no run"
+    },
+    {
+     "seq": 200801,
+     "period": 2,
+     "over": "8.1",
+     "text": "Salahuddin Khan to Ratnayake, 1 wide"
+    },
+    {
+     "seq": 200706,
+     "period": 2,
+     "over": "7.6",
+     "text": "Usama Mir to Airee, no run"
+    },
+    {
+     "seq": 200705,
+     "period": 2,
+     "over": "7.5",
+     "text": "Usama Mir to Airee, no run"
+    },
+    {
+     "seq": 200704,
+     "period": 2,
+     "over": "7.4",
+     "text": "Usama Mir to Ratnayake, 1 run"
+    },
+    {
+     "seq": 200703,
+     "period": 2,
+     "over": "7.3",
+     "text": "Usama Mir to Ratnayake, no run"
+    },
+    {
+     "seq": 200702,
+     "period": 2,
+     "over": "7.2",
+     "text": "Usama Mir to Kuggeleijn, OUT"
+    },
+    {
+     "seq": 200701,
+     "period": 2,
+     "over": "7.1",
+     "text": "Usama Mir to Kuggeleijn, no run"
+    },
+    {
+     "seq": 200606,
+     "period": 2,
+     "over": "6.6",
+     "text": "Kumar to Airee, 2 runs"
+    },
+    {
+     "seq": 200605,
+     "period": 2,
+     "over": "6.5",
+     "text": "Kumar to Airee, no run"
+    },
+    {
+     "seq": 200604,
+     "period": 2,
+     "over": "6.4",
+     "text": "Kumar to Pandey, OUT"
+    },
+    {
+     "seq": 200603,
+     "period": 2,
+     "over": "6.3",
+     "text": "Kumar to Kuggeleijn, 1 run"
+    },
+    {
+     "seq": 200602,
+     "period": 2,
+     "over": "6.2",
+     "text": "Kumar to Kuggeleijn, no run"
+    },
+    {
+     "seq": 200601,
+     "period": 2,
+     "over": "6.1",
+     "text": "Kumar to Pandey, 1 run"
+    },
+    {
+     "seq": 200506,
+     "period": 2,
+     "over": "5.6",
+     "text": "Dhakal to Pandey, 1 run"
+    },
+    {
+     "seq": 200505,
+     "period": 2,
+     "over": "5.5",
+     "text": "Dhakal to Pandey, no run"
+    },
+    {
+     "seq": 200504,
+     "period": 2,
+     "over": "5.4",
+     "text": "Dhakal to Pandey, FOUR"
+    },
+    {
+     "seq": 200503,
+     "period": 2,
+     "over": "5.3",
+     "text": "Dhakal to Pandey, no run"
+    },
+    {
+     "seq": 200502,
+     "period": 2,
+     "over": "5.2",
+     "text": "Dhakal to Pandey, FOUR"
+    },
+    {
+     "seq": 200501,
+     "period": 2,
+     "over": "5.1",
+     "text": "Dhakal to Kuggeleijn, 1 run"
+    },
+    {
+     "seq": 200406,
+     "period": 2,
+     "over": "4.6",
+     "text": "Kumar to Pandey, no run"
+    },
+    {
+     "seq": 200405,
+     "period": 2,
+     "over": "4.5",
+     "text": "Kumar to Pandey, no run"
+    },
+    {
+     "seq": 200404,
+     "period": 2,
+     "over": "4.4",
+     "text": "Kumar to Bhandari, OUT"
+    },
+    {
+     "seq": 200403,
+     "period": 2,
+     "over": "4.3",
+     "text": "Kumar to Bhandari, SIX"
+    },
+    {
+     "seq": 200402,
+     "period": 2,
+     "over": "4.2",
+     "text": "Kumar to Bhandari, no run"
+    },
+    {
+     "seq": 200401,
+     "period": 2,
+     "over": "4.1",
+     "text": "Kumar to Bhandari, 2 runs"
+    },
+    {
+     "seq": 200306,
+     "period": 2,
+     "over": "3.6",
+     "text": "Dhakal to Munsey, OUT"
+    },
+    {
+     "seq": 200305,
+     "period": 2,
+     "over": "3.5",
+     "text": "Dhakal to Bhandari, 1 run"
+    },
+    {
+     "seq": 200304,
+     "period": 2,
+     "over": "3.4",
+     "text": "Dhakal to Bhandari, FOUR"
+    },
+    {
+     "seq": 200303,
+     "period": 2,
+     "over": "3.3",
+     "text": "Dhakal to Munsey, 1 run"
+    },
+    {
+     "seq": 200302,
+     "period": 2,
+     "over": "3.2",
+     "text": "Dhakal to Bhandari, 1 run"
+    },
+    {
+     "seq": 200301,
+     "period": 2,
+     "over": "3.1",
+     "text": "Dhakal to Munsey, 1 run"
+    },
+    {
+     "seq": 200206,
+     "period": 2,
+     "over": "2.6",
+     "text": "Airee to Munsey, 1 run"
+    },
+    {
+     "seq": 200205,
+     "period": 2,
+     "over": "2.5",
+     "text": "Airee to Munsey, no run"
+    },
+    {
+     "seq": 200204,
+     "period": 2,
+     "over": "2.4",
+     "text": "Airee to Bhandari, 1 run"
+    },
+    {
+     "seq": 200203,
+     "period": 2,
+     "over": "2.3",
+     "text": "Airee to Bhandari, SIX"
+    },
+    {
+     "seq": 200202,
+     "period": 2,
+     "over": "2.2",
+     "text": "Airee to Bhandari, no run"
+    },
+    {
+     "seq": 200201,
+     "period": 2,
+     "over": "2.1",
+     "text": "Airee to Bhandari, no run"
+    },
+    {
+     "seq": 200106,
+     "period": 2,
+     "over": "1.6",
+     "text": "Dhakal to Munsey, no run"
+    },
+    {
+     "seq": 200105,
+     "period": 2,
+     "over": "1.5",
+     "text": "Dhakal to Munsey, no run"
+    },
+    {
+     "seq": 200104,
+     "period": 2,
+     "over": "1.4",
+     "text": "Dhakal to Munsey, no run"
+    },
+    {
+     "seq": 200103,
+     "period": 2,
+     "over": "1.3",
+     "text": "Dhakal to Munsey, no run"
+    },
+    {
+     "seq": 200102,
+     "period": 2,
+     "over": "1.2",
+     "text": "Dhakal to Munsey, no run"
+    },
+    {
+     "seq": 200101,
+     "period": 2,
+     "over": "1.1",
+     "text": "Dhakal to Bhandari, 1 run"
+    },
+    {
+     "seq": 200006,
+     "period": 2,
+     "over": "0.6",
+     "text": "Airee to Munsey, no run"
+    },
+    {
+     "seq": 200005,
+     "period": 2,
+     "over": "0.5",
+     "text": "Airee to Munsey, FOUR"
+    },
+    {
+     "seq": 200004,
+     "period": 2,
+     "over": "0.4",
+     "text": "Airee to Bhandari, 1 run"
+    },
+    {
+     "seq": 200003,
+     "period": 2,
+     "over": "0.3",
+     "text": "Airee to Munsey, 1 run"
+    },
+    {
+     "seq": 200002,
+     "period": 2,
+     "over": "0.2",
+     "text": "Airee to Munsey, no run"
+    },
+    {
+     "seq": 200001,
+     "period": 2,
+     "over": "0.1",
+     "text": "Airee to Munsey, no run"
+    },
+    {
+     "seq": 101907,
+     "period": 1,
+     "over": "19.6",
+     "text": "Dhami to Dhakal, 1 run, OUT"
+    },
+    {
+     "seq": 101906,
+     "period": 1,
+     "over": "19.5",
+     "text": "Dhami to Malan, 1 run"
+    },
+    {
+     "seq": 101905,
+     "period": 1,
+     "over": "19.4",
+     "text": "Dhami to Malan, 2 runs"
+    },
+    {
+     "seq": 101904,
+     "period": 1,
+     "over": "19.3",
+     "text": "Dhami to Malan, no run"
+    },
+    {
+     "seq": 101903,
+     "period": 1,
+     "over": "19.2",
+     "text": "Dhami to Malan, 2 runs"
+    },
+    {
+     "seq": 101902,
+     "period": 1,
+     "over": "19.1",
+     "text": "Dhami to Dhakal, 1 bye"
+    },
+    {
+     "seq": 101901,
+     "period": 1,
+     "over": "19.1",
+     "text": "Dhami to Dhakal, 1 wide"
+    },
+    {
+     "seq": 101806,
+     "period": 1,
+     "over": "18.6",
+     "text": "Kuggeleijn to Malan, SIX"
+    },
+    {
+     "seq": 101805,
+     "period": 1,
+     "over": "18.5",
+     "text": "Kuggeleijn to Dhakal, 1 run"
+    },
+    {
+     "seq": 101804,
+     "period": 1,
+     "over": "18.4",
+     "text": "Kuggeleijn to Malan, 1 run"
+    },
+    {
+     "seq": 101803,
+     "period": 1,
+     "over": "18.3",
+     "text": "Kuggeleijn to Malan, no run"
+    },
+    {
+     "seq": 101802,
+     "period": 1,
+     "over": "18.2",
+     "text": "Kuggeleijn to Dhakal, 1 run"
+    },
+    {
+     "seq": 101801,
+     "period": 1,
+     "over": "18.1",
+     "text": "Kuggeleijn to Airee, OUT"
+    },
+    {
+     "seq": 101708,
+     "period": 1,
+     "over": "17.6",
+     "text": "Dhami to Airee, 1 run"
+    },
+    {
+     "seq": 101707,
+     "period": 1,
+     "over": "17.5",
+     "text": "Dhami to Airee, 2 runs"
+    },
+    {
+     "seq": 101706,
+     "period": 1,
+     "over": "17.4",
+     "text": "Dhami to Airee, SIX"
+    },
+    {
+     "seq": 101705,
+     "period": 1,
+     "over": "17.3",
+     "text": "Dhami to Airee, 2 byes"
+    },
+    {
+     "seq": 101704,
+     "period": 1,
+     "over": "17.3",
+     "text": "Dhami to Airee, 1 wide"
+    },
+    {
+     "seq": 101703,
+     "period": 1,
+     "over": "17.2",
+     "text": "Dhami to Airee, no run"
+    },
+    {
+     "seq": 101702,
+     "period": 1,
+     "over": "17.2",
+     "text": "Dhami to Airee, 1 wide"
+    },
+    {
+     "seq": 101701,
+     "period": 1,
+     "over": "17.1",
+     "text": "Dhami to Airee, no run"
+    },
+    {
+     "seq": 101606,
+     "period": 1,
+     "over": "16.6",
+     "text": "Kuggeleijn to Airee, 1 run"
+    },
+    {
+     "seq": 101605,
+     "period": 1,
+     "over": "16.5",
+     "text": "Kuggeleijn to Salahuddin Khan, OUT"
+    },
+    {
+     "seq": 101604,
+     "period": 1,
+     "over": "16.4",
+     "text": "Kuggeleijn to Malan, 1 run"
+    },
+    {
+     "seq": 101603,
+     "period": 1,
+     "over": "16.3",
+     "text": "Kuggeleijn to Malan, FOUR"
+    },
+    {
+     "seq": 101602,
+     "period": 1,
+     "over": "16.2",
+     "text": "Kuggeleijn to Malan, no run"
+    },
+    {
+     "seq": 101601,
+     "period": 1,
+     "over": "16.1",
+     "text": "Kuggeleijn to Malan, no run"
+    },
+    {
+     "seq": 101507,
+     "period": 1,
+     "over": "15.6",
+     "text": "Ratnayake to Malan, 1 run"
+    },
+    {
+     "seq": 101506,
+     "period": 1,
+     "over": "15.5",
+     "text": "Ratnayake to Salahuddin Khan, 1 run"
+    },
+    {
+     "seq": 101505,
+     "period": 1,
+     "over": "15.5",
+     "text": "Ratnayake to Salahuddin Khan, 1 wide"
+    },
+    {
+     "seq": 101504,
+     "period": 1,
+     "over": "15.4",
+     "text": "Ratnayake to Salahuddin Khan, no run"
+    },
+    {
+     "seq": 101503,
+     "period": 1,
+     "over": "15.3",
+     "text": "Ratnayake to Salahuddin Khan, no run"
+    },
+    {
+     "seq": 101502,
+     "period": 1,
+     "over": "15.2",
+     "text": "Ratnayake to Malan, 1 run"
+    },
+    {
+     "seq": 101501,
+     "period": 1,
+     "over": "15.1",
+     "text": "Ratnayake to Malan, FOUR"
+    },
+    {
+     "seq": 101406,
+     "period": 1,
+     "over": "14.6",
+     "text": "Pandey to Malan, 1 run"
+    },
+    {
+     "seq": 101405,
+     "period": 1,
+     "over": "14.5",
+     "text": "Pandey to Salahuddin Khan, 1 run"
+    },
+    {
+     "seq": 101404,
+     "period": 1,
+     "over": "14.4",
+     "text": "Pandey to Salahuddin Khan, 2 runs"
+    },
+    {
+     "seq": 101403,
+     "period": 1,
+     "over": "14.3",
+     "text": "Pandey to Salahuddin Khan, SIX"
+    },
+    {
+     "seq": 101402,
+     "period": 1,
+     "over": "14.2",
+     "text": "Pandey to Malan, 1 run"
+    },
+    {
+     "seq": 101401,
+     "period": 1,
+     "over": "14.1",
+     "text": "Pandey to Salahuddin Khan, 1 run"
+    },
+    {
+     "seq": 101306,
+     "period": 1,
+     "over": "13.6",
+     "text": "Ratnayake to Malan, no run"
+    },
+    {
+     "seq": 101305,
+     "period": 1,
+     "over": "13.5",
+     "text": "Ratnayake to Malan, FOUR"
+    },
+    {
+     "seq": 101304,
+     "period": 1,
+     "over": "13.4",
+     "text": "Ratnayake to Salahuddin Khan, 1 run"
+    }
+   ],
+   "overTimeline": [
+    {
+     "label": "Over 19",
+     "bowler": "Rijan Dhakal",
+     "tokens": [
+      "2",
+      "\u00b7",
+      "\u00b7"
+     ],
+     "runs": 6,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 18",
+     "bowler": "Kamal Airee",
+     "tokens": [
+      "\u00b7",
+      "1",
+      "4",
+      "1",
+      "1",
+      "1"
+     ],
+     "runs": 8,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 17",
+     "bowler": "Salahuddin Khan",
+     "tokens": [
+      "1",
+      "1",
+      "4",
+      "4",
+      "1",
+      "1"
+     ],
+     "runs": 12,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 16",
+     "bowler": "Kamal Airee",
+     "tokens": [
+      "1",
+      "\u00b7",
+      "1",
+      "2",
+      "W",
+      "\u00b7"
+     ],
+     "runs": 4,
+     "wickets": 1,
+     "outs": [
+      "Aarif Sheikh"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 15",
+     "bowler": "Ranjit Kumar",
+     "tokens": [
+      "1wd",
+      "1wd",
+      "1wd",
+      "\u00b7",
+      "2",
+      "4",
+      "2",
+      "1",
+      "1"
+     ],
+     "runs": 13,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 14",
+     "bowler": "Usama Mir",
+     "tokens": [
+      "1",
+      "1",
+      "1",
+      "1",
+      "\u00b7",
+      "2"
+     ],
+     "runs": 6,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 13",
+     "bowler": "Salahuddin Khan",
+     "tokens": [
+      "2nb",
+      "4",
+      "2",
+      "W",
+      "1",
+      "1lb",
+      "1"
+     ],
+     "runs": 11,
+     "wickets": 1,
+     "outs": [
+      "Dipendra Singh Airee"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 12",
+     "bowler": "Usama Mir",
+     "tokens": [
+      "\u00b7",
+      "1",
+      "1",
+      "\u00b7",
+      "1",
+      "1"
+     ],
+     "runs": 4,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 11",
+     "bowler": "Kushal Malla",
+     "tokens": [
+      "1",
+      "1",
+      "1",
+      "1",
+      "1",
+      "1"
+     ],
+     "runs": 6,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/full/1141934.png"
+    },
+    {
+     "label": "Over 10",
+     "bowler": "Usama Mir",
+     "tokens": [
+      "\u00b7",
+      "1",
+      "1",
+      "\u00b7",
+      "\u00b7",
+      "1"
+     ],
+     "runs": 3,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 9",
+     "bowler": "Salahuddin Khan",
+     "tokens": [
+      "1wd",
+      "\u00b7",
+      "\u00b7",
+      "1lb",
+      "1",
+      "1wd",
+      "4",
+      "1"
+     ],
+     "runs": 9,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 8",
+     "bowler": "Usama Mir",
+     "tokens": [
+      "\u00b7",
+      "W",
+      "\u00b7",
+      "1",
+      "\u00b7",
+      "\u00b7"
+     ],
+     "runs": 1,
+     "wickets": 1,
+     "outs": [
+      "Scott Kuggeleijn"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 7",
+     "bowler": "Ranjit Kumar",
+     "tokens": [
+      "1",
+      "\u00b7",
+      "1",
+      "W",
+      "\u00b7",
+      "2"
+     ],
+     "runs": 4,
+     "wickets": 1,
+     "outs": [
+      "Ishan Pandey"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 6",
+     "bowler": "Rijan Dhakal",
+     "tokens": [
+      "1",
+      "4",
+      "\u00b7",
+      "4",
+      "\u00b7",
+      "1"
+     ],
+     "runs": 10,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 5",
+     "bowler": "Ranjit Kumar",
+     "tokens": [
+      "2",
+      "\u00b7",
+      "6",
+      "W",
+      "\u00b7",
+      "\u00b7"
+     ],
+     "runs": 8,
+     "wickets": 1,
+     "outs": [
+      "Binod Bhandari"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 4",
+     "bowler": "Rijan Dhakal",
+     "tokens": [
+      "1",
+      "1",
+      "1",
+      "4",
+      "1",
+      "W"
+     ],
+     "runs": 8,
+     "wickets": 1,
+     "outs": [
+      "George Munsey"
+     ],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 3",
+     "bowler": "Kamal Airee",
+     "tokens": [
+      "\u00b7",
+      "\u00b7",
+      "6",
+      "1",
+      "\u00b7",
+      "1"
+     ],
+     "runs": 8,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 2",
+     "bowler": "Rijan Dhakal",
+     "tokens": [
+      "1",
+      "\u00b7",
+      "\u00b7",
+      "\u00b7",
+      "\u00b7",
+      "\u00b7"
+     ],
+     "runs": 1,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    },
+    {
+     "label": "Over 1",
+     "bowler": "Kamal Airee",
+     "tokens": [
+      "\u00b7",
+      "\u00b7",
+      "1",
+      "1",
+      "4",
+      "\u00b7"
+     ],
+     "runs": 6,
+     "wickets": 0,
+     "outs": [],
+     "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+    }
+   ],
+   "live": {
+    "batters": [
+     {
+      "name": "Tharindu Ratnayake",
+      "runs": "44",
+      "balls": "38",
+      "fours": "5",
+      "sixes": "0",
+      "sr": "115.78",
+      "striker": true
+     },
+     {
+      "name": "Fabian Allen",
+      "runs": "4",
+      "balls": "6",
+      "fours": "0",
+      "sixes": "0",
+      "sr": "66.66",
+      "striker": false
+     }
+    ],
+    "bowlers": [
+     {
+      "name": "Rijan Dhakal",
+      "overs": "3.3",
+      "maidens": "0",
+      "runs": "21",
+      "wickets": "1",
+      "econ": "6",
+      "current": true
+     },
+     {
+      "name": "Kamal Airee",
+      "overs": "4",
+      "maidens": "0",
+      "runs": "26",
+      "wickets": "1",
+      "econ": "6.5",
+      "current": false
+     }
+    ],
+    "lastWicket": {
+     "name": "Aarif Sheikh",
+     "runs": "10",
+     "balls": "10",
+     "dismissal": "b Airee",
+     "fow": "102",
+     "over": "15.5"
+    },
+    "crr": "6.7",
+    "partnership": "22 (16)",
+    "lastOver": "6/0",
+    "lastFive": "42/1 (8.4)",
+    "projected": "134",
+    "forecastTeam": "SPR",
+    "recentOvers": [
+     {
+      "label": "Over 19",
+      "bowler": "Rijan Dhakal",
+      "tokens": [
+       "2",
+       "\u00b7",
+       "\u00b7"
+      ],
+      "runs": 6,
+      "wickets": 0,
+      "outs": [],
+      "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+     },
+     {
+      "label": "Over 18",
+      "bowler": "Kamal Airee",
+      "tokens": [
+       "\u00b7",
+       "1",
+       "4",
+       "1",
+       "1",
+       "1"
+      ],
+      "runs": 8,
+      "wickets": 0,
+      "outs": [],
+      "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+     },
+     {
+      "label": "Over 17",
+      "bowler": "Salahuddin Khan",
+      "tokens": [
+       "1",
+       "1",
+       "4",
+       "4",
+       "1",
+       "1"
+      ],
+      "runs": 12,
+      "wickets": 0,
+      "outs": [],
+      "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+     },
+     {
+      "label": "Over 16",
+      "bowler": "Kamal Airee",
+      "tokens": [
+       "1",
+       "\u00b7",
+       "1",
+       "2",
+       "W",
+       "\u00b7"
+      ],
+      "runs": 4,
+      "wickets": 1,
+      "outs": [
+       "Aarif Sheikh"
+      ],
+      "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+     },
+     {
+      "label": "Over 15",
+      "bowler": "Ranjit Kumar",
+      "tokens": [
+       "1wd",
+       "1wd",
+       "1wd",
+       "\u00b7",
+       "2",
+       "4",
+       "2",
+       "1",
+       "1"
+      ],
+      "runs": 13,
+      "wickets": 0,
+      "outs": [],
+      "bowlerPhoto": "https://a.espncdn.com/i/headshots/cricket/players/default-player-logo-500.png"
+     }
+    ]
+   },
+   "playingXi": [
+    {
+     "team": "Sudurpaschim Royals",
+     "players": [
+      {
+       "name": "George Munsey",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Binod Bhandari",
+       "role": "Wicketkeeper",
+       "captain": false
+      },
+      {
+       "name": "Scott Kuggeleijn",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Ishan Pandey",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Dipendra Singh Airee",
+       "role": "Allrounder",
+       "captain": true
+      },
+      {
+       "name": "Tharindu Ratnayake",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Aarif Sheikh",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Fabian Allen",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Anil Kharel",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Hemant Dhami",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Dipak Bohara",
+       "role": "Unknown",
+       "captain": false
+      }
+     ]
+    },
+    {
+     "team": "Chitwan Rhinos",
+     "players": [
+      {
+       "name": "Dev Khanal",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Kamil Mishara",
+       "role": "Wicketkeeper",
+       "captain": false
+      },
+      {
+       "name": "Dawid Malan",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Ravi Bopara",
+       "role": "Allrounder",
+       "captain": true
+      },
+      {
+       "name": "Bibek Yadav",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Kushal Malla",
+       "role": "Allrounder",
+       "captain": false
+      },
+      {
+       "name": "Usama Mir",
+       "role": "Bowler",
+       "captain": false
+      },
+      {
+       "name": "Salahuddin Khan",
+       "role": "Unknown",
+       "captain": false
+      },
+      {
+       "name": "Kamal Airee",
+       "role": "Bowler",
+       "captain": false
+      },
+      {
+       "name": "Rijan Dhakal",
+       "role": "Bowler",
+       "captain": false
+      },
+      {
+       "name": "Ranjit Kumar",
+       "role": "Unknown",
+       "captain": false
+      }
+     ]
+    }
+   ],
+   "url": "https://www.espncricinfo.com/"
+  }
+ ]
+}

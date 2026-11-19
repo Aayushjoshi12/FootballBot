@@ -213,6 +213,10 @@ def render_detail(d: dict, level: str = DETAIL_SIMPLE,
                     else f"Need: {need} runs")
         if cricket.get("run_rate"):
             lines.append(f"Run rate: {cricket['run_rate']}")
+        card_lines = format_cricket_scorecard(d, full=True)
+        if card_lines:
+            lines.append("")
+            lines.extend(card_lines)
         table = format_stats_table(stats)
         if table:
             lines.append("")
@@ -408,6 +412,84 @@ def format_cricket_stats(d: dict) -> list[str]:
     return lines
 
 
+def format_cricket_scorecard(d: dict, full: bool = False) -> list[str]:
+    """Advanced-only cricket scorecard: striker, non-striker,
+    current bowler, partnership, last wicket, current run rate.
+    full=True adds the current-innings batting + bowling card.
+    NPL only — the 1xBet feed carries no player names, so other
+    cricket has no scorecard and this returns []. Nothing is
+    invented: a missing name or figure simply drops its line."""
+    card = (d.get("cricket") or {}).get("scorecard") or {}
+    if not card:
+        return []
+    lines = ["**🏏 At the crease**"]
+    striker = card.get("striker") or {}
+    if striker.get("name"):
+        lines.append(
+            f"Striker: {striker['name']} {striker.get('runs', '')}"
+            f" ({striker.get('balls', '')})"
+            + (f" · {striker.get('fours', '')}x4"
+               f" {striker.get('sixes', '')}x6"
+               if striker.get("fours") not in (None, "")
+               else ""))
+    non = card.get("non_striker") or {}
+    if non.get("name"):
+        lines.append(
+            f"Non-striker: {non['name']} {non.get('runs', '')}"
+            f" ({non.get('balls', '')})")
+    bowler = card.get("bowler") or {}
+    if bowler.get("name"):
+        lines.append(
+            f"Bowler: {bowler['name']} {bowler.get('overs', '')}"
+            f"-{bowler.get('maidens', '')}-{bowler.get('runs', '')}"
+            f"-{bowler.get('wickets', '')}")
+    bits = []
+    if card.get("partnership"):
+        bits.append(f"Partnership: {card['partnership']}")
+    if card.get("crr"):
+        bits.append(f"CRR: {card['crr']}")
+    if bits:
+        lines.append(" · ".join(bits))
+    lw = card.get("last_wicket") or {}
+    if lw.get("name"):
+        lines.append(
+            f"Last wicket: {lw['name']} {lw.get('runs', '')}"
+            + (f" ({lw['dismissal']})" if lw.get("dismissal") else "")
+            + (f" · {lw['fow']}/{lw['over']}"
+               if lw.get("fow") and lw.get("over") else ""))
+    if card.get("last_over"):
+        lines.append(f"Last over: {card['last_over']}")
+    if not full:
+        return lines
+    batting = card.get("batting") or []
+    if batting:
+        lines.append("")
+        lines.append("**Batting**")
+        for b in batting:
+            if not b.get("name"):
+                continue
+            mark = "*" if b.get("on_strike") is True else ""
+            dis = b.get("dismissal") or ""
+            lines.append(
+                f"{b['name']}{mark} {b.get('runs', '')}"
+                f" ({b.get('balls', '')})"
+                + (f" · {dis}" if dis and dis != "not out" else
+                   " · not out" if dis == "not out" else ""))
+    bowling = card.get("bowling") or []
+    if bowling:
+        lines.append("")
+        lines.append("**Bowling**")
+        for b in bowling:
+            if not b.get("name"):
+                continue
+            lines.append(
+                f"{b['name']} {b.get('overs', '')}"
+                f"-{b.get('maidens', '')}-{b.get('runs', '')}"
+                f"-{b.get('wickets', '')}"
+                + (f" · Econ {b['econ']}" if b.get("econ") else ""))
+    return lines
+
+
 def render_analytics(d: dict, momentum: str | None = None,
                      updated: str | None = None) -> str:
     """Advanced analytics view: home/away comparison from the
@@ -468,6 +550,10 @@ def render_analytics(d: dict, momentum: str | None = None,
                          "the details feed is not answering.")
         else:
             lines.append("No match statistics available yet.")
+    card_lines = format_cricket_scorecard(d)
+    if card_lines:
+        lines.append("")
+        lines.extend(card_lines)
     cricket = d.get("cricket") or {}
     if cricket.get("target") is not None:
         lines.append(f"Target: {cricket['target']}")
@@ -3373,4 +3459,22 @@ async def _on_tick_locked(bot: discord.Client,
     # (The old phase 2 let only one panel per channel edit per
     # tick, so four panels in one channel took turns and each
     # panel's Updated footer only advanced about every 4s.)
+    # NPL cricket panels: one shared scorecard fetch for the
+    # tick (cached 10s in the provider) so Advanced/analytics
+    # panels show striker, bowler and partnership live. The
+    # fetch happens AFTER the event/snapshot loop above, so the
+    # scorecard never enters a snapshot or an event.
+    npl_keys = [k for k, d in details.items()
+                if d.get("league") == "Nepal Premier League"
+                and d.get("cricket") is not None]
+    if npl_keys:
+        try:
+            card = await prov.onex_npl_scorecard(
+                details[npl_keys[0]].get("home", ""),
+                details[npl_keys[0]].get("away", ""))
+        except Exception:
+            card = None
+        if card:
+            for k in npl_keys:
+                details[k]["cricket"]["scorecard"] = card
     _schedule_panel_edits(bot, details, changed)

@@ -1265,6 +1265,155 @@ def _onex_cricket_target_fmt(fmt: str, home_score: Any, away_score: Any,
                                 over_str, total)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# NPL scorecard — Cricinfo-style cricket detail (Advanced only)
+#
+# 1xBet's own feed carries NO batsman or bowler names (its
+# InningsStatistic payload has player ids only, names null — see
+# cricketRunRate in the site's Vercel proxy, same finding), so
+# the scorecard comes from the NPL official API instead:
+#   https://nplcricketleague.com/api/live-scores.php
+# (ESPN-sourced, already the site's score fallback). Its `live`
+# block names the striker / non-striker, the current bowler,
+# partnership, last wicket, current run rate and last over, and
+# the scorecard carries the full batting + bowling card of the
+# innings in progress. Non-NPL cricket has no such source, so
+# it keeps the 1xBet-only Advanced rows (target / need / run
+# rate) and simply shows no scorecard — never invented names.
+#
+# Fetched at most once per 10s (shared cache): the 1s panel
+# tick and button taps all read the same card, so a live panel
+# never hammers the NPL API.
+# ══════════════════════════════════════════════════════════════════════════
+
+_NPL_SCORECARD_URL = "https://nplcricketleague.com/api/live-scores.php"
+_NPL_CARD_TTL_S = 10.0
+_npl_card_cache: dict[str, Any] = {
+    "ts": 0.0, "home": "", "away": "", "card": None,
+}
+
+
+def _npl_norm_team(name: Any) -> str:
+    return normalize(str(name or ""))
+
+
+def _npl_card_batter(b: dict) -> dict:
+    return {
+        "name": str(b.get("name") or ""),
+        "runs": str(b.get("runs") or ""),
+        "balls": str(b.get("balls") or ""),
+        "fours": str(b.get("fours") or ""),
+        "sixes": str(b.get("sixes") or ""),
+        "sr": str(b.get("sr") or ""),
+        "dismissal": str(b.get("dismissal") or ""),
+    }
+
+
+def _npl_card_bowler(b: dict) -> dict:
+    return {
+        "name": str(b.get("name") or ""),
+        "overs": str(b.get("overs") or ""),
+        "maidens": str(b.get("maidens") or ""),
+        "runs": str(b.get("runs") or ""),
+        "wickets": str(b.get("wickets") or ""),
+        "econ": str(b.get("econ") or ""),
+    }
+
+
+def _npl_scorecard_from_api(data: Any, home: str, away: str) -> dict | None:
+    """Pure parse: the NPL official API's live scorecard for one
+    match, matched by team names (either order — the API's
+    team1/team2 need not match 1xBet's home/away). None when no
+    live match fits, or when the match carries no `live` block
+    (innings break, not started, finished)."""
+    if not isinstance(data, dict):
+        return None
+    want = {_npl_norm_team(home), _npl_norm_team(away)}
+    for m in data.get("matches") or []:
+        if not isinstance(m, dict) or m.get("status") != "live":
+            continue
+        teams = {_npl_norm_team(m.get("team1")),
+                 _npl_norm_team(m.get("team2"))}
+        if teams != want or "" in teams:
+            continue
+        live = m.get("live") or {}
+        batters = live.get("batters") or []
+        if not isinstance(batters, list) or not batters:
+            return None
+        striker = non_striker = None
+        for b in batters:
+            if not isinstance(b, dict):
+                continue
+            if b.get("striker") is True:
+                striker = _npl_card_batter(b)
+            elif b.get("striker") is False:
+                non_striker = _npl_card_batter(b)
+        bowlers = live.get("bowlers") or []
+        bowler = None
+        for b in bowlers:
+            if isinstance(b, dict) and b.get("current") is True:
+                bowler = _npl_card_bowler(b)
+                break
+        lw = live.get("lastWicket") or {}
+        last_wicket = None
+        if isinstance(lw, dict) and lw.get("name"):
+            last_wicket = {
+                "name": str(lw.get("name") or ""),
+                "runs": str(lw.get("runs") or ""),
+                "balls": str(lw.get("balls") or ""),
+                "dismissal": str(lw.get("dismissal") or ""),
+                "fow": str(lw.get("fow") or ""),
+                "over": str(lw.get("over") or ""),
+            }
+        inns = ((m.get("scorecard") or {}).get("innings") or [])
+        cur = inns[-1] if inns else {}
+        batting = [_npl_card_batter(b) for b in (cur.get("batting") or [])
+                   if isinstance(b, dict) and b.get("name")]
+        bowling = [_npl_card_bowler(b) for b in (cur.get("bowling") or [])
+                   if isinstance(b, dict) and b.get("name")]
+        # Mark the crease on the full card from the live block.
+        for b in batting:
+            if striker and b["name"] == striker["name"]:
+                b["on_strike"] = True
+            elif non_striker and b["name"] == non_striker["name"]:
+                b["on_strike"] = False
+        return {
+            "status_text": str(m.get("statusText") or ""),
+            "striker": striker,
+            "non_striker": non_striker,
+            "bowler": bowler,
+            "partnership": str(live.get("partnership") or ""),
+            "last_wicket": last_wicket,
+            "crr": str(live.get("crr") or ""),
+            "last_over": str(live.get("lastOver") or ""),
+            "batting": batting,
+            "bowling": bowling,
+        }
+    return None
+
+
+async def onex_npl_scorecard(home: str, away: str) -> dict | None:
+    """Live NPL scorecard for one match (cached 10s, shared by
+    the tick and button taps). Never raises — a failed fetch is
+    an absent scorecard, so the detail still renders."""
+    now = time.monotonic()
+    if (now - _npl_card_cache["ts"] < _NPL_CARD_TTL_S
+            and _npl_card_cache["home"] == home
+            and _npl_card_cache["away"] == away):
+        return _npl_card_cache["card"]
+    card = None
+    try:
+        data = await hc.get(_NPL_SCORECARD_URL, {}, None,
+                            cache_key="", provider="onexbet")
+        card = _npl_scorecard_from_api(data, home, away)
+    except Exception as exc:
+        log.warning("[onexbet] NPL scorecard failed (%s)",
+                    type(exc).__name__)
+    _npl_card_cache.update(
+        {"ts": now, "home": home, "away": away, "card": card})
+    return card
+
+
 def _onex_apply_cricket(m: dict, scores: dict) -> None:
     """Override football scores with the cricket wicketScore and
     set the overs clock + cricket detail on a normalized match."""
@@ -1440,6 +1589,19 @@ async def onex_game_detail(raw: dict) -> dict | None:
                 detail["format"], detail.get("home_score"),
                 detail.get("away_score"), cricket.get("team"),
                 cricket.get("over_str")))
+    # NPL cricket only: the full scorecard (striker, bowler,
+    # partnership...) comes from the NPL official API — the
+    # 1xBet feed carries no player names at all. Deliberately
+    # OUTSIDE the gameInfo block above: gameInfo 400s from
+    # datacentre IPs, and a failed gameInfo must never lose
+    # the scorecard. A failed or absent scorecard never fails
+    # the detail.
+    if (detail.get("cricket") is not None
+            and detail.get("league") == "Nepal Premier League"):
+        card = await onex_npl_scorecard(detail.get("home", ""),
+                                        detail.get("away", ""))
+        if card:
+            detail["cricket"]["scorecard"] = card
     return detail
 
 
@@ -1467,6 +1629,8 @@ def _onex_reset_caches() -> None:
     _live_cache["fetch_ok"] = True
     _fix_cache["npl"] = (0.0, None)
     _fix_cache["uefa"] = (0.0, None)
+    _npl_card_cache.update(
+        {"ts": 0.0, "home": "", "away": "", "card": None})
 
 
 async def onex_live_raw() -> list[dict]:

@@ -231,6 +231,89 @@ class TestRenderDetail(unittest.TestCase):
         self.assertEqual(detail["clock"], "Innings break")
         self.assertIn("Innings break", wmod.render_detail(detail, "simple"))
 
+    def _cricket_detail_with_card(self):
+        # NPL Qualifier 2 shape, as parsed from the official API:
+        # striker on 44, non-striker on 4, Dhakal bowling.
+        detail = {
+            "home": "Sudurpaschim Royals", "away": "Chitwan Rhinos",
+            "home_score": "128/6", "away_score": "133/9",
+            "status": "live", "minute": None, "clock": "18.4 ov",
+            "stats": None, "format": "T20", "league":
+                "Nepal Premier League",
+            "cricket": {
+                "is_break": False, "team": 2, "over_str": "18.4",
+                "target": 134, "need": 6, "balls_left": 8,
+                "run_rate": "6.7",
+                "scorecard": {
+                    "striker": {"name": "Tharindu Ratnayake",
+                                "runs": "44", "balls": "38",
+                                "fours": "5", "sixes": "0",
+                                "sr": "115.78", "dismissal": ""},
+                    "non_striker": {"name": "Fabian Allen",
+                                    "runs": "4", "balls": "6",
+                                    "fours": "0", "sixes": "0",
+                                    "sr": "66.66", "dismissal": ""},
+                    "bowler": {"name": "Rijan Dhakal", "overs": "3.3",
+                               "maidens": "0", "runs": "21",
+                               "wickets": "1", "econ": "6"},
+                    "partnership": "22 (16)",
+                    "last_wicket": {"name": "Aarif Sheikh",
+                                    "runs": "10", "balls": "10",
+                                    "dismissal": "b Airee",
+                                    "fow": "102", "over": "15.5"},
+                    "crr": "6.7", "last_over": "6/0",
+                    "batting": [
+                        {"name": "Tharindu Ratnayake", "runs": "44",
+                         "balls": "38", "fours": "5", "sixes": "0",
+                         "sr": "115.78", "dismissal": "not out",
+                         "on_strike": True},
+                        {"name": "Fabian Allen", "runs": "4",
+                         "balls": "6", "fours": "0", "sixes": "0",
+                         "sr": "66.66", "dismissal": "not out",
+                         "on_strike": False},
+                    ],
+                    "bowling": [
+                        {"name": "Rijan Dhakal", "overs": "3.3",
+                         "maidens": "0", "runs": "21", "wickets": "1",
+                         "econ": "6"},
+                    ],
+                },
+            },
+        }
+        return detail
+
+    def test_cricket_scorecard_advanced_only(self):
+        detail = self._cricket_detail_with_card()
+        simple = wmod.render_detail(detail, "simple")
+        self.assertNotIn("At the crease", simple)
+        advanced = wmod.render_detail(detail, "advanced")
+        self.assertIn("Striker: Tharindu Ratnayake 44 (38)", advanced)
+        self.assertIn("Non-striker: Fabian Allen 4 (6)", advanced)
+        self.assertIn("Bowler: Rijan Dhakal 3.3-0-21-1", advanced)
+        self.assertIn("Partnership: 22 (16)", advanced)
+        self.assertIn("Last wicket: Aarif Sheikh 10 (b Airee)", advanced)
+        self.assertIn("Tharindu Ratnayake* 44 (38)", advanced)
+        self.assertIn("Rijan Dhakal 3.3-0-21-1", advanced)
+
+    def test_cricket_scorecard_analytics_essentials_only(self):
+        detail = self._cricket_detail_with_card()
+        text = wmod.render_analytics(detail)
+        self.assertIn("Striker: Tharindu Ratnayake 44 (38)", text)
+        self.assertIn("Bowler: Rijan Dhakal 3.3-0-21-1", text)
+        # The ticking analytics panel keeps the essentials only —
+        # the full batting/bowling card lives on the Advanced
+        # detail view.
+        self.assertNotIn("**Batting**", text)
+        self.assertNotIn("**Bowling**", text)
+
+    def test_cricket_without_scorecard_shows_no_crease(self):
+        detail = self._cricket_detail_with_card()
+        del detail["cricket"]["scorecard"]
+        self.assertNotIn("At the crease",
+                         wmod.render_detail(detail, "advanced"))
+        self.assertNotIn("At the crease",
+                         wmod.render_analytics(detail))
+
     def test_render_top_games_stays_under_discord_limit(self):
         # 18 Nov 2026: /ask failed with "Something went wrong"
         # because a long list pushed the reply over Discord's
